@@ -1,0 +1,92 @@
+@import "tailwindcss";
+
+@theme {
+  --color-ink: #08090b;
+  --color-panel: #0c0e12;
+  --color-panel2: #0d0f13;
+  --color-line: #1e222a;
+  --color-body: #e9ebee;
+  --color-muted: #9aa2ad;
+  --color-accent: #8ab4f8;
+  --color-accentbg: #16243a;
+  --color-pos: #7fd6a0;
+  --color-neg: #e58a8a;
+  --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--color-ink);
+  color: var(--color-body);
+  font-family: var(--font-sans);
+  font-size: 13.5px;
+  line-height: 1.45;
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
+input[type="range"].ctx-range {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 18px;
+  background: transparent;
+  cursor: pointer;
+}
+
+input[type="range"].ctx-range::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 2px;
+  background: #272b33;
+}
+
+input[type="range"].ctx-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  margin-top: -5px;
+  border-radius: 50%;
+  background: var(--color-accent);
+}
+
+input[type="range"].ctx-range::-moz-range-track {
+  height: 4px;
+  border-radius: 2px;
+  background: #272b33;
+}
+
+input[type="range"].ctx-range::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border: 0;
+  border-radius: 50%;
+  background: var(--color-accent);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .ctx-fade {
+    animation: ctx-fade 0.12s ease-out;
+  }
+}
+
+@keyframes ctx-fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
