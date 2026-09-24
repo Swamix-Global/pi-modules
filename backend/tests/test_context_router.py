@@ -328,6 +328,49 @@ class RouterTests(unittest.TestCase):
         self.assertGreaterEqual(fresh.cache_count(), 1)
         self.assertEqual(fresh.stats_snapshot()["cache_db"], router.DB_PATH)
 
+    def test_slider_thresholds_persist_across_a_restart(self):
+        """The budget and block-length sliders survive a restart: they are written to ctx-engine.db, and a
+        fresh process loads the chosen values over the env defaults instead of reverting."""
+        self.assertTrue(router.init_db())
+        router.BUDGET["tokens"] = 100000
+        router.SUMMARY["tokens"] = 200
+        router.config_set("tokens", 100000)
+        router.config_set("summary_tokens", 200)
+        spec = importlib.util.spec_from_file_location("context_router_sliders", MODULE_PATH)
+        fresh = importlib.util.module_from_spec(spec)
+        assert spec.loader
+        spec.loader.exec_module(fresh)
+        fresh.DB_PATH = router.DB_PATH
+        fresh.BUDGET["tokens"] = fresh.CONTEXT_TOKENS
+        fresh.SUMMARY["tokens"] = fresh.DEFAULT_SUMMARY_TOKENS
+        fresh.load_config()
+        self.assertEqual(fresh.BUDGET["tokens"], 100000)
+        self.assertEqual(fresh.stats_snapshot()["token_limit"], 100000)
+        self.assertEqual(fresh.stats_snapshot()["summary_tokens"], 200)
+
+    def test_live_config_writes_through_to_disk(self):
+        """The live /config endpoint must persist, not only move the in-memory dict, so the slider is durable."""
+        server = router.make_server("127.0.0.1", 0, "https://upstream.invalid")
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            client = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+            client.request("POST", "/config", body=b'{"tokens":64000,"summary_tokens":400}', headers={"Content-Type": "application/json"})
+            ok = client.getresponse()
+            self.assertEqual(ok.status, 200)
+            ok.read()
+            client.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+        spec = importlib.util.spec_from_file_location("context_router_sliders_http", MODULE_PATH)
+        fresh = importlib.util.module_from_spec(spec)
+        assert spec.loader
+        spec.loader.exec_module(fresh)
+        fresh.DB_PATH = router.DB_PATH
+        fresh.load_config()
+        self.assertEqual(fresh.BUDGET["tokens"], 64000)
+        self.assertEqual(fresh.SUMMARY["tokens"], 400)
+
     def test_deepseek_empty_content_is_retried_once(self):
         """A reasoning model can spend the whole budget on reasoning and return empty content; one retry at
         double the budget must recover it, and a second empty answer must not loop."""

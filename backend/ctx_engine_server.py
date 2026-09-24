@@ -167,6 +167,9 @@ REQUESTS_SCHEMA = (
     "sent_tokens INTEGER NOT NULL DEFAULT 0, provider TEXT NOT NULL DEFAULT '', detail TEXT NOT NULL DEFAULT '', raw TEXT NOT NULL DEFAULT '', "
     "plan TEXT NOT NULL DEFAULT '', cost TEXT NOT NULL DEFAULT '')"
 )
+# The two dashboard sliders persist here, one row per key, so a restart keeps the chosen threshold instead of
+# reverting to the env default. The DB is already the server's writable state store.
+CONFIG_SCHEMA = "CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL, set_at REAL NOT NULL)"
 
 
 def _archive_table(conn: sqlite3.Connection, source: str, base: str) -> str:
@@ -192,6 +195,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if row is None:
         conn.execute(SCHEMA)
         conn.execute(REQUESTS_SCHEMA)
+        conn.execute(CONFIG_SCHEMA)
         return
     info = list(conn.execute("PRAGMA table_info(summaries)"))
     cols = {str(item[1]) for item in info}
@@ -218,6 +222,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
                 f'FROM "{legacy}" WHERE {valid}'
             )
     conn.execute(REQUESTS_SCHEMA)
+    conn.execute(CONFIG_SCHEMA)
     if "plan" not in {str(info[1]) for info in conn.execute("PRAGMA table_info(requests)")}:
         conn.execute("ALTER TABLE requests ADD COLUMN plan TEXT NOT NULL DEFAULT ''")
     if "cost" not in {str(info[1]) for info in conn.execute("PRAGMA table_info(requests)")}:
@@ -251,6 +256,53 @@ def cache_error(action: str, exc: sqlite3.Error) -> None:
     if now - DB_ERROR["at"] > 60:
         DB_ERROR["at"] = now
         print(f"ctx-engine cache {action} failed ({type(exc).__name__}): {exc}", file=sys.stderr, flush=True)
+
+
+# Persisted sliders: the values are strings in one key/value row each, written on every /config and applied
+# over the env defaults at startup, so a restart keeps the chosen budget and block length.
+CONFIG_KEYS = ("tokens", "summary_tokens")
+
+
+def config_set(key: str, value: int) -> None:
+    """Persist one slider; a cache write failure is reported once a minute and never fails the request."""
+    try:
+        with DB_LOCK:
+            conn = db_connect()
+            try:
+                conn.execute(
+                    "INSERT INTO config (key, value, set_at) VALUES (?, ?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value, set_at=excluded.set_at",
+                    (key, str(int(value)), time.time()),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+    except sqlite3.Error as exc:
+        cache_error(f"config write {key}", exc)
+
+
+def load_config() -> None:
+    """Apply persisted sliders over the env defaults; a malformed row falls back to the current value."""
+    try:
+        with DB_LOCK:
+            conn = db_connect()
+            try:
+                rows = {row[0]: (row[1], row[2]) for row in conn.execute("SELECT key, value, set_at FROM config")}
+            finally:
+                conn.close()
+    except sqlite3.Error as exc:
+        cache_error("config read", exc)
+        return
+    try:
+        if "tokens" in rows:
+            BUDGET.update(tokens=int(rows["tokens"][0]), set_at=float(rows["tokens"][1]))
+    except (TypeError, ValueError):
+        pass
+    try:
+        if "summary_tokens" in rows:
+            SUMMARY.update(tokens=snap_summary_tokens(rows["summary_tokens"][0]), set_at=float(rows["summary_tokens"][1]))
+    except (TypeError, ValueError):
+        pass
 
 
 def cache_get(digest: str, provider: str, want_tokens: int | None = None, model: str | None = None) -> str | None:
@@ -965,8 +1017,10 @@ class RouterHandler(BaseHTTPRequestHandler):
             now = time.time()
             if "tokens" in result:
                 BUDGET.update(tokens=result["tokens"], set_at=now)
+                config_set("tokens", result["tokens"])
             if "summary_tokens" in result:
                 SUMMARY.update(tokens=result["summary_tokens"], set_at=now)
+                config_set("summary_tokens", result["summary_tokens"])
             self.send_bytes(200, compact_json(result).encode())
             return
         upstream, rest = self.resolve_upstream(path)
@@ -1117,6 +1171,7 @@ def main() -> None:
     server = make_server(args.host, args.port, args.upstream)
     cache_state = "ready" if init_db() else "unavailable"
     if cache_state == "ready":
+        load_config()
         backfill_costs()
         reprice_costs()
     print(f"ctx-engine server listening on {args.host}:{server.server_port} (condenser {DEEPSEEK_MODEL}, {BUDGET['tokens']} tokens, cache {cache_state})", flush=True)
