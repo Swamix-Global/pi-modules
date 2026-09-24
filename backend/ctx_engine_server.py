@@ -42,12 +42,30 @@ import threading
 import time
 from concurrent import futures
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 # Pure helpers and config live in the utils module; re-export them so module callers and tests see one namespace.
 # Make the sibling module importable however this file is launched (systemd, importlib by path, cwd elsewhere).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from ctx_engine_utils import *  # noqa: E402,F401,F403
+
+
+# The prompt is configuration state, not request-ledger data. Its digest is part of every
+# summary identity so changing it can never reuse a note written under another prompt.
+DEFAULT_CONDENSER_PROMPT = CONDENSER_SYSTEM
+CONDENSER_PROMPT = DEFAULT_CONDENSER_PROMPT
+PROMPT_MAX_CHARS = 32 * 1024
+PROMPT_LOCK = threading.RLock()
+
+
+def condenser_prompt() -> str:
+    with PROMPT_LOCK:
+        return CONDENSER_PROMPT
+
+
+def condenser_prompt_hash(prompt: str | None = None) -> str:
+    value = condenser_prompt() if prompt is None else prompt
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 def usage_add(tokens_in: int, tokens_out: int, usd: float) -> None:
@@ -156,8 +174,8 @@ BUCKETS = ("deepseek",)
 # model is part of the identity too, so a condenser switch never serves a note written by the old model.
 SCHEMA = (
     "CREATE TABLE IF NOT EXISTS summaries (digest TEXT NOT NULL, provider TEXT NOT NULL, summary TEXT NOT NULL, "
-    "model TEXT NOT NULL, tokens INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL, "
-    "PRIMARY KEY (digest, provider, model, tokens))"
+    "model TEXT NOT NULL, tokens INTEGER NOT NULL DEFAULT 0, prompt_hash TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL, "
+    "PRIMARY KEY (digest, provider, model, tokens, prompt_hash))"
 )
 # A second domain in the same file: every router decision, so the dashboard window survives restarts. Rows are
 # pruned to the last REQUESTS_KEEP on write; the display window (WINDOW) is deliberately smaller than retention.
@@ -184,48 +202,48 @@ def _archive_table(conn: sqlite3.Connection, source: str, base: str) -> str:
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
-    """Rebuild the summary cache whenever its identity changes, so an old row cannot answer a new request.
-
-    Identity moved from digest alone -> (digest, provider) -> (digest, provider, model, tokens). Old word rows
-    were written at per-block word steps, not token ceilings, so they are archived under
-    `summaries_words_legacy` and never reused as token entries. A superseded schema is archived the same way,
-    never dropped, so no legacy note is lost. The requests ledger is untouched.
-    """
+    """Create or archive cache schemas without allowing stale prompt identities to answer."""
     row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='summaries'").fetchone()
     if row is None:
         conn.execute(SCHEMA)
         conn.execute(REQUESTS_SCHEMA)
         conn.execute(CONFIG_SCHEMA)
+        conn.commit()
         return
     info = list(conn.execute("PRAGMA table_info(summaries)"))
     cols = {str(item[1]) for item in info}
+    pk = [str(item[1]) for item in info if int(item[5])]
+    expected_pk = ["digest", "provider", "model", "tokens", "prompt_hash"]
     if "words" in cols and "tokens" not in cols:
-        # Legacy word notes are not token notes. Archive, don't delete: the new cache grows separately.
         _archive_table(conn, "summaries", "summaries_words_legacy")
         conn.execute(SCHEMA)
-    else:
-        pk = [str(item[1]) for item in info if int(item[5])]
-        if pk != ["digest", "provider", "model", "tokens"]:
-            legacy = _archive_table(conn, "summaries", "summaries_schema_legacy")
-            conn.execute(SCHEMA)
-            legacy_cols = {str(item[1]) for item in conn.execute(f'PRAGMA table_info("{legacy}")')}
-            model_col = "model" if "model" in legacy_cols else "''"
-            allowed = ",".join(str(step) for step in SUMMARY_TOKEN_STEPS)
-            if "tokens" in legacy_cols:
-                length_col = f"CASE WHEN tokens IN ({allowed}) THEN tokens ELSE NULL END"
-                valid = f"{length_col} IS NOT NULL"
-            else:
-                length_col, valid = "NULL", "0"
-            conn.execute(
-                "INSERT OR IGNORE INTO summaries (digest, provider, summary, model, tokens, created_at) "
-                f"SELECT digest, COALESCE(NULLIF(provider, ''), 'local'), summary, {model_col}, {length_col}, created_at "
-                f'FROM "{legacy}" WHERE {valid}'
-            )
+    elif pk != expected_pk or "prompt_hash" not in cols:
+        legacy = _archive_table(conn, "summaries", "summaries_schema_legacy")
+        conn.execute(SCHEMA)
+        legacy_cols = {str(item[1]) for item in conn.execute(f'PRAGMA table_info("{legacy}")')}
+        model_col = "model" if "model" in legacy_cols else "''"
+        allowed = ",".join(str(step) for step in SUMMARY_TOKEN_STEPS)
+        if "tokens" in legacy_cols:
+            length_col = f"CASE WHEN tokens IN ({allowed}) THEN tokens ELSE NULL END"
+            valid = f"{length_col} IS NOT NULL"
+        else:
+            length_col, valid = "NULL", "0"
+        # The config table is created below. Existing rows are considered written with the
+        # prompt active at migration time; a later edit changes the hash and makes them miss.
+        conn.execute(CONFIG_SCHEMA)
+        configured = conn.execute("SELECT value FROM config WHERE key = 'condenser_prompt'").fetchone()
+        migration_hash = condenser_prompt_hash(str(configured[0])) if configured and str(configured[0]).strip() else condenser_prompt_hash(DEFAULT_CONDENSER_PROMPT)
+        conn.execute(
+            "INSERT OR IGNORE INTO summaries (digest, provider, summary, model, tokens, prompt_hash, created_at) "
+            f"SELECT digest, COALESCE(NULLIF(provider, ''), 'local'), summary, {model_col}, {length_col}, ?, created_at "
+            f'FROM "{legacy}" WHERE {valid}', (migration_hash,)
+        )
     conn.execute(REQUESTS_SCHEMA)
     conn.execute(CONFIG_SCHEMA)
-    if "plan" not in {str(info[1]) for info in conn.execute("PRAGMA table_info(requests)")}:
+    request_cols = {str(item[1]) for item in conn.execute("PRAGMA table_info(requests)")}
+    if "plan" not in request_cols:
         conn.execute("ALTER TABLE requests ADD COLUMN plan TEXT NOT NULL DEFAULT ''")
-    if "cost" not in {str(info[1]) for info in conn.execute("PRAGMA table_info(requests)")}:
+    if "cost" not in request_cols:
         conn.execute("ALTER TABLE requests ADD COLUMN cost TEXT NOT NULL DEFAULT ''")
     conn.commit()
 
@@ -263,22 +281,26 @@ def cache_error(action: str, exc: sqlite3.Error) -> None:
 CONFIG_KEYS = ("tokens", "summary_tokens")
 
 
-def config_set(key: str, value: int) -> None:
-    """Persist one slider; a cache write failure is reported once a minute and never fails the request."""
+def config_set(key: str, value: object) -> bool:
+    """Persist a config value and report failure to callers that need fail-closed writes."""
     try:
+        serialized = str(int(value)) if key in {"tokens", "summary_tokens"} else str(value)
         with DB_LOCK:
             conn = db_connect()
             try:
                 conn.execute(
                     "INSERT INTO config (key, value, set_at) VALUES (?, ?, ?) "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value, set_at=excluded.set_at",
-                    (key, str(int(value)), time.time()),
+                    (key, serialized, time.time()),
                 )
                 conn.commit()
             finally:
                 conn.close()
-    except sqlite3.Error as exc:
-        cache_error(f"config write {key}", exc)
+        return True
+    except (sqlite3.Error, ValueError, TypeError) as exc:
+        if isinstance(exc, sqlite3.Error):
+            cache_error(f"config write {key}", exc)
+        return False
 
 
 def load_config() -> None:
@@ -303,9 +325,14 @@ def load_config() -> None:
             SUMMARY.update(tokens=snap_summary_tokens(rows["summary_tokens"][0]), set_at=float(rows["summary_tokens"][1]))
     except (TypeError, ValueError):
         pass
+    prompt_row = rows.get("condenser_prompt")
+    if prompt_row and isinstance(prompt_row[0], str) and prompt_row[0].strip() and len(prompt_row[0]) <= PROMPT_MAX_CHARS:
+        with PROMPT_LOCK:
+            global CONDENSER_PROMPT
+            CONDENSER_PROMPT = prompt_row[0]
 
 
-def cache_get(digest: str, provider: str, want_tokens: int | None = None, model: str | None = None) -> str | None:
+def cache_get(digest: str, provider: str, want_tokens: int | None = None, model: str | None = None, prompt_hash: str | None = None) -> str | None:
     """Read one row for the named bucket at the requested length and currently selected condenser model.
 
     Lengths coexist: an explicit `want_tokens` filters on `tokens`, so a note written at one length never answers
@@ -315,13 +342,14 @@ def cache_get(digest: str, provider: str, want_tokens: int | None = None, model:
     """
     active_model = model or DEEPSEEK_MODEL
     target = summary_target() if want_tokens is None else int(want_tokens)
+    active_prompt_hash = prompt_hash or condenser_prompt_hash()
     try:
         with DB_LOCK:
             conn = db_connect()
             try:
                 row = conn.execute(
-                    "SELECT summary FROM summaries WHERE digest = ? AND provider = ? AND model = ? AND tokens = ?",
-                    (digest, provider, active_model, target),
+                    "SELECT summary FROM summaries WHERE digest = ? AND provider = ? AND model = ? AND tokens = ? AND prompt_hash = ?",
+                    (digest, provider, active_model, target, active_prompt_hash),
                 ).fetchone()
             finally:
                 conn.close()
@@ -334,18 +362,19 @@ def cache_get(digest: str, provider: str, want_tokens: int | None = None, model:
     return None
 
 
-def cache_put(digest: str, summary: str, provider: str | None = None, tokens: int | None = None, model: str | None = None) -> None:
-    """One row per (digest, bucket, model, length): INSERT OR REPLACE touches only the current identity."""
+def cache_put(digest: str, summary: str, provider: str | None = None, tokens: int | None = None, model: str | None = None, prompt_hash: str | None = None) -> None:
+    """One row per block, bucket, model, length and condenser prompt identity."""
     bucket = provider or "deepseek"
     tokens = summary_target() if tokens is None else int(tokens)
     active_model = model or DEEPSEEK_MODEL
+    active_prompt_hash = prompt_hash or condenser_prompt_hash()
     try:
         with DB_LOCK:
             conn = db_connect()
             try:
                 conn.execute(
-                    "INSERT OR REPLACE INTO summaries (digest, provider, summary, model, tokens, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                    (digest, bucket, summary, active_model, int(tokens or 0), time.time()),
+                    "INSERT OR REPLACE INTO summaries (digest, provider, summary, model, tokens, prompt_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (digest, bucket, summary, active_model, int(tokens or 0), active_prompt_hash, time.time()),
                 )
                 conn.commit()
             finally:
@@ -630,13 +659,13 @@ def condense_cost(payload: dict) -> None:
     bump(condenser_tokens_in=fresh + cached, condenser_tokens_out=out, condenser_cost_usd=usd)
 
 
-def call_condenser(prompt: str, target: int | None = None) -> str:
+def call_condenser(prompt: str, target: int | None = None, system_prompt: str | None = None) -> str:
     """One condense call through DeepSeek. Never logs the prompt or any credential."""
     target = summary_target(prompt) if target is None else target
     hint = summary_hint(prompt, target)
     body = {
         "model": DEEPSEEK_MODEL,
-        "messages": [{"role": "system", "content": CONDENSER_SYSTEM}, {"role": "user", "content": prompt + "\n\n" + hint}],
+        "messages": [{"role": "system", "content": condenser_prompt() if system_prompt is None else system_prompt}, {"role": "user", "content": prompt + "\n\n" + hint}],
         "temperature": DEEPSEEK_TEMPERATURE,
         "stream": False,
         "max_tokens": DEEPSEEK_MAX_TOKENS,
@@ -662,20 +691,28 @@ def call_condenser(prompt: str, target: int | None = None) -> str:
     return normalize_summary(text)
 
 
-def summarize_block(block: list, tokens: int | None = None, model: str | None = None) -> tuple[str, str]:
-    """One summary per (block, model, length target): read and write only that exact cache row."""
+def summarize_block(block: list, tokens: int | None = None, model: str | None = None, system_prompt: str | None = None, prompt_hash: str | None = None) -> tuple[str, str]:
+    """One summary per block, model, length and prompt identity; never serve another prompt's note."""
     ident = block_id(block)
     bucket = "deepseek"
     model = DEEPSEEK_MODEL if model is None else model
     tokens = summary_target() if tokens is None else tokens
+    system_prompt = condenser_prompt() if system_prompt is None else system_prompt
+    prompt_hash = condenser_prompt_hash(system_prompt) if prompt_hash is None else prompt_hash
     transcript = block_transcript(block)
-    cached = cache_get(ident, bucket, tokens, model)
-    # Only a row already in the labelled shape is a cache hit; old bullets or prose are re-condensed and replaced.
+    cached = cache_get(ident, bucket, tokens, model, prompt_hash)
     if cached and is_current_summary(cached):
         bump(cache_hits=1)
         return ident, cached
-    summary = call_condenser(transcript, tokens)
-    cache_put(ident, summary, bucket, tokens, model)
+    try:
+        summary = call_condenser(transcript, tokens, system_prompt=system_prompt)
+    except TypeError as exc:
+        # Tests and embedding callers may provide the historical two-argument hook. The
+        # production function accepts the snapshot so an in-flight job cannot cross prompts.
+        if "system_prompt" not in str(exc):
+            raise
+        summary = call_condenser(transcript, tokens)
+    cache_put(ident, summary, bucket, tokens, model, prompt_hash)
     bump(blocks_summarized=1)
     return ident, summary
 
@@ -686,15 +723,17 @@ def summary_item(ident: str, summary: str) -> dict:
 
 def schedule_summary(block: list, summarize=summarize_block) -> futures.Future:
     """Start one background condensation for a (block, model, length) identity; an identical job is reused."""
-    key = (block_id(block), "deepseek", DEEPSEEK_MODEL, summary_target())
+    prompt_snapshot = condenser_prompt()
+    prompt_identity = condenser_prompt_hash(prompt_snapshot)
+    key = (block_id(block), "deepseek", DEEPSEEK_MODEL, summary_target(), prompt_identity)
     with JOBS_LOCK:
         job = SUMMARY_JOBS.get(key)
         if job is None or job.done():
             if len(SUMMARY_JOBS) > 512:
                 for old in [k for k, f in SUMMARY_JOBS.items() if f.done()]:
                     SUMMARY_JOBS.pop(old, None)
-            # ponytail: capture settings before queuing; a slider change must not relabel an in-flight note.
-            job = SUMMARY_POOL.submit(summarize, block, key[3], key[2]) if summarize is summarize_block else SUMMARY_POOL.submit(summarize, block)
+            # Capture settings before queuing; a prompt edit gets a distinct job and cache identity.
+            job = SUMMARY_POOL.submit(summarize, block, key[3], key[2], prompt_snapshot, prompt_identity) if summarize is summarize_block else SUMMARY_POOL.submit(summarize, block)
             SUMMARY_JOBS[key] = job
     return job
 
@@ -838,6 +877,215 @@ def rewrite_request(raw: bytes, token_limit: int | None = None, report: dict | N
 
 # Only the built UI is served; source files and the databases stay outside the web root.
 FRONTEND_DIST = os.path.abspath(os.path.join(os.path.dirname(__file__), "../frontend/dist"))
+
+
+# ----------------------------- session debugger -----------------------------
+
+# These are the two persisted session stores used by Pi and SubagentX. Only these roots,
+# their direct files, and one Pi project bucket level are eligible; arbitrary paths are never opened.
+DEBUG_SESSION_ROOTS = (
+    ("pi", os.path.realpath(os.path.expanduser("~/.pi/agent/sessions"))),
+    ("subagentx", os.path.realpath(os.path.expanduser("~/.pi/agent/subagentx-sessions"))),
+)
+DEBUG_SESSION_MAX_BYTES = int(os.environ.get("PI_CONTEXT_ROUTER_DEBUG_MAX_SESSION_BYTES", str(64 * 1024 * 1024)))
+DEBUG_SESSION_MAX_FILES = int(os.environ.get("PI_CONTEXT_ROUTER_DEBUG_MAX_SESSION_FILES", "10000"))
+DEBUG_RESPONSE_MAX_BYTES = int(os.environ.get("PI_CONTEXT_ROUTER_DEBUG_MAX_RESPONSE_BYTES", str(64 * 1024 * 1024)))
+DEBUG_LOCK = threading.RLock()
+DEBUG_NOT_CONDENSED = "not yet condensed"
+
+
+class DebugInputError(ValueError):
+    pass
+
+
+def _debug_project(value: object) -> str:
+    if not isinstance(value, str) or not value or len(value) > 4096 or "\x00" in value or not os.path.isabs(value):
+        raise DebugInputError("project must be an absolute path")
+    return os.path.realpath(value)
+
+
+def _debug_timestamp(value: object, fallback: float) -> float:
+    try:
+        if isinstance(value, (int, float)):
+            number = float(value)
+            return number / 1000 if number > 100_000_000_000 else number
+        if isinstance(value, str):
+            from datetime import datetime
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError, OverflowError):
+        pass
+    return fallback
+
+
+def _debug_files() -> list[tuple[str, str, str]]:
+    files: list[tuple[str, str, str]] = []
+    for source, root in DEBUG_SESSION_ROOTS:
+        try:
+            entries = list(os.scandir(root))
+        except OSError:
+            continue
+        for entry in entries:
+            candidates = [entry]
+            if entry.is_dir(follow_symlinks=False):
+                try:
+                    candidates.extend(os.scandir(entry.path))
+                except OSError:
+                    continue
+            for candidate in candidates:
+                if len(files) >= DEBUG_SESSION_MAX_FILES:
+                    return files
+                if not candidate.name.endswith(".jsonl") or not candidate.is_file(follow_symlinks=False):
+                    continue
+                try:
+                    path = os.path.realpath(candidate.path)
+                    if os.path.commonpath((root, path)) != root:
+                        continue
+                    if os.stat(path).st_size > DEBUG_SESSION_MAX_BYTES:
+                        continue
+                except OSError:
+                    continue
+                rel = os.path.relpath(path, root)
+                files.append((source, root, rel))
+    return files
+
+
+def _session_wire_message(message: dict) -> dict:
+    """Remove Pi journal metadata while retaining the message schema used by block_id/transcript."""
+    allowed = {"role", "content", "name", "tool_calls", "tool_call_id", "function_call", "type", "id", "call_id", "arguments", "input", "output"}
+    return {key: value for key, value in message.items() if key in allowed}
+
+
+def _read_debug_session(source: str, root: str, relative: str) -> dict | None:
+    path = os.path.realpath(os.path.join(root, relative))
+    try:
+        if os.path.commonpath((root, path)) != root or not path.endswith(".jsonl"):
+            return None
+        size = os.stat(path).st_size
+        if size > DEBUG_SESSION_MAX_BYTES:
+            raise DebugInputError("session file exceeds the configured size limit")
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            text = handle.read()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise DebugInputError(f"session file unavailable: {type(exc).__name__}") from exc
+    records = []
+    for line in text.splitlines():
+        try:
+            record = json.loads(line)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if isinstance(record, dict):
+            records.append(record)
+    session = next((record for record in records if record.get("type") == "session"), {})
+    project_raw = session.get("cwd")
+    if not isinstance(project_raw, str) or not os.path.isabs(project_raw):
+        return None
+    project = os.path.realpath(project_raw)
+    messages = []
+    for record in records:
+        message = record.get("message") if record.get("type") == "message" else None
+        if isinstance(message, dict) and isinstance(message.get("role"), str):
+            messages.append(_session_wire_message(message))
+    _prefix, blocks = split_message_blocks(messages)
+    session_id = session.get("id") if isinstance(session.get("id"), str) else os.path.splitext(os.path.basename(relative))[0]
+    title = next((str(record.get("name")) for record in records if record.get("type") == "session_info" and record.get("name")), "")
+    if not title:
+        first_user = next((message for message in messages if message.get("role") == "user"), None)
+        title = normalized_text(content_text(first_user.get("content")))[:120] if first_user else session_id
+    try:
+        fallback = os.stat(path).st_mtime
+    except OSError:
+        fallback = 0.0
+    at = max((_debug_timestamp(record.get("timestamp"), fallback) for record in records), default=fallback)
+    return {"id": f"{source}:{relative}", "title": title or session_id, "source": source, "at": at,
+            "project": project, "blocks": blocks, "messages": messages, "path": path, "size": size}
+
+
+def _debug_sessions(project: str | None = None) -> list[dict]:
+    sessions = []
+    with DEBUG_LOCK:
+        for source, root, relative in _debug_files():
+            session = _read_debug_session(source, root, relative)
+            if session is not None and (project is None or session["project"] == project):
+                sessions.append(session)
+    sessions.sort(key=lambda session: (session["at"], session["id"]), reverse=True)
+    return sessions
+
+
+def debug_projects() -> dict:
+    counts = Counter(session["project"] for session in _debug_sessions())
+    return {"projects": [{"path": path, "sessions": counts[path]} for path in sorted(counts)]}
+
+
+def debug_session_list(project: str) -> dict:
+    return {"sessions": [{key: session[key] for key in ("id", "title", "source", "at")}
+                         | {"blocks": len(session["blocks"])} for session in _debug_sessions(project)]}
+
+
+def debug_session_detail(session_id: str, project: str) -> dict | None:
+    sessions = _debug_sessions(project)
+    session = next((item for item in sessions if item["id"] == session_id), None)
+    if session is None:
+        return None
+    blocks = []
+    try:
+        with DB_LOCK:
+            conn = db_connect()
+            try:
+                prompt_hash = condenser_prompt_hash()
+                for block in session["blocks"]:
+                    digest = block_id(block)
+                    row = conn.execute(
+                        "SELECT summary FROM summaries WHERE digest = ? AND provider = 'deepseek' AND model = ? AND tokens = ? AND prompt_hash = ?",
+                        (digest, DEEPSEEK_MODEL, summary_target(), prompt_hash),
+                    ).fetchone()
+                    blocks.append({"id": digest, "before": block_transcript(block),
+                                   "after": str(row[0]) if row else DEBUG_NOT_CONDENSED,
+                                   "source": session["source"]})
+            finally:
+                conn.close()
+    except sqlite3.Error as exc:
+        cache_error("debug read", exc)
+        raise
+    result = {"blocks": blocks, "id": session["id"], "title": session["title"], "source": session["source"], "at": session["at"]}
+    encoded_size = len(compact_json(result).encode("utf-8"))
+    if encoded_size > DEBUG_RESPONSE_MAX_BYTES:
+        raise DebugInputError("debug session response exceeds the configured size limit")
+    return result
+
+
+def debug_prompt_payload() -> dict:
+    try:
+        with DB_LOCK:
+            conn = db_connect()
+            try:
+                row = conn.execute("SELECT value FROM config WHERE key = 'condenser_prompt'").fetchone()
+            finally:
+                conn.close()
+    except sqlite3.Error:
+        raise
+    prompt = str(row[0]) if row and isinstance(row[0], str) and row[0].strip() else condenser_prompt()
+    if row and isinstance(row[0], str) and row[0].strip() and len(row[0]) <= PROMPT_MAX_CHARS:
+        with PROMPT_LOCK:
+            global CONDENSER_PROMPT
+            CONDENSER_PROMPT = row[0]
+            prompt = row[0]
+    return {"prompt": prompt, "default_prompt": DEFAULT_CONDENSER_PROMPT}
+
+
+def save_debug_prompt(prompt: str) -> dict:
+    if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > PROMPT_MAX_CHARS:
+        raise DebugInputError(f"prompt must be a non-empty string of at most {PROMPT_MAX_CHARS} characters")
+    if not config_set("condenser_prompt", prompt):
+        raise sqlite3.OperationalError("prompt could not be persisted")
+    with PROMPT_LOCK:
+        global CONDENSER_PROMPT
+        CONDENSER_PROMPT = prompt
+    return {"prompt": prompt}
+
+
+
 LOCALAI_DB_PATH = os.environ.get("LOCALAI_DB_PATH", os.path.expanduser("~/.pi/agent/localai.db"))
 
 
@@ -894,7 +1142,11 @@ def stats_snapshot() -> dict:
     return snapshot
 
 
-# ----------------------------- http -----------------------------
+def _debug_query(query: dict[str, list[str]], required: tuple[str, ...]) -> dict[str, str]:
+    if set(query) != set(required) or any(len(query.get(key, [])) != 1 or not query[key][0] for key in required):
+        raise DebugInputError("invalid query shape")
+    return {key: query[key][0] for key in required}
+
 
 class RouterServer(ThreadingHTTPServer):
     daemon_threads = True
@@ -944,45 +1196,98 @@ class RouterHandler(BaseHTTPRequestHandler):
         self.send_bytes(200, body, mimetypes.guess_type(path)[0] or "application/octet-stream")
 
     def do_GET(self) -> None:
-        path = self.path.split("?", 1)[0].rstrip("/")
-        if path == "/health":
-            self.send_bytes(200, b'{"status":"ok"}')
-        elif path == "/stats":
-            self.send_bytes(200, compact_json(stats_snapshot()).encode())
-        elif path in ("/dashboard", "/dashboard/index.html"):
-            self.serve_dashboard("index.html")
-        elif path.startswith("/dashboard/assets/"):
-            name = path.removeprefix("/dashboard/assets/")
-            if not re.fullmatch(r"[A-Za-z0-9._-]+", name):
-                self.send_bytes(404, b'{"error":"not found"}')
-                return
-            self.serve_dashboard("assets/" + name)
-        elif path == "/token-stats":
-            try:
-                self.send_bytes(200, compact_json(token_stats()).encode())
-            except (sqlite3.Error, OSError) as exc:
-                print(f"ctx-engine token stats error: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
-                self.send_bytes(503, b'{"error":"local token journal unavailable"}')
-        elif path.startswith("/request/"):
-            detail = request_detail(int(path.rsplit("/", 1)[-1])) if path.rsplit("/", 1)[-1].isdigit() else None
-            self.send_bytes(200 if detail else 404, compact_json(detail or {"error": "not found"}).encode())
-        else:
-            # providers probe their baseUrl (e.g. GET /models), so route GETs through too
-            upstream, rest = self.resolve_upstream(path)
-            if upstream is None:
-                self.send_bytes(404, b'{"error":"not found"}')
-                return
-            try:
-                self.forward_get(upstream, rest)
-            except (BrokenPipeError, ConnectionResetError):
-                self.close_connection = True
-            except Exception as exc:
-                print(f"ctx-engine GET error: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
-                self.send_bytes(502, b'{"error":{"message":"context router upstream failure","type":"server_error"}}')
+        parsed = urlsplit(self.path)
+        path = parsed.path.rstrip("/")
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        try:
+            if path == "/debug/projects":
+                if query:
+                    raise DebugInputError("debug/projects does not accept query parameters")
+                self.send_bytes(200, compact_json(debug_projects()).encode())
+            elif path == "/debug/sessions":
+                values = _debug_query(query, ("project",))
+                self.send_bytes(200, compact_json(debug_session_list(_debug_project(values["project"]))).encode())
+            elif path == "/debug/session":
+                values = _debug_query(query, ("id", "project"))
+                detail = debug_session_detail(values["id"], _debug_project(values["project"]))
+                self.send_bytes(200 if detail else 404, compact_json(detail or {"error": "not found"}).encode())
+            elif path == "/debug/prompt":
+                if query:
+                    raise DebugInputError("debug/prompt does not accept query parameters")
+                self.send_bytes(200, compact_json(debug_prompt_payload()).encode())
+            elif path == "/health":
+                self.send_bytes(200, b'{"status":"ok"}')
+            elif path == "/stats":
+                self.send_bytes(200, compact_json(stats_snapshot()).encode())
+            elif path in ("/dashboard", "/dashboard/index.html"):
+                self.serve_dashboard("index.html")
+            elif path.startswith("/dashboard/assets/"):
+                name = path.removeprefix("/dashboard/assets/")
+                if not re.fullmatch(r"[A-Za-z0-9._/-]+", name) or ".." in name.split("/"):
+                    self.send_bytes(404, b'{"error":"not found"}')
+                    return
+                self.serve_dashboard("assets/" + name)
+            elif path == "/token-stats":
+                try:
+                    self.send_bytes(200, compact_json(token_stats()).encode())
+                except (sqlite3.Error, OSError) as exc:
+                    print(f"ctx-engine token stats error: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+                    self.send_bytes(503, b'{"error":"local token journal unavailable"}')
+            elif path.startswith("/request/"):
+                detail = request_detail(int(path.rsplit("/", 1)[-1])) if path.rsplit("/", 1)[-1].isdigit() else None
+                self.send_bytes(200 if detail else 404, compact_json(detail or {"error": "not found"}).encode())
+            else:
+                upstream, rest = self.resolve_upstream(path)
+                if upstream is None:
+                    self.send_bytes(404, b'{"error":"not found"}')
+                    return
+                try:
+                    self.forward_get(upstream, rest)
+                except (BrokenPipeError, ConnectionResetError):
+                    self.close_connection = True
+                except Exception as exc:
+                    print(f"ctx-engine GET error: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+                    self.send_bytes(502, b'{"error":{"message":"context router upstream failure","type":"server_error"}}')
+        except DebugInputError as exc:
+            self.send_bytes(400, compact_json({"error": str(exc)}).encode())
+        except sqlite3.Error as exc:
+            cache_error("debug endpoint", exc)
+            self.send_bytes(503, b'{"error":"ctx-engine database unavailable"}')
 
     def do_POST(self) -> None:
         started = time.perf_counter()
-        path = self.path.split("?", 1)[0].rstrip("/")
+        parsed = urlsplit(self.path)
+        path = parsed.path.rstrip("/")
+        if path == "/debug/prompt" and parsed.query:
+            self.send_bytes(400, b'{"error":"debug/prompt does not accept query parameters"}')
+            return
+        if path == "/debug/prompt":
+            try:
+                length = int(self.headers.get("Content-Length", "-1"))
+            except ValueError:
+                self.send_bytes(400, b'{"error":"invalid content length"}')
+                return
+            if length <= 0 or length > PROMPT_MAX_CHARS + 128:
+                self.send_bytes(413, b'{"error":"prompt request body size rejected"}')
+                return
+            try:
+                payload = json.loads(self.rfile.read(length))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                self.send_bytes(400, b'{"error":"invalid JSON"}')
+                return
+            if not isinstance(payload, dict) or set(payload) != {"prompt"}:
+                self.send_bytes(400, b'{"error":"body must be {\\"prompt\\": string}"}')
+                return
+            try:
+                result = save_debug_prompt(payload["prompt"])
+            except DebugInputError as exc:
+                self.send_bytes(400, compact_json({"error": str(exc)}).encode())
+                return
+            except sqlite3.Error:
+                self.send_bytes(503, b'{"error":"ctx-engine database unavailable"}')
+                return
+            self.send_bytes(200, compact_json(result).encode())
+            return
         if path == "/config":
             try:
                 length = int(self.headers.get("Content-Length", "0"))

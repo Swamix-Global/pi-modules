@@ -104,10 +104,9 @@ CONDENSER_SYSTEM = (
     "bottom of the prompt gives this block's ceiling; stay within it, and spend it: a note far shorter than the "
     "ceiling means identifiers, numbers or open threads from the block were dropped.\n"
     "Example:\n"
-    "- Task/Query: stop the condenser looping on small quantised models.\n"
-    "- Actions Performed: raised PI_CONTEXT_ROUTER_DEEPSEEK_MAX_TOKENS to 4096 in ctx_engine_server.py, then "
-    "verified with tests/test_context_router.py and restarted the service.\n"
-    "- Conclusion: structured notes with no retry and one cache hit on replay; DeepSeek kept temperature 0.1."
+    "- Task/Query: find why block 7f3a91c2e0b44d18 was still pending after the context-router replay.\n"
+    "- Actions Performed: compared the block transcript from 2026-09-24T00-33-31-978Z_01a0d0d4-f349-73d3-a379-98e720020fa5.jsonl with summaries.digest in ctx-engine.db; the row was absent, while requests.raw contained only a 4000-character excerpt.\n"
+    "- Conclusion: block 7f3a91c2e0b44d18 was not yet condensed; the debugger must show the full bounded session block and must not treat the request excerpt as its summary."
 )
 
 

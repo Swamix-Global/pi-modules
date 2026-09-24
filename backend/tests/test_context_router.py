@@ -92,7 +92,44 @@ class RouterTests(unittest.TestCase):
             return reply
         router.call_condenser = fake
 
-    def test_below_threshold_is_byte_identical(self):
+    def test_debugger_reads_real_shaped_sessions_and_prompt_invalidates_cache(self):
+        """The debugger shows complete bounded blocks and only a matching prompt identity gets a note."""
+        project = os.path.join(self.tmpdir, "project")
+        session_root = os.path.join(self.tmpdir, "pi-sessions")
+        os.makedirs(session_root)
+        session_path = os.path.join(session_root, "2026-09-24T00-33-31-978Z_fixture.jsonl")
+        records = [
+            {"type": "session", "version": 3, "id": "fixture-id", "timestamp": "2026-09-24T00:33:31.978Z", "cwd": project},
+            {"type": "session_info", "id": "info", "timestamp": "2026-09-24T00:33:31.978Z", "name": "prompt cache fixture"},
+            {"type": "message", "id": "u1", "parentId": None, "timestamp": 1790210263784,
+             "message": {"role": "user", "content": [{"type": "text", "text": "keep this complete evidence"}], "timestamp": 1790210263784}},
+            {"type": "message", "id": "a1", "parentId": "u1", "timestamp": 1790210264000,
+             "message": {"role": "assistant", "content": [{"type": "text", "text": "ran command with exact result 42"}], "provider": "deepseek", "model": "deepseek-flash"}},
+        ]
+        with open(session_path, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(json.dumps(record) for record in records) + "\n")
+        old_roots = router.DEBUG_SESSION_ROOTS
+        old_prompt = router.condenser_prompt()
+        router.DEBUG_SESSION_ROOTS = (("pi", session_root),)
+        try:
+            self.assertEqual(router.debug_session_list(project)["sessions"][0]["blocks"], 1)
+            missing = router.debug_session_detail("pi:2026-09-24T00-33-31-978Z_fixture.jsonl", project)
+            self.assertEqual(missing["blocks"][0]["after"], "not yet condensed")
+            block = router._debug_sessions(project)[0]["blocks"][0]
+            digest = router.block_id(block)
+            note = "- Task/Query: fixture\n- Actions Performed: command\n- Conclusion: 42"
+            router.cache_put(digest, note, "deepseek", router.summary_target(), router.DEEPSEEK_MODEL)
+            detail = router.debug_session_detail("pi:2026-09-24T00-33-31-978Z_fixture.jsonl", project)
+            self.assertIn("keep this complete evidence", detail["blocks"][0]["before"])
+            self.assertEqual(detail["blocks"][0]["after"], note)
+            changed = old_prompt + "\nAdditional evidence rule: preserve exit status."
+            self.assertEqual(router.save_debug_prompt(changed)["prompt"], changed)
+            self.assertEqual(router.debug_prompt_payload()["prompt"], changed)
+            self.assertIsNone(router.cache_get(digest, "deepseek", router.summary_target(), router.DEEPSEEK_MODEL))
+        finally:
+            router.DEBUG_SESSION_ROOTS = old_roots
+            router.save_debug_prompt(old_prompt)
+
         raw = b'{ "model": "gpt", "input": [{"role":"user","content":"hello"}] }'
         output, changed = router.rewrite_request(raw, token_limit=64000)
         self.assertFalse(changed)
