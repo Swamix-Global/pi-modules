@@ -105,7 +105,7 @@ CONDENSER_SYSTEM = (
     "ceiling means identifiers, numbers or open threads from the block were dropped.\n"
     "Example (from a real SGLang troubleshooting session):\n"
     "- Task/Query: restart the Granite 4.2 SGLang server after changing HiCache and mixed-chunk options.\n"
-    "- Actions Performed: found orphaned PID 37624 holding port 30000; sent TERM, then killed process group -37624 and launcher PIDs 37625 and 37627; removed ~/src/sglang-server/logs/sgl.pid, relaunched ./launch-sgl.sh and polled http://127.0.0.1:30000/v1/models.\n"
+    "- Actions Performed: found PID 37624 and launcher PIDs 37625/37627; sent TERM to 37624 (process group 37624), removed ~/src/sglang-server/logs/sgl.pid, relaunched ./launch-sgl.sh and polled http://127.0.0.1:30000/v1/models.\n"
     "- Conclusion: PID 37624 died and port 30000 became free; readiness polling timed out with exit 124, so the new server's state was not verified."
 )
 
