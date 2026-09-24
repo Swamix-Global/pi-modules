@@ -138,7 +138,7 @@ export function ContextView({ stats }: { stats: Stats }) {
 
   return (
     <div className="space-y-2">
-      <div className="text-[12.5px] text-muted">{stats.model} condenser · compacts above {fmt(stats.token_limit)} tokens · {fmt(stats.summary_tokens)} tokens per block</div>
+      <div className="text-[12.5px] text-muted">{stats.model} condenser · compacts above {fmt(stats.token_limit)} tokens · {fmt(stats.summary_words)} words per block</div>
 
       <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
         <StatCard
@@ -178,7 +178,7 @@ export function ContextView({ stats }: { stats: Stats }) {
               rows={[
                 ["Blocks seen", fmt(stats.blocks_seen)],
                 ["Blocks summarized", fmt(stats.blocks_summarized)],
-                ["Blocks pending", fmt(stats.blocks_pending)],
+                ["Fallback notes", fmt(stats.blocks_fallback)],
                 ["Cache hits", fmt(stats.cache_hits)],
                 ["Cached now", fmt(stats.cache_entries)],
                 ["Hit rate", pct(stats.blocks_seen ? (100 * stats.cache_hits) / stats.blocks_seen : 0)],

@@ -76,8 +76,9 @@ class RouterTests(unittest.TestCase):
             if isinstance(router.METRICS[key], (int, float)) and key != "started":
                 router.METRICS[key] = 0
         router.WAIT_MS = 2000
+        router.FALLBACK_MS = 20
         router.BUDGET["tokens"] = router.CONTEXT_TOKENS
-        router.SUMMARY["tokens"] = router.DEFAULT_SUMMARY_TOKENS
+        router.SUMMARY["words"] = router.DEFAULT_SUMMARY_WORDS
         with router.JOBS_LOCK:
             router.SUMMARY_JOBS.clear()
         self.calls = []
@@ -91,6 +92,43 @@ class RouterTests(unittest.TestCase):
             self.calls.append(prompt)
             return reply
         router.call_condenser = fake
+
+    def test_random_condenser_resolves_per_block_and_input_keeps_the_verbatim_query(self):
+        """Random mode picks an available real condenser per block, and the condenser input starts with the user text."""
+        old_choices = router.provider_choices
+        router.provider_choices = lambda: [
+            {"provider": "local", "label": "Local", "model": "granite-4.2-3b-fp8", "available": True},
+            {"provider": "deepseek", "label": "DeepSeek", "model": "deepseek-flash", "available": True},
+            {"provider": "openai-codex", "label": "Codex Luna", "model": "gpt-6-luna", "available": False, "error": "unavailable"},
+            {"provider": router.RANDOM_PROVIDER, "label": "Random", "model": "any available", "available": True},
+        ]
+        self.stub_condenser()
+        query = "Restart SGLang only after changing HiCache, then verify port 30000."
+        block = [{"role": "user", "content": [{"type": "input_text", "text": query}]},
+                 {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "done"}]}]
+        old_active = router.ACTIVE_PROVIDER
+        try:
+            router.set_active_provider(router.RANDOM_PROVIDER)
+            self.assertEqual(router.ACTIVE_PROVIDER, router.RANDOM_PROVIDER)
+            picks = {router.resolve_provider(router.RANDOM_PROVIDER) for _ in range(40)}
+            self.assertTrue(picks <= {"local", "deepseek"})
+            snapshot = router.resolve_snapshot({"provider": router.RANDOM_PROVIDER, "model": "any available", "words": 400, "prompt_hash": "x"})
+            self.assertIn(snapshot["provider"], {"local", "deepseek"})
+            self.assertEqual(snapshot["model"], router.provider_model(snapshot["provider"]))
+            _ident, summary = router.summarize_block(block)
+            self.assertTrue(router.is_current_summary(summary))
+            blocks = [[{"role": "user", "content": f"request {n}"}, {"role": "assistant", "content": f"answer {n}"}] for n in range(4)]
+            notes = router.condense_completed(blocks, snapshot=router.condenser_snapshot())
+            self.assertEqual(len(notes), 4)
+            rendered = {provider for block_item, (ident, note) in zip(blocks, notes) if router.is_current_summary(note)
+                        for provider in ("local", "deepseek")
+                        if router.cache_get(ident, provider, router.summary_target(), router.provider_model(provider), router.condenser_prompt_hash())}
+            self.assertTrue(rendered <= {"local", "deepseek"})
+        finally:
+            router.ACTIVE_PROVIDER = old_active
+            router.provider_choices = old_choices
+        self.assertIn(query, self.calls[0])
+        self.assertIn("verbatim", self.calls[0].splitlines()[0].lower())
 
     def test_debugger_reads_real_shaped_sessions_and_prompt_invalidates_cache(self):
         """The debugger shows complete bounded blocks and only a matching prompt identity gets a note."""
@@ -242,6 +280,8 @@ class RouterTests(unittest.TestCase):
         self.stub_condenser()
         image = {"role": "user", "content": [{"type": "input_image", "image_url": "data:image/png;base64," + "A" * 4096}]}
         items = history_blocks(3) + [image, {"role": "assistant", "content": [{"type": "output_text", "text": "seen"}]},
+                                     {"role": "user", "content": [{"type": "input_text", "text": "follow-up"}]},
+                                     {"role": "assistant", "content": [{"type": "output_text", "text": "ok"}]},
                                      {"role": "user", "content": [{"type": "input_text", "text": "current"}]}]
         output, changed = router.rewrite_request(json.dumps({"input": items}).encode(), token_limit=1000)
         self.assertTrue(changed)
@@ -260,7 +300,7 @@ class RouterTests(unittest.TestCase):
         finally:
             router.http_json, router.deepseek_key = real_http, real_key
         self.assertIn("Length hint: this block is", captured["messages"][-1]["content"])
-        self.assertIn("within 100 tokens.", captured["messages"][-1]["content"], "the global token ceiling is the hint")
+        self.assertIn("aim for a note around 400 words", captured["messages"][-1]["content"], "the default output hint is 400 words")
         self.assertTrue(router.is_current_summary(summary))
 
     def test_summary_length_is_part_of_the_cache_key(self):
@@ -270,7 +310,7 @@ class RouterTests(unittest.TestCase):
         self.assertIsNone(router.cache_get("d1", "local", 200), "a different length target must not hit")
 
     def test_every_length_coexists_in_the_cache(self):
-        notes = {step: f"- Task/Query: note {step}\n- Actions Performed: b\n- Conclusion: c" for step in router.SUMMARY_TOKEN_STEPS}
+        notes = {step: f"- Task/Query: note {step}\n- Actions Performed: b\n- Conclusion: c" for step in router.SUMMARY_WORD_STEPS}
         for step, note in notes.items():
             router.cache_put("coexist", note, "deepseek", step)
         for step, note in notes.items():
@@ -297,14 +337,19 @@ class RouterTests(unittest.TestCase):
             conn.close()
         self.assertEqual(models, ["model-a", "model-b"], "both models persist side by side")
 
-    def test_summary_lengths_come_from_the_fixed_token_menu(self):
-        for tokens in router.SUMMARY_TOKEN_STEPS:
-            router.SUMMARY["tokens"] = tokens
-            self.assertEqual(router.summary_target(), tokens)
-            self.assertTrue(router.summary_hint("x" * 350).endswith(f"keep the whole note within {tokens} tokens."))
-        self.assertEqual(router.SUMMARY_TOKEN_STEPS, (50, 100, 200, 400), "token-first menu, not per-block word steps")
-        router.SUMMARY["tokens"] = 100
-        self.assertEqual(router.summary_target(), 100, "one global length, not derived from the block size")
+    def test_summary_lengths_are_word_sizing_hints_from_the_fixed_menu(self):
+        self.assertEqual(router.DEFAULT_SUMMARY_WORDS, 400)
+        self.assertEqual(router.SUMMARY["words"], 400)
+        for words in router.SUMMARY_WORD_STEPS:
+            router.SUMMARY["words"] = words
+            self.assertEqual(router.summary_target(), words)
+            hint = router.summary_hint("one two three")
+            self.assertIn("this block is about 3 words", hint)
+            self.assertIn(f"aim for a note around {words} words", hint)
+            self.assertNotIn("within", hint)
+        self.assertEqual(router.SUMMARY_WORD_STEPS, (50, 100, 200, 400))
+        router.SUMMARY["words"] = 400
+        self.assertEqual(router.summary_target(), 400, "one global word target, not derived from block size")
 
     def test_old_word_rows_are_not_reusable_as_token_entries(self):
         conn = sqlite3.connect(router.DB_PATH)
@@ -326,6 +371,26 @@ class RouterTests(unittest.TestCase):
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM summaries_words_legacy").fetchone()[0], 2, "old notes are archived")
         finally:
             conn.close()
+
+    def test_old_token_length_cache_and_config_are_archived_on_word_migration(self):
+        conn = sqlite3.connect(router.DB_PATH)
+        conn.execute(router.SCHEMA)
+        conn.execute(router.CONFIG_SCHEMA)
+        conn.execute("INSERT INTO config VALUES ('summary_tokens', '400', 1.0)")
+        note = "- Task/Query: old token note\\n- Actions Performed: old\\n- Conclusion: archived"
+        conn.execute("INSERT INTO summaries VALUES ('legacy-digest', 'deepseek', ?, 'deepseek-flash', 400, 'old-prompt-hash', 1.0)", (note,))
+        conn.commit()
+        conn.close()
+        router.init_db()
+        router.SUMMARY["words"] = router.DEFAULT_SUMMARY_WORDS
+        router.load_config()
+        self.assertEqual(router.SUMMARY["words"], 400, "old persisted 400-token setting must not determine the word default")
+        self.assertIsNone(router.cache_get("legacy-digest", "deepseek", 400), "token-era notes are never reused")
+        with sqlite3.connect(router.DB_PATH) as conn:
+            self.assertEqual(conn.execute("SELECT summary FROM summaries_tokens_legacy WHERE digest = 'legacy-digest'").fetchone()[0], note)
+            self.assertEqual(conn.execute("SELECT value FROM config WHERE key = 'summary_tokens_tokens_legacy'").fetchone()[0], "400")
+            self.assertIsNone(conn.execute("SELECT 1 FROM config WHERE key = 'summary_tokens'").fetchone())
+            self.assertEqual(conn.execute("SELECT value FROM config WHERE key = 'summary_length_unit'").fetchone()[0], "words")
 
     def test_superseded_schema_is_archived_not_dropped(self):
         """A pre-prompt-pk table keeps its notes in the archive without inventing a prompt identity."""
@@ -378,15 +443,16 @@ class RouterTests(unittest.TestCase):
         output, changed = router.rewrite_request(json.dumps(body).encode(), token_limit=1000)
         self.assertTrue(changed)
         rewritten = json.loads(output)
+        live = router.split_blocks(body["input"])[-router.LIVE_BLOCKS:]
+        live_items = [item for block in live for item in block]
         self.assertEqual(rewritten["input"][-len(current):], current)
-        self.assertTrue(rewritten["input"][0]["content"][0]["text"].startswith(router.FRAME))
+        self.assertEqual(rewritten["input"][-len(live_items):-len(current)], live[0], "the block before the live one stays byte-exact too")
         self.assertLessEqual(router.estimate_tokens(rewritten), 1000)
-        # one summary per completed block while they fit; oldest are dropped first, never the current turn
-        summaries = rewritten["input"][:-len(current)]
+        # one summary per completed block while they fit; oldest are dropped first, never the live window
+        summaries = rewritten["input"][:-len(live_items)]
         self.assertTrue(1 <= len(summaries) <= 12, len(summaries))
-        ids = [re.search(r"\[block ([0-9a-f]+)\]", s["content"][0]["text"]).group(1) for s in summaries]
-        self.assertEqual(len(set(ids)), len(ids), "block ids must be unique")
-        self.assertTrue(all("[block " in s["content"][0]["text"] for s in summaries))
+        expected = "- Task/Query: fix checkout\n- Actions Performed: patched the retry path\n- Conclusion: checkout still failed after r221; error rate peaked at 42.0 percent."
+        self.assertTrue(all(s["content"][0]["text"] == expected for s in summaries))
 
     def test_repeated_blocks_are_summarized_once(self):
         self.stub_condenser()
@@ -398,20 +464,33 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(len(self.calls), calls_after_first, "a repeated block must be served from cache")
         self.assertGreater(router.stats_snapshot()["cache_hits"], 0)
 
-    def test_condenser_failure_never_releases_the_uncompacted_turn(self):
+    def test_condenser_failure_serves_clipped_excerpts_instead_of_pending(self):
+        """A failed condenser still replaces every completed block, clipped, and never as a pending marker."""
         def broken(_prompt, _target=None):
             raise router.CondenserError("backend down")
         real = router.call_condenser
         router.call_condenser = broken
         try:
-            raw = json.dumps({"input": history_blocks(6) + [{"role": "user", "content": [{"type": "input_text", "text": "next"}]}]}).encode()
-            output, changed = router.rewrite_request(raw, token_limit=1000)
+            items = history_blocks(6) + [{"role": "user", "content": [{"type": "input_text", "text": "next"}]}]
+            output, changed = router.rewrite_request(json.dumps({"input": items}).encode(), token_limit=1000)
             self.assertTrue(changed, "a failed condenser must not release the whole backlog")
-            self.assertNotIn(b"old request 0", output)
-            self.assertLessEqual(router.estimate_tokens(json.loads(output)), 1000)
+            self.assertNotIn(b"summary pending", output)
+            rewritten = json.loads(output)
+            self.assertLessEqual(router.estimate_tokens(rewritten), 1000)
+            completed = len(router.split_blocks(items)) - router.LIVE_BLOCKS
             stats = router.stats_snapshot()
-            self.assertEqual(stats["condenser_errors"], 6)
-            self.assertEqual(stats["blocks_pending"], 6)
+            self.assertEqual(stats["condenser_errors"], completed)
+            self.assertEqual(stats["blocks_fallback"], completed)
+            self.assertEqual(stats["blocks_pending"], 0)
+            live = [item for block in router.split_blocks(items)[-router.LIVE_BLOCKS:] for item in block]
+            excerpts = rewritten["input"][:-len(live)]
+            self.assertTrue(excerpts)
+            self.assertTrue(all(len(item["content"][0]["text"]) <= router.FALLBACK_CHARS for item in excerpts))
+            self.stub_condenser()
+            repaired, _changed = router.rewrite_request(json.dumps({"input": items}).encode(), token_limit=1000)
+            self.assertEqual(json.loads(repaired)["input"][:-len(live)], excerpts,
+                             "recovery must not rewrite a served excerpt and invalidate the prefix cache")
+            self.assertEqual(self.calls, [], "a pinned excerpt is served without a condenser call")
         finally:
             router.call_condenser = real
 
@@ -437,20 +516,20 @@ class RouterTests(unittest.TestCase):
         fresh process loads the chosen values over the env defaults instead of reverting."""
         self.assertTrue(router.init_db())
         router.BUDGET["tokens"] = 100000
-        router.SUMMARY["tokens"] = 200
+        router.SUMMARY["words"] = 200
         router.config_set("tokens", 100000)
-        router.config_set("summary_tokens", 200)
+        router.config_set("summary_words", 200)
         spec = importlib.util.spec_from_file_location("context_router_sliders", MODULE_PATH)
         fresh = importlib.util.module_from_spec(spec)
         assert spec.loader
         spec.loader.exec_module(fresh)
         fresh.DB_PATH = router.DB_PATH
         fresh.BUDGET["tokens"] = fresh.CONTEXT_TOKENS
-        fresh.SUMMARY["tokens"] = fresh.DEFAULT_SUMMARY_TOKENS
+        fresh.SUMMARY["words"] = fresh.DEFAULT_SUMMARY_WORDS
         fresh.load_config()
         self.assertEqual(fresh.BUDGET["tokens"], 100000)
         self.assertEqual(fresh.stats_snapshot()["token_limit"], 100000)
-        self.assertEqual(fresh.stats_snapshot()["summary_tokens"], 200)
+        self.assertEqual(fresh.stats_snapshot()["summary_words"], 200)
 
     def test_live_config_writes_through_to_disk(self):
         """The live /config endpoint must persist, not only move the in-memory dict, so the slider is durable."""
@@ -458,7 +537,7 @@ class RouterTests(unittest.TestCase):
         threading.Thread(target=server.serve_forever, daemon=True).start()
         try:
             client = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
-            client.request("POST", "/config", body=b'{"tokens":64000,"summary_tokens":400}', headers={"Content-Type": "application/json"})
+            client.request("POST", "/config", body=b'{"tokens":64000,"summary_words":400}', headers={"Content-Type": "application/json"})
             ok = client.getresponse()
             self.assertEqual(ok.status, 200)
             ok.read()
@@ -473,7 +552,7 @@ class RouterTests(unittest.TestCase):
         fresh.DB_PATH = router.DB_PATH
         fresh.load_config()
         self.assertEqual(fresh.BUDGET["tokens"], 64000)
-        self.assertEqual(fresh.SUMMARY["tokens"], 400)
+        self.assertEqual(fresh.SUMMARY["words"], 400)
 
     def test_deepseek_empty_content_is_retried_once(self):
         """A reasoning model can spend the whole budget on reasoning and return empty content; one retry at
@@ -513,7 +592,7 @@ class RouterTests(unittest.TestCase):
             self.assertNotIn("min_p", captured)
             self.assertNotIn("repetition_penalty", captured)
             self.assertTrue(captured["messages"][-1]["content"].endswith(
-                "Length hint: this block is about 100 tokens; keep the whole note within 100 tokens."))
+                "Length hint: this block is about 1 word; aim for a note around 400 words, without omitting important details."))
         finally:
             router.http_json, router.deepseek_key = real_http, real_key
 
@@ -541,23 +620,25 @@ class RouterTests(unittest.TestCase):
     def test_chat_completions_is_condensed_and_the_live_turn_is_exact(self):
         self.stub_condenser()
         messages = [{"role": "system", "content": "kernel instructions"}]
-        for index in range(8):
+        for index in range(7):
             messages.append({"role": "user", "content": f"old ask {index} " + "x" * 4000})
             messages.append({"role": "assistant", "content": f"old answer {index}"})
+        previous = [{"role": "user", "content": "previous ask"}, {"role": "assistant", "content": "previous answer"}]
         live = [
             {"role": "user", "content": "current ask"},
             {"role": "assistant", "content": None, "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "read", "arguments": '{"path":"x"}'}}]},
             {"role": "tool", "tool_call_id": "call-1", "content": "result"},
         ]
-        body = {"model": "deepseek-flash", "messages": messages + live}
+        body = {"model": "deepseek-flash", "messages": messages + previous + live}
         output, changed = router.rewrite_request(json.dumps(body).encode(), token_limit=1000)
         self.assertTrue(changed)
         rewritten = json.loads(output)
         self.assertEqual(rewritten["messages"][0], {"role": "system", "content": "kernel instructions"})
         self.assertEqual(rewritten["messages"][-len(live):], live, "live turn must stay byte-exact")
-        summaries = rewritten["messages"][1:-len(live)]
-        self.assertTrue(summaries and all(m["role"] == "user" and router.FRAME in m["content"] for m in summaries))
-        self.assertTrue(all(re.search(r"\[block [0-9a-f]{16}\]", m["content"]) for m in summaries))
+        self.assertEqual(rewritten["messages"][-len(live)-len(previous):-len(live)], previous, "the previous turn stays byte-exact too")
+        summaries = rewritten["messages"][1:-len(live)-len(previous)]
+        expected = "- Task/Query: fix checkout\n- Actions Performed: patched the retry path\n- Conclusion: checkout still failed after r221; error rate peaked at 42.0 percent."
+        self.assertTrue(summaries and all(m["role"] == "user" and m["content"] == expected for m in summaries))
         self.assertLessEqual(router.estimate_tokens(rewritten), 1000)
         # a tool result outside a block would break the API contract, so the tool message must follow its call inside the live turn
         self.assertEqual([m["role"] for m in rewritten["messages"][-3:]], ["user", "assistant", "tool"])
@@ -593,7 +674,8 @@ class RouterTests(unittest.TestCase):
         self.assertTrue(changed)
         self.assertEqual(json.loads(output)["input"][0]["content"][1], image, "the image is passed byte-identical")
 
-    def test_slow_condenser_is_held_back_then_cached(self):
+    def test_slow_condenser_serves_a_fallback_note_then_caches(self):
+        """A note still unfinished at the wait budget is served as the fallback clip, never as pending."""
         release = threading.Event()
 
         def slow(prompt, _target=None):
@@ -604,21 +686,28 @@ class RouterTests(unittest.TestCase):
         real_wait, real_call = router.WAIT_MS, router.call_condenser
         router.call_condenser, router.WAIT_MS = slow, 50
         try:
-            raw = json.dumps({"input": history_blocks(6) + [{"role": "user", "content": [{"type": "input_text", "text": "next"}]}]}).encode()
+            items = history_blocks(6) + [{"role": "user", "content": [{"type": "input_text", "text": "next"}]}]
+            raw = json.dumps({"input": items}).encode()
             first, changed = router.rewrite_request(raw, token_limit=1000)
             self.assertTrue(changed)
-            self.assertIn(router.PENDING_SUMMARY, first.decode(), "an unfinished note is held back, not sent as history")
-            self.assertEqual(router.stats_snapshot()["blocks_pending"], 6)
+            self.assertNotIn(b"summary pending", first, "an unfinished note is never rendered as pending")
+            completed = len(router.split_blocks(items)) - router.LIVE_BLOCKS
+            self.assertEqual(router.stats_snapshot()["blocks_fallback"], completed)
+            self.assertEqual(router.stats_snapshot()["blocks_pending"], 0)
+            live = [item for block in router.split_blocks(items)[-router.LIVE_BLOCKS:] for item in block]
+            first_notes = json.loads(first)["input"][:-len(live)]
             release.set()
             deadline = time.time() + 10
-            while router.cache_count() < 6 and time.time() < deadline:
+            while (router.cache_counts()["deepseek"] < completed or router.cache_counts()["local"] < completed) and time.time() < deadline:
                 time.sleep(0.05)
-            self.assertEqual(router.cache_count(), 6, "the workers finish the notes for the next request")
+            self.assertEqual(router.cache_counts()["deepseek"], completed, "the primary workers finish the notes")
+            self.assertEqual(router.cache_counts()["local"], completed, "the fallback workers finish too")
             calls = len(self.calls)
             second, _changed = router.rewrite_request(raw, token_limit=1000)
-            self.assertNotIn(router.PENDING_SUMMARY, second.decode(), "the next request reads the cached notes")
-            self.assertIn("cached for the next request", second.decode())
-            self.assertEqual(len(self.calls), calls, "cached notes are not recomputed")
+            self.assertNotIn(b"summary pending", second, "the next request never sees a pending marker")
+            self.assertEqual(json.loads(second)["input"][:-len(live)], first_notes,
+                             "a served block keeps its exact wire text, so the provider prefix cache survives")
+            self.assertEqual(len(self.calls), calls, "pinned text is not recomputed")
         finally:
             release.set()
             router.call_condenser, router.WAIT_MS = real_call, real_wait
@@ -676,7 +765,8 @@ class RouterTests(unittest.TestCase):
             filler = int(router.CONTEXT_TOKENS * router.CHARS_PER_TOKEN) + 200_000
             big = {"role": "user", "content": [{"type": "input_text", "text": "x" * filler}]}
             answer = {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "noted"}]}
-            large = json.dumps({"input": [big, answer, {"role": "user", "content": [{"type": "input_text", "text": "current"}]}]}).encode()
+            middle = {"role": "user", "content": [{"type": "input_text", "text": "middle"}]}
+            large = json.dumps({"input": [big, answer, middle, {"role": "user", "content": [{"type": "input_text", "text": "current"}]}]}).encode()
             large_body = json.loads(large)
             compressed = zstd.compress(large)
             client = http.client.HTTPConnection("127.0.0.1", proxy.server_port, timeout=5)
@@ -687,7 +777,10 @@ class RouterTests(unittest.TestCase):
             self.assertEqual(response.getheader("X-Context-Router"), "compacted")
             self.assertEqual(UpstreamHandler.content_encoding, "zstd")
             rewritten = json.loads(UpstreamHandler.body)
-            self.assertTrue(rewritten["input"][0]["content"][0]["text"].startswith(router.FRAME))
+            tail = [middle, {"role": "user", "content": [{"type": "input_text", "text": "current"}]}]
+            expected = "- Task/Query: fix checkout\n- Actions Performed: patched the retry path\n- Conclusion: checkout still failed after r221; error rate peaked at 42.0 percent."
+            self.assertEqual(rewritten["input"][0]["content"][0]["text"], expected)
+            self.assertEqual(rewritten["input"][-len(tail):], tail, "the retained window reaches the upstream byte-exact")
             self.assertLessEqual(router.estimate_tokens(rewritten), router.CONTEXT_TOKENS)
 
             row = router.recent_requests(1)[0]
@@ -700,7 +793,7 @@ class RouterTests(unittest.TestCase):
             client.close()
             self.assertEqual(detail["id"], row["id"])
             self.assertEqual(detail["result"], "compacted")
-            self.assertEqual([b["id"] for b in detail["plan"]["blocks"]], [router.block_id(b) for b in router.split_blocks(large_body["input"])[:-1]])
+            self.assertEqual([b["id"] for b in detail["plan"]["blocks"]], [router.block_id(b) for b in router.split_blocks(large_body["input"])[:-router.LIVE_BLOCKS]])
             self.assertEqual(router.request_detail(10 ** 9), None)
 
             client = http.client.HTTPConnection("127.0.0.1", proxy.server_port, timeout=5)
@@ -720,13 +813,13 @@ class RouterTests(unittest.TestCase):
             self.assertEqual(rejected.status, 400)
             rejected.read()
 
-            client.request("POST", "/config", body=b'{"summary_tokens":200}', headers={"Content-Type": "application/json"})
+            client.request("POST", "/config", body=b'{"summary_words":200}', headers={"Content-Type": "application/json"})
             configured = json.loads(client.getresponse().read())
-            self.assertEqual(configured["summary_tokens"], 200)
+            self.assertEqual(configured["summary_words"], 200)
             snapshot = router.stats_snapshot()
-            self.assertEqual(snapshot["summary_tokens"], 200, "the global block output length applies without a restart")
-            self.assertEqual(snapshot["summary_token_steps"], [50, 100, 200, 400])
-            client.request("POST", "/config", body=b'{"summary_tokens":123}', headers={"Content-Type": "application/json"})
+            self.assertEqual(snapshot["summary_words"], 200, "the global block output length applies without a restart")
+            self.assertEqual(snapshot["summary_word_steps"], [50, 100, 200, 400])
+            client.request("POST", "/config", body=b'{"summary_words":123}', headers={"Content-Type": "application/json"})
             bad = client.getresponse()
             self.assertEqual(bad.status, 400, "a length outside the fixed token menu is rejected")
             bad.read()
@@ -741,29 +834,29 @@ class RouterTests(unittest.TestCase):
     def test_config_valid_threshold_with_invalid_length_does_not_partially_update(self):
         """One POST carries both fields; validating the whole payload before applying keeps a rejected length
         from leaving the threshold moved."""
-        real_budget, real_summary = router.BUDGET["tokens"], router.SUMMARY["tokens"]
+        real_budget, real_summary = router.BUDGET["tokens"], router.SUMMARY["words"]
         server = router.make_server("127.0.0.1", 0, "https://upstream.invalid")
         threading.Thread(target=server.serve_forever, daemon=True).start()
         try:
-            router.BUDGET["tokens"], router.SUMMARY["tokens"] = 64000, 100
+            router.BUDGET["tokens"], router.SUMMARY["words"] = 64000, 100
             client = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
-            client.request("POST", "/config", body=b'{"tokens":8192,"summary_tokens":123}', headers={"Content-Type": "application/json"})
+            client.request("POST", "/config", body=b'{"tokens":8192,"summary_words":123}', headers={"Content-Type": "application/json"})
             bad = client.getresponse()
             self.assertEqual(bad.status, 400)
             bad.read()
             self.assertEqual(router.BUDGET["tokens"], 64000, "a rejected length must not let the valid threshold apply")
-            self.assertEqual(router.SUMMARY["tokens"], 100, "the current length is untouched by the rejected payload")
-            client.request("POST", "/config", body=b'{"tokens":8192,"summary_tokens":200}', headers={"Content-Type": "application/json"})
+            self.assertEqual(router.SUMMARY["words"], 100, "the current length is untouched by the rejected payload")
+            client.request("POST", "/config", body=b'{"tokens":8192,"summary_words":200}', headers={"Content-Type": "application/json"})
             ok = client.getresponse()
             self.assertEqual(ok.status, 200)
-            self.assertEqual(json.loads(ok.read()), {"tokens": 8192, "summary_tokens": 200})
+            self.assertEqual(json.loads(ok.read()), {"tokens": 8192, "summary_words": 200})
             self.assertEqual(router.BUDGET["tokens"], 8192)
-            self.assertEqual(router.SUMMARY["tokens"], 200)
+            self.assertEqual(router.SUMMARY["words"], 200)
             client.close()
         finally:
             server.shutdown()
             server.server_close()
-            router.BUDGET["tokens"], router.SUMMARY["tokens"] = real_budget, real_summary
+            router.BUDGET["tokens"], router.SUMMARY["words"] = real_budget, real_summary
 
     def test_request_window_persists_and_rolls_over_the_last_100(self):
         for i in range(150):
@@ -867,6 +960,13 @@ class RouterTests(unittest.TestCase):
         detail = router.request_detail(router.recent_requests(3)[1]["id"])
         self.assertTrue(detail["cost"]["estimated"])
 
+    def test_ledger_keeps_the_condenser_that_made_the_note(self):
+        """The dashboard's Condenser column reads this row, so a local run must not be labelled DeepSeek."""
+        router.record_request({"at": 1.0, "route": "lmstudio", "model": "granite-4.2-3b-fp8", "result": "compacted", "provider": "local"})
+        self.assertEqual(router.recent_requests(1)[0]["provider"], "local")
+        router.record_request({"at": 1.0, "route": "codex", "model": "g", "result": "passed"})
+        self.assertEqual(router.recent_requests(1)[0]["provider"], "deepseek", "an entry without a provider keeps the old default")
+
     def test_compaction_plan_records_each_removed_block(self):
         self.stub_condenser()
         body = {"input": history_blocks(6) + [{"role": "user", "content": [{"type": "input_text", "text": "next"}]}]}
@@ -874,7 +974,7 @@ class RouterTests(unittest.TestCase):
         _output, changed = router.rewrite_request(json.dumps(body).encode(), token_limit=1000, report=report)
         self.assertTrue(changed)
         plan = json.loads(report["plan"])
-        completed = router.split_blocks(body["input"])[:-1]
+        completed = router.split_blocks(body["input"])[:-router.LIVE_BLOCKS]
         self.assertEqual([b["id"] for b in plan["blocks"]], [router.block_id(b) for b in completed], "every completed block in order")
         self.assertTrue(all(b["chars"] > 0 for b in plan["blocks"]))
         self.assertTrue(all(b["tokens"] > 0 for b in plan["blocks"]), "plans are token-first as well")
@@ -900,7 +1000,7 @@ class RouterTests(unittest.TestCase):
         plan = json.loads(report["plan"])
         prefix, blocks = router.split_message_blocks(messages)
         self.assertEqual(len(prefix), 1)
-        self.assertEqual([b["id"] for b in plan["blocks"]], [router.block_id(b) for b in blocks[:-1]])
+        self.assertEqual([b["id"] for b in plan["blocks"]], [router.block_id(b) for b in blocks[:-router.LIVE_BLOCKS]])
 
     def test_dashboard_is_the_built_frontend_bundle(self):
         """The dashboard is the Vite build in frontend/dist, not an inline string: the built index.html

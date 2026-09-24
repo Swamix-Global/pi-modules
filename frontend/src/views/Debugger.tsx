@@ -23,7 +23,7 @@ function BlockReport({ block, index, project, sessionId }: { block: DebugBlock; 
         <pre className="m-0 max-h-[70vh] overflow-auto whitespace-pre-wrap break-words p-3 font-mono text-[12px] leading-relaxed text-body">{block.after}</pre>
         <div className="border-t border-line p-2">
           <button type="button" disabled={preview.isPending} onClick={() => preview.mutate()} className="min-h-10 border border-accent px-3 font-semibold text-accent hover:bg-accentbg disabled:opacity-50">{preview.isPending ? "Generating…" : "Generate summary"}</button>
-          <span className="ml-2 text-[12px] text-muted">Sends this block to DeepSeek; may incur cost.</span>
+          <span className="ml-2 text-[12px] text-muted">Uses the selected condenser; may incur cost.</span>
           {preview.isError && <p role="alert" className="text-neg">Could not generate summary.</p>}
         </div>
       </section>

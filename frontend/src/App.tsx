@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "./api";
-import { BUDGET_POINTS, OUTPUT_POINTS, SettingSlider, Tabs, type TabDef } from "./components";
+import { BUDGET_POINTS, SettingSlider, Tabs, type TabDef } from "./components";
 import { clockTime, dur, syncClock } from "./format";
 import { ContextView } from "./views/Context";
 import { TokenStatsView } from "./views/TokenStats";
@@ -43,7 +43,7 @@ export default function App() {
   };
   const queryClient = useQueryClient();
   const settings = useMutation({
-    mutationFn: (change: { tokens?: number; summary_tokens?: number }) => api.setConfig(change),
+    mutationFn: (change: { tokens?: number; summary_words?: number; provider?: string }) => api.setConfig(change),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["stats"] }),
   });
 
@@ -75,8 +75,17 @@ export default function App() {
         {stats && <div className="flex flex-wrap gap-2" aria-label="Global settings">
           <SettingSlider label="Compaction threshold" points={BUDGET_POINTS} value={stats.token_limit}
             onCommit={(tokens) => settings.mutate({ tokens })} disabled={settings.isPending} />
-          <SettingSlider label="Block output length" points={OUTPUT_POINTS} value={stats.summary_tokens}
-            onCommit={(summary_tokens) => settings.mutate({ summary_tokens })} disabled={settings.isPending} />
+          <div className="inline-flex overflow-hidden border border-line bg-panel" role="radiogroup" aria-label="Condenser provider">
+            {stats.providers.map((choice) => {
+              const selected = choice.provider === stats.provider;
+              return <button key={choice.provider} type="button" role="radio" aria-checked={selected} disabled={!choice.available || settings.isPending}
+                title={choice.available ? `${choice.label} · ${choice.model}` : choice.error || `${choice.label} unavailable`}
+                onClick={() => settings.mutate({ provider: choice.provider })}
+                className={`border-l border-line px-2.5 py-1.5 text-[12px] first:border-l-0 ${selected ? "bg-accentbg font-semibold text-accent" : "text-muted hover:text-body"} disabled:cursor-not-allowed disabled:opacity-40`}>
+                {choice.label}
+              </button>;
+            })}
+          </div>
         </div>}
         {stats && <span className="text-[12.5px] text-muted">router clock {clockTime(stats.now)}</span>}
         <Tabs tabs={TABS} active={tab} onChange={navigateTab} />

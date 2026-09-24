@@ -1,7 +1,14 @@
 # ctx-engine
 
 Pi context router: a localhost reverse proxy that condenses settled transcript
-blocks before forwarding to a provider, plus a React dashboard.
+blocks before forwarding to a provider, plus a React dashboard. Condensed block
+length is a 400-word default sizing hint (not a hard cap), adjustable through the
+50/100/200/400-word dashboard control.
+
+On first startup after the token-to-word change, the backend archives existing
+summary notes and the old `summary_tokens` setting in `ctx-engine.db`; notes are
+not deleted or reused, and the new 400-word default is used unless a
+`summary_words` setting is saved.
 
 - `backend/` — stdlib-only Python HTTP server (`ctx_engine_server.py` runtime,
   `ctx_engine_utils.py` config/cost/blocks), tests in `backend/tests/`.

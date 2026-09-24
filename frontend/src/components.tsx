@@ -230,7 +230,7 @@ export function SettingSlider({ label, points, value, onCommit, disabled = false
           value={index}
           disabled={disabled}
           aria-labelledby={labelId}
-          aria-valuetext={`${kfmt(points[index])} tokens`}
+          aria-valuetext={`${kfmt(points[index])} ${label.includes("words") ? "words" : "tokens"}`}
           onChange={(event) => {
             const next = Number(event.target.value);
             setIndex(next);

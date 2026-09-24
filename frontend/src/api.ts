@@ -83,7 +83,16 @@ export interface GlobalStats {
   last_at: number | null;
 }
 
+export interface ProviderChoice {
+  provider: string;
+  label: string;
+  model: string;
+  available: boolean;
+  error?: string;
+}
+
 export interface Stats {
+  providers: ProviderChoice[];
   requests: number;
   passed: number;
   compacted: number;
@@ -93,6 +102,7 @@ export interface Stats {
   blocks_seen: number;
   blocks_summarized: number;
   blocks_pending: number;
+  blocks_fallback: number;
   blocks_dropped?: number;
   cache_hits: number;
   cache_entries: number;
@@ -105,8 +115,8 @@ export interface Stats {
   condenser_tokens_out: number;
   condenser_cost_usd: number;
   condenser_errors: number;
-  summary_tokens: number;
-  summary_token_steps: number[];
+  summary_words: number;
+  summary_word_steps: number[];
   token_limit: number;
   provider: string;
   model: string;
@@ -252,9 +262,10 @@ export const api = {
   stats: () => getJson<Stats>("/stats"),
   tokenStats: () => getJson<TokenStats>("/token-stats"),
   request: (id: number) => getJson<RequestDetail>(`/request/${id}`),
-  setConfig: (config: { tokens?: number; summary_tokens?: number }) => postJson<unknown>("/config", config),
-  setProvider: (provider: string) => postJson<unknown>("/provider", { provider }),
+  setConfig: (config: { tokens?: number; summary_words?: number; provider?: string }) => postJson<unknown>("/config", config),
+
   debugProjects: () => getJson<{ projects: DebugProject[] }>("/debug/projects"),
+
   debugSessions: (project: string) =>
     getJson<{ sessions: DebugSession[] }>(`/debug/sessions?project=${encodeURIComponent(project)}`),
   debugSession: (id: string, project: string) =>

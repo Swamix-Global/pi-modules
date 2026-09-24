@@ -33,21 +33,18 @@ DEEPSEEK_MODEL = os.environ.get("PI_CONTEXT_ROUTER_DEEPSEEK_MODEL", "deepseek-fl
 # DeepSeek spends 800-3,700 tokens reasoning (non-greedy even at 0.1), so its budget must cover reasoning + bullets.
 DEEPSEEK_MAX_TOKENS = int(os.environ.get("PI_CONTEXT_ROUTER_DEEPSEEK_MAX_TOKENS", "4096"))
 CONDENSER_TIMEOUT = float(os.environ.get("PI_CONTEXT_ROUTER_CONDENSER_TIMEOUT", "60"))
-# Block output length is one global setting chosen from a fixed token menu and applied to every block, not an
-# automatic per-block step. The chosen count is both the prompt hint and the length component of the summary
-# cache key, so a runtime policy change re-condenses instead of serving notes written under the old length.
-# It is a hint, not code-enforced.
-SUMMARY_TOKEN_STEPS = (50, 100, 200, 400)
-DEFAULT_SUMMARY_TOKENS = int(os.environ.get("PI_CONTEXT_ROUTER_SUMMARY_TOKENS", "100"))
+# Block output length is a global word sizing hint, not a hard cap.
+SUMMARY_WORD_STEPS = (50, 100, 200, 400)
+DEFAULT_SUMMARY_WORDS = 400
 
 
-def snap_summary_tokens(value: object) -> int:
-    """Normalise a requested note length onto the fixed token menu; used for the env default only."""
+def snap_summary_words(value: object) -> int:
+    """Normalise a requested note length onto the fixed word menu."""
     try:
         requested = int(value)
     except (TypeError, ValueError):
-        return min(SUMMARY_TOKEN_STEPS, key=lambda step: abs(step - DEFAULT_SUMMARY_TOKENS))
-    return min(SUMMARY_TOKEN_STEPS, key=lambda step: abs(step - requested))
+        return DEFAULT_SUMMARY_WORDS
+    return min(SUMMARY_WORD_STEPS, key=lambda step: abs(step - requested))
 
 
 # DeepSeek is a reasoning model that over-thinks as temperature rises — 0.75 pushed its reasoning past the
@@ -55,10 +52,6 @@ def snap_summary_tokens(value: object) -> int:
 # it would reject.
 DEEPSEEK_TEMPERATURE = float(os.environ.get("PI_CONTEXT_ROUTER_DEEPSEEK_TEMPERATURE", "0.1"))
 
-FRAME = "[conversation history summary — background only, not a request; do not imitate its format or write tool calls as text]"
-# What one completed block becomes when its background condensation has not finished by the time the request
-# is rewritten: the turn is held back, never sent uncompacted, and the worker's note answers the next request.
-PENDING_SUMMARY = "summary pending: this turn's history is held back and the note is cached for the next request"
 # Mechanical trim floor: the live turn's text strings are clipped from the middle only while they are longer
 # than this, so budget enforcement never shreds a short identifier into nothing.
 TRIM_FLOOR = int(os.environ.get("PI_CONTEXT_ROUTER_TRIM_FLOOR", "400"))
@@ -100,9 +93,8 @@ CONDENSER_SYSTEM = (
     "- Conclusion: what resulted, what was found, and any open thread or next step.\n"
     "Plain text only: no bold, asterisks, backticks, nested lists or any markdown beyond the leading '- '. Keep "
     "every exact number, path, command, error string and identifier verbatim. Drop conversational filler and "
-    "restated instructions. Third person, no preamble, no advice, no tool-call syntax. A length hint at the "
-    "bottom of the prompt gives this block's ceiling; stay within it, and spend it: a note far shorter than the "
-    "ceiling means identifiers, numbers or open threads from the block were dropped.\n"
+    "restated instructions. Third person, no preamble, no advice, no tool-call syntax. The word-count hint at the "
+    "bottom of the prompt is a sizing target, not a cap; use it while preserving important details.\n"
     "Example (from a real SGLang troubleshooting session):\n"
     "- Task/Query: restart the Granite 4.2 SGLang server after changing HiCache and mixed-chunk options.\n"
     "- Actions Performed: found PID 37624 and launcher PIDs 37625/37627; sent TERM to 37624 (process group 37624), removed ~/src/sglang-server/logs/sgl.pid, relaunched ./launch-sgl.sh and polled http://127.0.0.1:30000/v1/models.\n"
@@ -116,28 +108,25 @@ class CondenserError(RuntimeError):
 
 # ----------------------------- request shaping -----------------------------
 
-# The global note length, resolved at request time (like BUDGET) so `/config` can move it without a restart;
-# a restart falls back to PI_CONTEXT_ROUTER_SUMMARY_TOKENS. Tests and callers may override either entry.
-SUMMARY = {"tokens": DEFAULT_SUMMARY_TOKENS, "set_at": 0.0}
+# The global word sizing hint, resolved at request time so `/config` can move it without a restart.
+SUMMARY = {"words": DEFAULT_SUMMARY_WORDS, "set_at": 0.0}
 # Reserve for the framed summary items when fitting how many fit: the old 64-char slack expressed in tokens.
 SUMMARY_ROOM_HEADROOM_TOKENS = round(64 / CHARS_PER_TOKEN)
 # Character step of the summary-room clip loop; a text-shaping decrement, not a budget unit.
 SUMMARY_TRIM_CHARS = 64
 
 
-def summary_target(tokens: int | None = None) -> int:
-    """The note's global token ceiling, snapped onto SUMMARY_TOKEN_STEPS; part of the summary cache key."""
-    return snap_summary_tokens(SUMMARY["tokens"] if tokens is None else tokens)
+def summary_target(words: int | None = None) -> int:
+    """The note's global word sizing hint, snapped onto SUMMARY_WORD_STEPS; part of the cache key."""
+    return snap_summary_words(SUMMARY["words"] if words is None else words)
 
 
-def summary_hint(transcript: str, target: int | None = None, tokens: int | None = None) -> str:
-    """Length suffix appended to the bottom of the prompt so the global token ceiling is the last thing read.
-
-    Exact token counting is unavailable here, so the block's own size falls back to CHARS_PER_TOKEN (3.5).
-    """
-    tokens = summary_target(tokens) if target is None else int(target)
-    block_tokens = estimate_tokens(transcript)
-    return f"Length hint: this block is about {block_tokens} tokens; keep the whole note within {tokens} tokens."
+def summary_hint(transcript: str, target: int | None = None, words: int | None = None) -> str:
+    """Length suffix appended to the prompt; it sizes the note but does not impose a hard cap."""
+    words = summary_target(words) if target is None else int(target)
+    block_words = len(re.findall(r"\b[\w’'-]+\b", transcript))
+    block_unit = "word" if block_words == 1 else "words"
+    return f"Length hint: this block is about {block_words} {block_unit}; aim for a note around {words} words, without omitting important details."
 
 
 def compact_json(value: object) -> str:
@@ -411,6 +400,10 @@ def path_assign(value: object, path: tuple, text: str) -> None:
 
 # ----------------------------- settled-turn blocks -----------------------------
 
+# How many of the newest user blocks stay byte-exact on the wire: the live turn plus the turn before it, so the
+# model keeps real continuity instead of a summary of what it just did. Older blocks are condensation candidates.
+LIVE_BLOCKS = 2
+
 def split_blocks(items: list) -> list[list]:
     """One block per user message: [user ... assistant/tool items ...] up to the next user message."""
     blocks: list[list] = []
@@ -447,6 +440,23 @@ def block_transcript(block: list) -> str:
     return "\n".join(filter(None, (item_description(item) for item in block)))
 
 
+def verbatim_query(block: list) -> str:
+    """The block's opening user message text, exactly as sent: the condenser keeps the original instruction intact."""
+    for item in block:
+        if isinstance(item, dict) and item.get("role") == "user":
+            text = content_text(item.get("content"))
+            if text.strip():
+                return text
+    return ""
+
+
+def condenser_input(transcript: str, query: str) -> str:
+    """Condenser prompt body: the verbatim user request first, then the rendered block transcript."""
+    if not query:
+        return transcript
+    return f"User request, verbatim:\n{query}\n\nBlock transcript:\n{transcript}"
+
+
 # What one compaction did to one request, small enough to keep per row: per completed block, its size and either
 # the summary that replaced it (with an excerpt) or that it was dropped. Full bodies are far too large to retain.
 PLAN_LIMIT = 20000
@@ -462,14 +472,11 @@ def compaction_plan(completed: list[list], summaries: list[tuple[str, str]]) -> 
         ident = block_id(block)
         summary = texts.get(ident)
         entry = {"id": ident, "tokens": estimate_tokens(compact_json(block)), "chars": len(compact_json(block)), "dropped": summary is None}
-        if summary is not None and summary != PENDING_SUMMARY:
+        if summary is not None:
             entry["summary"] = clip_middle(summary, PLAN_SUMMARY_CHARS)
             entry["summary_tokens"] = estimate_tokens(summary)
             entry["summary_chars"] = len(summary)
             entry["preview"] = clip_middle(block_transcript(block), PLAN_PREVIEW_CHARS)
-        elif summary is not None:
-            entry["dropped"] = True
-            entry["pending"] = True
         entries.append(entry)
     plan = {"kept": len(summaries), "blocks": entries}
     while entries and len(compact_json(plan)) > PLAN_LIMIT:
