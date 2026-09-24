@@ -710,7 +710,7 @@ def summarize_block(block: list, tokens: int | None = None, model: str | None = 
 
 
 def summary_item(ident: str, summary: str) -> dict:
-    return {"role": "user", "content": [{"type": "input_text", "text": f"{FRAME}\n[block {ident}] {summary}"}]}
+    return {"role": "user", "content": [{"type": "input_text", "text": summary}]}
 
 
 def schedule_summary(block: list, summarize=summarize_block) -> futures.Future:
@@ -807,7 +807,7 @@ def rewrite_chat(body: dict, token_limit: int, raw: bytes, report: dict | None =
 
 
 def chat_summary_item(ident: str, summary: str) -> dict:
-    return {"role": "user", "content": f"{FRAME}\n[block {ident}] {summary}"}
+    return {"role": "user", "content": summary}
 
 
 def rewrite_request(raw: bytes, token_limit: int | None = None, report: dict | None = None) -> tuple[bytes, bool]:
