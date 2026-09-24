@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "./api";
 import { BUDGET_POINTS, OUTPUT_POINTS, SettingSlider, Tabs, type TabDef } from "./components";
@@ -6,15 +6,41 @@ import { clockTime, dur, syncClock } from "./format";
 import { ContextView } from "./views/Context";
 import { TokenStatsView } from "./views/TokenStats";
 import { TrafficStatsView } from "./views/TrafficStats";
+import { DebuggerView } from "./views/Debugger";
 
 const TABS: TabDef[] = [
   { id: "context", label: "Context" },
   { id: "tokens", label: "Token Stats" },
   { id: "traffic", label: "Traffic Stats" },
+  { id: "debugger", label: "Debugger" },
 ];
 
+const TAB_PATHS: Record<string, string> = {
+  context: "/dashboard",
+  tokens: "/token-stats",
+  traffic: "/dashboard/traffic",
+  debugger: "/dashboard/debugger",
+};
+
+function tabFromPath(path: string): string {
+  if (path === "/dashboard/debugger") return "debugger";
+  if (path === "/token-stats") return "tokens";
+  if (path === "/dashboard/traffic") return "traffic";
+  return "context";
+}
+
 export default function App() {
-  const [tab, setTab] = useState("context");
+  const [tab, setTab] = useState(() => tabFromPath(window.location.pathname));
+  useEffect(() => {
+    const onPopState = () => setTab(tabFromPath(window.location.pathname));
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, []);
+  const navigateTab = (next: string) => {
+    setTab(next);
+    const path = TAB_PATHS[next];
+    if (path && window.location.pathname !== path) window.history.pushState({}, "", path);
+  };
   const queryClient = useQueryClient();
   const settings = useMutation({
     mutationFn: (change: { tokens?: number; summary_tokens?: number }) => api.setConfig(change),
@@ -53,7 +79,7 @@ export default function App() {
             onCommit={(summary_tokens) => settings.mutate({ summary_tokens })} disabled={settings.isPending} />
         </div>}
         {stats && <span className="text-[12.5px] text-muted">router clock {clockTime(stats.now)}</span>}
-        <Tabs tabs={TABS} active={tab} onChange={setTab} />
+        <Tabs tabs={TABS} active={tab} onChange={navigateTab} />
       </header>
 
       {settings.isError && <p role="alert" className="py-2 text-neg">Could not save setting; refresh to retry.</p>}
@@ -63,8 +89,9 @@ export default function App() {
         aria-labelledby={`tab-${tab}`}
         className="mt-2"
       >
-        {statsQuery.isLoading && <p className="px-1 py-6 text-muted">loading counters…</p>}
-        {statsQuery.error != null && !stats && (
+        {tab === "debugger" && <DebuggerView />}
+        {tab !== "debugger" && statsQuery.isLoading && <p className="px-1 py-6 text-muted">loading counters…</p>}
+        {tab !== "debugger" && statsQuery.error != null && !stats && (
           <p className="px-1 py-6 text-muted">the router /stats endpoint did not answer — retrying every 5 s.</p>
         )}
         {stats && tab === "context" && <ContextView stats={stats} />}

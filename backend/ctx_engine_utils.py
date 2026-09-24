@@ -103,10 +103,10 @@ CONDENSER_SYSTEM = (
     "restated instructions. Third person, no preamble, no advice, no tool-call syntax. A length hint at the "
     "bottom of the prompt gives this block's ceiling; stay within it, and spend it: a note far shorter than the "
     "ceiling means identifiers, numbers or open threads from the block were dropped.\n"
-    "Example:\n"
-    "- Task/Query: find why block 7f3a91c2e0b44d18 was still pending after the context-router replay.\n"
-    "- Actions Performed: compared the block transcript from 2026-09-24T00-33-31-978Z_01a0d0d4-f349-73d3-a379-98e720020fa5.jsonl with summaries.digest in ctx-engine.db; the row was absent, while requests.raw contained only a 4000-character excerpt.\n"
-    "- Conclusion: block 7f3a91c2e0b44d18 was not yet condensed; the debugger must show the full bounded session block and must not treat the request excerpt as its summary."
+    "Example (from a real SGLang troubleshooting session):\n"
+    "- Task/Query: restart the Granite 4.2 SGLang server after changing HiCache and mixed-chunk options.\n"
+    "- Actions Performed: found orphaned PID 37624 holding port 30000; sent TERM, then killed process group -37624 and launcher PIDs 37625 and 37627; removed ~/src/sglang-server/logs/sgl.pid, relaunched ./launch-sgl.sh and polled http://127.0.0.1:30000/v1/models.\n"
+    "- Conclusion: PID 37624 died and port 30000 became free; readiness polling timed out with exit 124, so the new server's state was not verified."
 )
 
 

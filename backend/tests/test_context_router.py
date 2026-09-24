@@ -135,6 +135,73 @@ class RouterTests(unittest.TestCase):
         self.assertFalse(changed)
         self.assertEqual(output, raw)
 
+    def test_debug_preview_condenses_selected_block_and_keeps_prompt_identity(self):
+        """The explicit preview POST calls the mocked condenser and persists its snapshotted prompt hash."""
+        project = os.path.join(self.tmpdir, "project")
+        session_root = os.path.join(self.tmpdir, "pi-sessions")
+        os.makedirs(session_root)
+        session_path = os.path.join(session_root, "fixture.jsonl")
+        records = [
+            {"type": "session", "version": 3, "id": "fixture-id", "cwd": project},
+            {"type": "message", "message": {"role": "user", "content": [{"type": "text", "text": "preview this block"}]}},
+            {"type": "message", "message": {"role": "assistant", "content": [{"type": "text", "text": "the real completed result"}]}},
+        ]
+        with open(session_path, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(json.dumps(record) for record in records) + "\n")
+        old_roots = router.DEBUG_SESSION_ROOTS
+        old_prompt = router.condenser_prompt()
+        old_call = router.call_condenser
+        started = threading.Event()
+        release = threading.Event()
+        note = "- Task/Query: preview this block\n- Actions Performed: mocked condenser\n- Conclusion: persisted safely"
+
+        def fake(prompt, _target=None, system_prompt=None):
+            self.assertIn("preview this block", prompt)
+            self.assertEqual(system_prompt, old_prompt)
+            started.set()
+            self.assertTrue(release.wait(5))
+            return note
+
+        router.DEBUG_SESSION_ROOTS = (("pi", session_root),)
+        router.call_condenser = fake
+        server = router.make_server("127.0.0.1", 0, "https://upstream.invalid")
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        result = {}
+        try:
+            session_id = "pi:fixture.jsonl"
+            block = router._debug_sessions(project)[0]["blocks"][0]
+            digest = router.block_id(block)
+            body = json.dumps({"project": project, "id": session_id, "block_id": digest}).encode()
+
+            def request_preview():
+                client = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+                client.request("POST", "/debug/preview", body=body, headers={"Content-Type": "application/json"})
+                response = client.getresponse()
+                result["status"] = response.status
+                result["body"] = json.loads(response.read())
+                client.close()
+
+            request = threading.Thread(target=request_preview)
+            request.start()
+            self.assertTrue(started.wait(5), "preview must call the condenser instead of only reading the page")
+            changed = old_prompt + "\nConcurrent edit: preserve the exit status."
+            router.save_debug_prompt(changed)
+            release.set()
+            request.join(5)
+            self.assertEqual(result, {"status": 200, "body": {"after": note}})
+
+            with sqlite3.connect(router.DB_PATH) as conn:
+                row = conn.execute("SELECT summary, model, tokens, prompt_hash FROM summaries WHERE digest = ?", (digest,)).fetchone()
+            self.assertEqual(row, (note, router.DEEPSEEK_MODEL, router.summary_target(), router.condenser_prompt_hash(old_prompt)))
+            self.assertEqual(router.cache_get(digest, "deepseek", router.summary_target(), router.DEEPSEEK_MODEL, router.condenser_prompt_hash(changed)), None)
+        finally:
+            release.set()
+            server.shutdown()
+            server.server_close()
+            router.DEBUG_SESSION_ROOTS = old_roots
+            router.call_condenser = old_call
+            router.save_debug_prompt(old_prompt)
+
     def test_image_content_passes_through_byte_identical(self):
         raw = json.dumps({"input": [{"role": "user", "content": [{"type": "input_text", "text": "inspect"}, {"type": "input_image", "image_url": "data:image/png;base64,AA=="}]}]}).encode()
         output, changed = router.rewrite_request(raw)
@@ -261,7 +328,7 @@ class RouterTests(unittest.TestCase):
             conn.close()
 
     def test_superseded_schema_is_archived_not_dropped(self):
-        """A pre-token-pk table that still has token lengths keeps its notes: archived, and copied into the new cache."""
+        """A pre-prompt-pk table keeps its notes in the archive without inventing a prompt identity."""
         conn = sqlite3.connect(router.DB_PATH)
         conn.execute("CREATE TABLE summaries (digest TEXT NOT NULL, provider TEXT NOT NULL, summary TEXT NOT NULL, "
                      "model TEXT NOT NULL, tokens INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL, "
@@ -275,8 +342,8 @@ class RouterTests(unittest.TestCase):
         try:
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM summaries_schema_legacy").fetchone()[0], 2, "the old table survives")
             rows = dict(conn.execute("SELECT digest, tokens FROM summaries").fetchall())
-            self.assertEqual(rows, {"keep": 100}, "only menu-length token notes are carried forward")
-            self.assertEqual(router.cache_get("keep", "local", 100, "m"), "- Task/Query: preserved")
+            self.assertEqual(rows, {}, "legacy notes must not be reused without their original prompt hash")
+            self.assertIsNone(router.cache_get("keep", "local", 100, "m"))
         finally:
             conn.close()
 

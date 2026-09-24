@@ -29,6 +29,7 @@ import argparse
 import gzip
 import hashlib
 import http.client
+import inspect
 import compression.zstd as zstd
 import json
 import mimetypes
@@ -220,24 +221,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
     elif pk != expected_pk or "prompt_hash" not in cols:
         legacy = _archive_table(conn, "summaries", "summaries_schema_legacy")
         conn.execute(SCHEMA)
-        legacy_cols = {str(item[1]) for item in conn.execute(f'PRAGMA table_info("{legacy}")')}
-        model_col = "model" if "model" in legacy_cols else "''"
-        allowed = ",".join(str(step) for step in SUMMARY_TOKEN_STEPS)
-        if "tokens" in legacy_cols:
-            length_col = f"CASE WHEN tokens IN ({allowed}) THEN tokens ELSE NULL END"
-            valid = f"{length_col} IS NOT NULL"
-        else:
-            length_col, valid = "NULL", "0"
-        # The config table is created below. Existing rows are considered written with the
-        # prompt active at migration time; a later edit changes the hash and makes them miss.
-        conn.execute(CONFIG_SCHEMA)
-        configured = conn.execute("SELECT value FROM config WHERE key = 'condenser_prompt'").fetchone()
-        migration_hash = condenser_prompt_hash(str(configured[0])) if configured and str(configured[0]).strip() else condenser_prompt_hash(DEFAULT_CONDENSER_PROMPT)
-        conn.execute(
-            "INSERT OR IGNORE INTO summaries (digest, provider, summary, model, tokens, prompt_hash, created_at) "
-            f"SELECT digest, COALESCE(NULLIF(provider, ''), 'local'), summary, {model_col}, {length_col}, ?, created_at "
-            f'FROM "{legacy}" WHERE {valid}', (migration_hash,)
-        )
+        # Legacy rows do not carry the original condenser prompt, so assigning the current
+        # prompt hash would falsely make them cache hits. Keep them in the archive only;
+        # a subsequent request re-condenses under the known prompt identity.
     conn.execute(REQUESTS_SCHEMA)
     conn.execute(CONFIG_SCHEMA)
     request_cols = {str(item[1]) for item in conn.execute("PRAGMA table_info(requests)")}
@@ -705,12 +691,18 @@ def summarize_block(block: list, tokens: int | None = None, model: str | None = 
         bump(cache_hits=1)
         return ident, cached
     try:
+        signature = inspect.signature(call_condenser)
+    except (TypeError, ValueError):
+        accepts_prompt = False
+    else:
+        accepts_prompt = "system_prompt" in signature.parameters or any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values()
+        )
+    if accepts_prompt:
         summary = call_condenser(transcript, tokens, system_prompt=system_prompt)
-    except TypeError as exc:
+    else:
         # Tests and embedding callers may provide the historical two-argument hook. The
         # production function accepts the snapshot so an in-flight job cannot cross prompts.
-        if "system_prompt" not in str(exc):
-            raise
         summary = call_condenser(transcript, tokens)
     cache_put(ident, summary, bucket, tokens, model, prompt_hash)
     bump(blocks_summarized=1)
@@ -890,6 +882,7 @@ DEBUG_SESSION_ROOTS = (
 DEBUG_SESSION_MAX_BYTES = int(os.environ.get("PI_CONTEXT_ROUTER_DEBUG_MAX_SESSION_BYTES", str(64 * 1024 * 1024)))
 DEBUG_SESSION_MAX_FILES = int(os.environ.get("PI_CONTEXT_ROUTER_DEBUG_MAX_SESSION_FILES", "10000"))
 DEBUG_RESPONSE_MAX_BYTES = int(os.environ.get("PI_CONTEXT_ROUTER_DEBUG_MAX_RESPONSE_BYTES", str(64 * 1024 * 1024)))
+DEBUG_PREVIEW_MAX_BODY_BYTES = 16 * 1024
 DEBUG_LOCK = threading.RLock()
 DEBUG_NOT_CONDENSED = "not yet condensed"
 
@@ -1037,8 +1030,9 @@ def debug_session_detail(session_id: str, project: str) -> dict | None:
                 for block in session["blocks"]:
                     digest = block_id(block)
                     row = conn.execute(
-                        "SELECT summary FROM summaries WHERE digest = ? AND provider = 'deepseek' AND model = ? AND tokens = ? AND prompt_hash = ?",
-                        (digest, DEEPSEEK_MODEL, summary_target(), prompt_hash),
+                        "SELECT summary FROM summaries WHERE digest = ? AND provider = 'deepseek' AND model = ? AND prompt_hash = ? "
+                        "ORDER BY (tokens = ?) DESC, created_at DESC LIMIT 1",
+                        (digest, DEEPSEEK_MODEL, prompt_hash, summary_target()),
                     ).fetchone()
                     blocks.append({"id": digest, "before": block_transcript(block),
                                    "after": str(row[0]) if row else DEBUG_NOT_CONDENSED,
@@ -1053,6 +1047,28 @@ def debug_session_detail(session_id: str, project: str) -> dict | None:
     if encoded_size > DEBUG_RESPONSE_MAX_BYTES:
         raise DebugInputError("debug session response exceeds the configured size limit")
     return result
+
+
+def debug_preview(project: object, session_id: object, block_digest: object) -> dict:
+    """Condense one real block selected from the allow-listed session stores.
+
+    The request supplies identifiers only; the session file and condenser prompt are
+    resolved from server-owned state, and summarize_block snapshots the prompt identity
+    through the whole call/cache write.
+    """
+    project_path = _debug_project(project)
+    if not isinstance(session_id, str) or not session_id or len(session_id) > 4096 or "\x00" in session_id:
+        raise DebugInputError("id must be a non-empty session identifier")
+    if not isinstance(block_digest, str) or not re.fullmatch(r"[0-9a-f]{16}", block_digest):
+        raise DebugInputError("block_id must be a 16-character block digest")
+    session = next((item for item in _debug_sessions(project_path) if item["id"] == session_id), None)
+    if session is None:
+        raise DebugInputError("session not found")
+    block = next((item for item in session["blocks"] if block_id(item) == block_digest), None)
+    if block is None:
+        raise DebugInputError("block not found")
+    _ident, summary = summarize_block(block)
+    return {"after": summary}
 
 
 def debug_prompt_payload() -> dict:
@@ -1260,6 +1276,41 @@ class RouterHandler(BaseHTTPRequestHandler):
         path = parsed.path.rstrip("/")
         if path == "/debug/prompt" and parsed.query:
             self.send_bytes(400, b'{"error":"debug/prompt does not accept query parameters"}')
+            return
+        if path == "/debug/preview" and parsed.query:
+            self.send_bytes(400, b'{"error":"debug/preview does not accept query parameters"}')
+            return
+        if path == "/debug/preview":
+            try:
+                length = int(self.headers.get("Content-Length", "-1"))
+            except ValueError:
+                self.send_bytes(400, b'{"error":"invalid content length"}')
+                return
+            if length <= 0 or length > DEBUG_PREVIEW_MAX_BODY_BYTES:
+                self.send_bytes(413, b'{"error":"preview request body size rejected"}')
+                return
+            try:
+                payload = json.loads(self.rfile.read(length))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                self.send_bytes(400, b'{"error":"invalid JSON"}')
+                return
+            if not isinstance(payload, dict) or set(payload) != {"project", "id", "block_id"}:
+                self.send_bytes(400, b'{"error":"body must be {\\"project\\": string, \\"id\\": string, \\"block_id\\": string}"}')
+                return
+            try:
+                result = debug_preview(payload["project"], payload["id"], payload["block_id"])
+            except DebugInputError as exc:
+                self.send_bytes(400, compact_json({"error": str(exc)}).encode())
+                return
+            except sqlite3.Error:
+                self.send_bytes(503, b'{"error":"ctx-engine database unavailable"}')
+                return
+            except (CondenserError, OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+                bump(condenser_errors=1)
+                print(f"ctx-engine debug preview failed ({type(exc).__name__})", file=sys.stderr, flush=True)
+                self.send_bytes(502, b'{"error":"debug preview condenser unavailable"}')
+                return
+            self.send_bytes(200, compact_json(result).encode())
             return
         if path == "/debug/prompt":
             try:

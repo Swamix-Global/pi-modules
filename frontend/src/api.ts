@@ -198,6 +198,26 @@ export interface TokenStats {
   recent: TokenRecent[];
 }
 
+export interface DebugProject {
+  path: string;
+  sessions: number;
+}
+
+export interface DebugSession {
+  id: string;
+  title: string;
+  source: string;
+  at: number;
+  blocks: number;
+}
+
+export interface DebugBlock {
+  id: string;
+  before: string;
+  after: string;
+  source: string;
+}
+
 export class ApiError extends Error {
   constructor(
     public readonly status: number,
@@ -234,4 +254,12 @@ export const api = {
   request: (id: number) => getJson<RequestDetail>(`/request/${id}`),
   setConfig: (config: { tokens?: number; summary_tokens?: number }) => postJson<unknown>("/config", config),
   setProvider: (provider: string) => postJson<unknown>("/provider", { provider }),
+  debugProjects: () => getJson<{ projects: DebugProject[] }>("/debug/projects"),
+  debugSessions: (project: string) =>
+    getJson<{ sessions: DebugSession[] }>(`/debug/sessions?project=${encodeURIComponent(project)}`),
+  debugSession: (id: string, project: string) =>
+    getJson<{ blocks: DebugBlock[] }>(`/debug/session?id=${encodeURIComponent(id)}&project=${encodeURIComponent(project)}`),
+  debugPrompt: () => getJson<{ prompt: string; default_prompt: string }>("/debug/prompt"),
+  saveDebugPrompt: (prompt: string) => postJson<{ prompt: string }>("/debug/prompt", { prompt }),
+  debugPreview: (project: string, id: string, block_id: string) => postJson<{ after: string }>("/debug/preview", { project, id, block_id }),
 };
