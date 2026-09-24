@@ -1235,7 +1235,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                 self.send_bytes(200, b'{"status":"ok"}')
             elif path == "/stats":
                 self.send_bytes(200, compact_json(stats_snapshot()).encode())
-            elif path in ("/dashboard", "/dashboard/index.html"):
+            elif path in ("/dashboard", "/dashboard/index.html", "/dashboard/debugger"):
                 self.serve_dashboard("index.html")
             elif path.startswith("/dashboard/assets/"):
                 name = path.removeprefix("/dashboard/assets/")
