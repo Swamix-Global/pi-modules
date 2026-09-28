@@ -21,6 +21,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "ctx_engine_server.py"
+# Provider probes are network calls; this suite answers availability from the static map instead.
+os.environ["PI_CONTEXT_ROUTER_PROVIDER_PROBE_TTL"] = "0"
 SPEC = importlib.util.spec_from_file_location("context_router", MODULE_PATH)
 router = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader
@@ -451,7 +453,7 @@ class RouterTests(unittest.TestCase):
         # one summary per completed block while they fit; oldest are dropped first, never the live window
         summaries = rewritten["input"][:-len(live_items)]
         self.assertTrue(1 <= len(summaries) <= 12, len(summaries))
-        expected = "- Task/Query: fix checkout\n- Actions Performed: patched the retry path\n- Conclusion: checkout still failed after r221; error rate peaked at 42.0 percent."
+        expected = router.COMPACTED_TRACE + "- Task/Query: fix checkout\n- Actions Performed: patched the retry path\n- Conclusion: checkout still failed after r221; error rate peaked at 42.0 percent."
         self.assertTrue(all(s["content"][0]["text"] == expected for s in summaries))
 
     def test_repeated_blocks_are_summarized_once(self):
@@ -463,6 +465,83 @@ class RouterTests(unittest.TestCase):
         self.assertTrue(first[1] and second[1])
         self.assertEqual(len(self.calls), calls_after_first, "a repeated block must be served from cache")
         self.assertGreater(router.stats_snapshot()["cache_hits"], 0)
+
+    def test_tagged_notes_survive_pressure_without_paid_resummary_or_double_tag(self):
+        self.stub_condenser()
+        tagged = router.COMPACTED_TRACE + "- Task/Query: already done\n- Actions Performed: preserved\n- Conclusion: keep exact"
+        items = [{"role": "user", "content": "middle " + "x" * 2500},
+                 {"role": "user", "content": tagged}, {"role": "assistant", "content": "reply"},
+                 {"role": "tool", "content": "tool reply"}, {"role": "user", "content": "current"}]
+        _prefix, blocks = router.split_message_blocks(items)
+        self.assertEqual(blocks[:3], [[items[0]], [items[1]], [items[2], items[3]]])
+        self.assertEqual(router.split_blocks(items)[:3], [[items[0]], [items[1]], [items[2], items[3]]])
+        output, changed = router.rewrite_request(json.dumps({"messages": items}).encode(), token_limit=100)
+        self.assertTrue(changed)
+        rendered = json.loads(output)["messages"]
+        tagged_notes = [m["content"] for m in rendered if m.get("role") == "user" and isinstance(m.get("content"), str) and m["content"].startswith(router.COMPACTED_TRACE)]
+        self.assertIn(tagged, tagged_notes)
+        self.assertEqual(tagged_notes.count(tagged), 1)
+        self.assertTrue(all(router.COMPACTED_TRACE not in prompt for prompt in self.calls), "the marked note is never re-summarized")
+        self.assertEqual(blocks[2], [items[2], items[3]], "assistant/tool replies stay together in their own block")
+        self.assertIsNone(router.compacted_note(blocks[2]), "the reply block cannot bypass condensation")
+
+    def test_excerpt_is_not_tagged_as_a_finished_condensation(self):
+        self.assertEqual(router._traced_summary("temporary excerpt"), "temporary excerpt")
+        note = "- Task/Query: one\n- Actions Performed: done\n- Conclusion: complete"
+        self.assertEqual(router._traced_summary(note), router.COMPACTED_TRACE + note)
+        self.assertEqual(router._traced_summary(router.COMPACTED_TRACE + note), router.COMPACTED_TRACE + note)
+
+    def test_master_condense_api_caches_and_rejects_bad_requests(self):
+        calls = []
+        note = "- Task/Query: one\n- Actions Performed: mocked\n- Conclusion: cached"
+        def fake(prompt, _target=None):
+            calls.append(prompt)
+            return note
+        old_call = router.call_condenser
+        router.call_condenser = fake
+        server = router.make_server("127.0.0.1", 0, "https://upstream.invalid")
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        block = [{"role": "user", "content": "condense this"}]
+        try:
+            def post(body):
+                client = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+                client.request("POST", "/master/condense", body=body, headers={"Content-Type": "application/json"})
+                response = client.getresponse()
+                result = (response.status, response.read())
+                client.close()
+                return result
+            body = json.dumps({"block": block}).encode()
+            status, first = post(body)
+            self.assertEqual(status, 200)
+            result = json.loads(first)
+            self.assertEqual(result["id"], router.block_id(block))
+            self.assertEqual(result["note"], router.COMPACTED_TRACE + note)
+            self.assertEqual(result["prompt_hash"], router.condenser_prompt_hash())
+            self.assertEqual(post(body), (200, first))
+            self.assertEqual(len(calls), 1, "the second explicit request is served from the cache")
+            marked_block = [{"role": "user", "content": router.COMPACTED_TRACE + "already compacted"}]
+            status, marked_response = post(json.dumps({"block": marked_block}).encode())
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(marked_response)["note"], marked_block[0]["content"])
+            marked_snapshot = router.resolve_snapshot(router.condenser_snapshot())
+            self.assertIsNone(router.cache_get(router.block_id(marked_block), marked_snapshot["provider"], marked_snapshot["words"], marked_snapshot["model"], marked_snapshot["prompt_hash"]))
+            self.assertEqual(len(calls), 1, "an already-tagged singleton is not sent to the condenser")
+            self.assertEqual(post(b'{"block":[]}')[0], 400)
+            self.assertEqual(post(b'{"block":[{"role":3}]}')[0], 400)
+            self.assertEqual(post(b'{"block":[],"provider":"local"}')[0], 400)
+            oversized = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+            oversized.putrequest("POST", "/master/condense")
+            oversized.putheader("Content-Length", str(1024 * 1024 + 1))
+            oversized.endheaders()
+            response = oversized.getresponse()
+            self.assertEqual(response.status, 413)
+            response.read()
+            oversized.close()
+            self.assertEqual(len(calls), 1, "invalid and oversized requests do not call any external API")
+        finally:
+            server.shutdown()
+            server.server_close()
+            router.call_condenser = old_call
 
     def test_condenser_failure_serves_clipped_excerpts_instead_of_pending(self):
         """A failed condenser still replaces every completed block, clipped, and never as a pending marker."""
@@ -488,9 +567,16 @@ class RouterTests(unittest.TestCase):
             self.assertTrue(all(len(item["content"][0]["text"]) <= router.FALLBACK_CHARS for item in excerpts))
             self.stub_condenser()
             repaired, _changed = router.rewrite_request(json.dumps({"input": items}).encode(), token_limit=1000)
-            self.assertEqual(json.loads(repaired)["input"][:-len(live)], excerpts,
-                             "recovery must not rewrite a served excerpt and invalidate the prefix cache")
-            self.assertEqual(self.calls, [], "a pinned excerpt is served without a condenser call")
+            self.assertNotEqual(json.loads(repaired)["input"][:-len(live)], excerpts,
+                                "the first real note replaces the provisional excerpt")
+            self.assertIn(b"patched the retry path", repaired)
+            self.assertGreater(len(self.calls), 0, "a recovered block is condensed once")
+            self.stub_condenser(reply="- Task/Query: rewritten\n- Actions Performed: nope\n- Conclusion: first note wins.")
+            calls = len(self.calls)
+            third, _changed = router.rewrite_request(json.dumps({"input": items}).encode(), token_limit=1000)
+            self.assertEqual(json.loads(third)["input"][:-len(live)], json.loads(repaired)["input"][:-len(live)],
+                             "a real note is permanent; a later render never rewrites the wire")
+            self.assertEqual(len(self.calls), calls, "the pinned note is not recomputed")
         finally:
             router.call_condenser = real
 
@@ -637,7 +723,7 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(rewritten["messages"][-len(live):], live, "live turn must stay byte-exact")
         self.assertEqual(rewritten["messages"][-len(live)-len(previous):-len(live)], previous, "the previous turn stays byte-exact too")
         summaries = rewritten["messages"][1:-len(live)-len(previous)]
-        expected = "- Task/Query: fix checkout\n- Actions Performed: patched the retry path\n- Conclusion: checkout still failed after r221; error rate peaked at 42.0 percent."
+        expected = router.COMPACTED_TRACE + "- Task/Query: fix checkout\n- Actions Performed: patched the retry path\n- Conclusion: checkout still failed after r221; error rate peaked at 42.0 percent."
         self.assertTrue(summaries and all(m["role"] == "user" and m["content"] == expected for m in summaries))
         self.assertLessEqual(router.estimate_tokens(rewritten), 1000)
         # a tool result outside a block would break the API contract, so the tool message must follow its call inside the live turn
@@ -705,9 +791,16 @@ class RouterTests(unittest.TestCase):
             calls = len(self.calls)
             second, _changed = router.rewrite_request(raw, token_limit=1000)
             self.assertNotIn(b"summary pending", second, "the next request never sees a pending marker")
-            self.assertEqual(json.loads(second)["input"][:-len(live)], first_notes,
-                             "a served block keeps its exact wire text, so the provider prefix cache survives")
-            self.assertEqual(len(self.calls), calls, "pinned text is not recomputed")
+            second_notes = json.loads(second)["input"][:-len(live)]
+            self.assertNotEqual(second_notes, first_notes, "the real note upgrades the provisional excerpt")
+            self.assertIn(b"cached for the next request", second)
+            self.assertEqual(len(self.calls), calls, "the upgrade reads the note the worker already cached")
+            self.stub_condenser(reply="- Task/Query: rewritten\n- Actions Performed: nope\n- Conclusion: first note wins.")
+            calls = len(self.calls)
+            third, _changed = router.rewrite_request(raw, token_limit=1000)
+            self.assertEqual(json.loads(third)["input"][:-len(live)], second_notes,
+                             "once a real note is served, a later render never rewrites the wire")
+            self.assertEqual(len(self.calls), calls, "the pinned note is not recomputed")
         finally:
             release.set()
             router.call_condenser, router.WAIT_MS = real_call, real_wait
@@ -779,7 +872,7 @@ class RouterTests(unittest.TestCase):
             rewritten = json.loads(UpstreamHandler.body)
             tail = [middle, {"role": "user", "content": [{"type": "input_text", "text": "current"}]}]
             expected = "- Task/Query: fix checkout\n- Actions Performed: patched the retry path\n- Conclusion: checkout still failed after r221; error rate peaked at 42.0 percent."
-            self.assertEqual(rewritten["input"][0]["content"][0]["text"], expected)
+            self.assertEqual(rewritten["input"][0]["content"][0]["text"], router.COMPACTED_TRACE + expected)
             self.assertEqual(rewritten["input"][-len(tail):], tail, "the retained window reaches the upstream byte-exact")
             self.assertLessEqual(router.estimate_tokens(rewritten), router.CONTEXT_TOKENS)
 

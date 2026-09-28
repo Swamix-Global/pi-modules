@@ -75,7 +75,7 @@ export default function App() {
         {stats && <div className="flex flex-wrap gap-2" aria-label="Global settings">
           <SettingSlider label="Compaction threshold" points={BUDGET_POINTS} value={stats.token_limit}
             onCommit={(tokens) => settings.mutate({ tokens })} disabled={settings.isPending} />
-          <div className="inline-flex overflow-hidden border border-line bg-panel" role="radiogroup" aria-label="Condenser provider">
+          <div className="inline-flex flex-wrap overflow-hidden border border-line bg-panel" role="radiogroup" aria-label="Condenser provider">
             {stats.providers.map((choice) => {
               const selected = choice.provider === stats.provider;
               return <button key={choice.provider} type="button" role="radio" aria-checked={selected} disabled={!choice.available || settings.isPending}

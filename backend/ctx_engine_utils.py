@@ -403,13 +403,32 @@ def path_assign(value: object, path: tuple, text: str) -> None:
 # How many of the newest user blocks stay byte-exact on the wire: the live turn plus the turn before it, so the
 # model keeps real continuity instead of a summary of what it just did. Older blocks are condensation candidates.
 LIVE_BLOCKS = 2
+COMPACTED_TRACE = '<compacted>\n'
+
+
+def compacted_note(block: list) -> str | None:
+    """Return the exact note only for a tagged, singleton user message."""
+    if not isinstance(block, list) or len(block) != 1:
+        return None
+    item = block[0]
+    if not isinstance(item, dict) or item.get("role") != "user":
+        return None
+    content = item.get("content")
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list) and len(content) == 1 and isinstance(content[0], dict) and isinstance(content[0].get("text"), str):
+        text = content[0]["text"]
+    else:
+        return None
+    return text if text.startswith(COMPACTED_TRACE) else None
+
 
 def split_blocks(items: list) -> list[list]:
-    """One block per user message: [user ... assistant/tool items ...] up to the next user message."""
+    """One block per user message; assistant/tool replies to a marked singleton form another block."""
     blocks: list[list] = []
     for item in items:
         starts = isinstance(item, dict) and item.get("role") == "user"
-        if starts or not blocks:
+        if starts or not blocks or compacted_note(blocks[-1]):
             blocks.append([item])
         else:
             blocks[-1].append(item)
@@ -425,7 +444,7 @@ def split_message_blocks(messages: list) -> tuple[list, list]:
         index += 1
     blocks: list[list] = []
     for item in messages[index:]:
-        if (isinstance(item, dict) and item.get("role") == "user") or not blocks:
+        if (isinstance(item, dict) and item.get("role") == "user") or not blocks or compacted_note(blocks[-1]):
             blocks.append([item])
         else:
             blocks[-1].append(item)
@@ -483,6 +502,170 @@ def compaction_plan(completed: list[list], summaries: list[tuple[str, str]]) -> 
         entries.pop(0)
         plan["omitted"] = plan.get("omitted", 0) + 1
     return compact_json(plan)
+
+
+# ----------------------------- Pi provider map -----------------------------
+
+# The major providers Pi ships, in popularity order: id, label, credential environment variable, model
+# family to prefer. Model ids, base URLs and API styles are deliberately NOT listed here — they come from
+# Pi's own cached catalog (models-store.json) and credentials from auth.json, so the map always agrees with
+# what Pi can really call and shows exactly which providers are working on this machine. The family hints
+# because a gated plan usually unlocks its own models only (the Qwen token plan denies MiniMax/DeepSeek),
+# so "cheapest first" alone would probe models the account can never use.
+PI_PROVIDERS: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
+    ("openai", "OpenAI", "OPENAI_API_KEY", ("gpt",)),
+    ("anthropic", "Anthropic", "ANTHROPIC_API_KEY", ("claude",)),
+    ("google", "Google Gemini", "GEMINI_API_KEY", ("gemini",)),
+    ("groq", "Groq", "GROQ_API_KEY", ()),
+    ("openrouter", "OpenRouter", "OPENROUTER_API_KEY", ()),
+    ("mistral", "Mistral", "MISTRAL_API_KEY", ("mistral",)),
+    ("xai", "xAI", "XAI_API_KEY", ("grok",)),
+    ("cerebras", "Cerebras", "CEREBRAS_API_KEY", ()),
+    ("qwen-token-plan", "Qwen Token Plan", "QWEN_TOKEN_PLAN_API_KEY", ("qwen",)),
+    ("xiaomi", "Xiaomi MiMo", "XIAOMI_API_KEY", ("mimo",)),
+    ("xiaomi-token-plan-sgp", "Xiaomi MiMo SGP", "XIAOMI_TOKEN_PLAN_SGP_API_KEY", ("mimo",)),
+    ("moonshotai", "Moonshot AI", "MOONSHOT_API_KEY", ("kimi", "moonshot")),
+    ("nvidia", "NVIDIA", "NVIDIA_API_KEY", ()),
+    ("together", "Together", "TOGETHER_API_KEY", ()),
+    ("fireworks", "Fireworks", "FIREWORKS_API_KEY", ("fireworks",)),
+)
+ENV_BY_PROVIDER = {pid: env for pid, _label, env, _family in PI_PROVIDERS}
+FAMILY_BY_PROVIDER = {pid: family for pid, _label, _env, family in PI_PROVIDERS}
+
+# Catalog API styles whose endpoint speaks Chat Completions: Pi prefers Responses/Conversations for
+# OpenAI, xAI and Mistral, but those vendors all serve /chat/completions for the same model ids.
+# Anthropic/Bedrock/Azure/Codex styles are mapped (visible in the provider map) but not callable here.
+CHAT_API_STYLES = {"openai-completions", "openai-responses", "mistral-conversations", "google-generative-ai"}
+
+
+def read_json_file(path: str) -> dict:
+    try:
+        with open(path, encoding="utf-8") as handle:
+            value = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def catalog_path_for(auth_path: str) -> str:
+    return os.path.join(os.path.dirname(auth_path), "models-store.json")
+
+
+def catalog_models(pid: str, auth_path: str | None = None, catalog_path: str | None = None) -> list:
+    """Pi's cached model list for one provider; [] when the provider was never catalogued."""
+    path = catalog_path or catalog_path_for(AUTH_PATH if auth_path is None else auth_path)
+    value = read_json_file(path).get(pid)
+    models = value.get("models") if isinstance(value, dict) else None
+    return models if isinstance(models, list) else []
+
+
+def provider_credential(pid: str, env_var: str = "", auth_path: str | None = None) -> str:
+    """A usable key for one provider: auth.json first (API key or OAuth token), then its environment
+    variable. `!command` entries are not resolved here — the router never executes credential commands."""
+    entry = read_json_file(AUTH_PATH if auth_path is None else auth_path).get(pid)
+    if isinstance(entry, dict):
+        for value in (entry.get("key"), entry.get("access")):
+            if isinstance(value, str) and value and not value.startswith("!"):
+                return value
+    return os.environ.get(env_var, "") if env_var else ""
+
+
+def _rate(value: object) -> float:
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 1e9
+
+
+def condenser_models(models: list, family: tuple[str, ...] = ()) -> list[dict]:
+    """Usable chat models from a catalog list: the provider's own family first (see PI_PROVIDERS), then
+    cheapest — no `~`-prefixed aliases, no negative-cost routing markers, text input and a condenser-
+    callable API style. The order is stable, so a probe can walk it until one model actually answers.
+    ponytail: family + cheapest; a per-provider preferred-model list is the upgrade path."""
+    usable = []
+    for model in models:
+        if not isinstance(model, dict):
+            continue
+        ident = model.get("id")
+        if not isinstance(ident, str) or not ident or ident.startswith("~"):
+            continue
+        if model.get("api") not in CHAT_API_STYLES or model.get("type", "chat") != "chat":
+            continue
+        if model.get("input") and "text" not in model.get("input"):
+            continue
+        rates = model.get("cost") if isinstance(model.get("cost"), dict) else {}
+        if _rate(rates.get("input", -1)) < 0:
+            continue
+        usable.append(model)
+    return sorted(usable, key=lambda model: (
+        0 if any(token in str(model.get("id")).lower() for token in family) else 1,
+        _rate((model.get("cost") or {}).get("input", 1e9)),
+        _rate((model.get("cost") or {}).get("output", 1e9)), str(model.get("id"))))
+
+
+def provider_candidates(pid: str, auth_path: str | None = None, catalog_path: str | None = None) -> list[dict]:
+    """Condenser-callable models for one mapped provider, best first."""
+    return condenser_models(catalog_models(pid, auth_path, catalog_path), FAMILY_BY_PROVIDER.get(pid, ()))
+
+
+def chat_completion_url(model: dict) -> str | None:
+    """Chat Completions URL for one catalog model; None when its API style has no such endpoint."""
+    base = str(model.get("baseUrl") or "").rstrip("/")
+    api = model.get("api")
+    if not base or api not in CHAT_API_STYLES:
+        return None
+    return base + ("/openai/chat/completions" if api == "google-generative-ai" else "/chat/completions")
+
+
+def provider_status(pid: str, label: str, env_var: str = "", auth_path: str | None = None,
+                    catalog_path: str | None = None) -> dict:
+    """One row of the provider map: available only with a credential, a cached catalog model and a
+    chat-completions endpoint — the three ways a provider can look installed but not actually work."""
+    row = {"provider": pid, "label": label, "model": "", "available": False, "error": ""}
+    if not provider_credential(pid, env_var, auth_path):
+        row["error"] = "no credential in auth.json or environment"
+        return row
+    models = catalog_models(pid, auth_path, catalog_path)
+    candidates = condenser_models(models, FAMILY_BY_PROVIDER.get(pid, ()))
+    if not candidates:
+        api = models[0].get("api") if models and isinstance(models[0], dict) else None
+        row["error"] = (f"API style {api} is not supported by the condenser" if api
+                        else "no chat model in Pi's cached catalog (run /login so Pi can refresh it)")
+        return row
+    row["model"] = str(candidates[0]["id"])
+    if chat_completion_url(candidates[0]) is None:
+        row["error"] = "catalog model has no base URL"
+        return row
+    row["available"] = True
+    return row
+
+
+def pi_provider_map(auth_path: str | None = None, catalog_path: str | None = None) -> list[dict]:
+    """Every mapped provider in popularity order: the majors first, then any extra provider Pi holds a
+    credential *and* a catalog for, so an installed provider never hides behind the fixed list."""
+    resolved_auth = AUTH_PATH if auth_path is None else auth_path
+    rows = [provider_status(pid, label, env, resolved_auth, catalog_path) for pid, label, env, _family in PI_PROVIDERS]
+    known = {row["provider"] for row in rows} | {"deepseek", "local", "openai-codex"}
+    for pid in read_json_file(resolved_auth):
+        if pid not in known and catalog_models(pid, resolved_auth, catalog_path):
+            label = " ".join(part.capitalize() for part in str(pid).replace("_", "-").split("-"))
+            rows.append(provider_status(pid, label, "", resolved_auth, catalog_path))
+    return rows
+
+
+def provider_endpoint(pid: str, model: str, auth_path: str | None = None,
+                      catalog_path: str | None = None) -> tuple[str, dict[str, str]]:
+    """Chat URL and headers for a mapped provider's condenser model; CondenserError when the credential
+    or endpoint is missing, so a call fails loudly instead of silently condensing with another provider."""
+    key = provider_credential(pid, ENV_BY_PROVIDER.get(pid, ""), auth_path)
+    if not key:
+        raise CondenserError(f"no credential for condenser provider {pid}")
+    entry = next((item for item in catalog_models(pid, auth_path, catalog_path)
+                  if isinstance(item, dict) and item.get("id") == model), None)
+    url = chat_completion_url(entry or {})
+    if not url:
+        raise CondenserError(f"condenser provider {pid} model {model} has no chat-completions endpoint")
+    return url, {"Content-Type": "application/json", "Authorization": f"Bearer {key}"}
 
 
 def http_json(url: str, payload: dict, headers: dict[str, str], timeout: float) -> dict:

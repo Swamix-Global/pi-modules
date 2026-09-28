@@ -19,6 +19,12 @@ The condenser runs the DeepSeek Flash backend: the prompt-policy block that beat
 budgets in the benchmark (OODA/Pareto/MECE/BLUF + hard rules), a structured note under Task/Query / Actions Performed / Conclusion,
 and temperature 0.1 (a reasoning model that over-thinks as it warms). Counters are visible at `/dashboard`
 and `/stats`.
+
+Condensers are not hard-coded: `/stats` maps Pi's major providers (auth.json credential + Pi's cached
+`models-store.json` catalog, plus any other provider Pi holds both for), marks each row with the reason it
+cannot work, and *verifies* the rest with one tiny completion probe per provider — a cached catalog model can
+be retired, unpurchased or unbilled while the credential still looks valid. Only verified rows are selectable;
+`PI_CONTEXT_ROUTER_PROVIDER_PROBE_TTL=0` turns probing off and lets the static check answer.
 """
 
 from __future__ import annotations
@@ -113,7 +119,9 @@ DB_ERROR = {"at": 0.0}
 # without a restart; a restart falls back to PI_CONTEXT_ROUTER_TOKENS.
 BUDGET = {"tokens": CONTEXT_TOKENS, "set_at": 0.0}
 # Provider selection is durable config, not request data. A summary job receives an immutable snapshot.
-PROVIDERS = ("deepseek", "local", "openai-codex")
+# The three core backends are always on the dashboard; `provider_ids()` extends them with Pi's mapped
+# providers (auth.json credential + models-store.json catalog), so the map follows what is installed.
+CORE_PROVIDERS = ("deepseek", "local", "openai-codex")
 RANDOM_PROVIDER = "random"
 PROVIDER_LOCK = threading.RLock()
 ACTIVE_PROVIDER = "deepseek"
@@ -176,6 +184,85 @@ def local_model() -> str:
         return "granite-4.2-3b-fp8"
 
 
+# ----------------------------- provider verification -----------------------------
+# Availability is verified, not assumed: a catalog model can be retired, unpurchased or unbilled while the
+# credential still looks valid (Groq's cached model 404s, Gemini returns 402, Qwen's plan denies 403). One
+# tiny completion probes each candidate, cheapest model first; the answer is cached for PROBE_TTL seconds,
+# refreshed in the background while the last known answer keeps serving, and /stats never waits on a probe.
+# Setting PROBE_TTL=0 turns probing off (tests, offline): the static credential + catalog check answers.
+PROBE_TTL = float(os.environ.get("PI_CONTEXT_ROUTER_PROVIDER_PROBE_TTL", "600"))
+PROBE_ATTEMPTS = 4
+PROBE_TIMEOUT = min(CONDENSER_TIMEOUT, 20.0)
+PROBES: dict[str, dict] = {}
+PROBE_LOCK = threading.Lock()
+PROBE_POOL = futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="ctx-probe")
+
+
+def _probe_provider(pid: str) -> dict:
+    """Ask one candidate model at a time until one answers; the last failure text is the row's error."""
+    row = {"provider": pid, "model": "", "available": False, "error": "no catalog model to probe"}
+    for candidate in provider_candidates(pid)[:PROBE_ATTEMPTS]:
+        model = str(candidate["id"])
+        row["model"] = model
+        try:
+            url, headers = provider_endpoint(pid, model)
+            payload = http_json(url, {"model": model, "messages": [{"role": "user", "content": "Reply with OK."}]},
+                                headers, PROBE_TIMEOUT)
+            if condenser_text(payload):
+                return {"provider": pid, "model": model, "available": True, "error": ""}
+            row["error"] = "probe returned no usable text"
+        except (CondenserError, OSError, ValueError) as exc:
+            row["error"] = str(exc)[:300] or type(exc).__name__
+    return row
+
+
+def _run_probe(pid: str) -> None:
+    try:
+        row = _probe_provider(pid)
+    except Exception as exc:  # a probe must degrade to "unavailable", never take the worker down
+        row = {"provider": pid, "model": "", "available": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
+    with PROBE_LOCK:
+        PROBES.setdefault(pid, {"at": 0.0, "row": None, "busy": False}).update(at=time.monotonic(), row=row, busy=False)
+
+
+def _probe_state(pid: str) -> dict | None:
+    """Verified row for one mapped provider: None until the first probe answers, then cached for
+    PROBE_TTL and refreshed in the background while the stale answer keeps serving."""
+    if PROBE_TTL <= 0:
+        return None
+    spawn = False
+    with PROBE_LOCK:
+        entry = PROBES.setdefault(pid, {"at": 0.0, "row": None, "busy": False})
+        if entry["busy"] or entry["row"] is None or time.monotonic() - entry["at"] >= PROBE_TTL:
+            if not entry["busy"]:
+                entry["busy"] = True
+                spawn = True
+        row = dict(entry["row"]) if entry["row"] else None
+    if spawn:
+        PROBE_POOL.submit(_run_probe, pid)
+    return row
+
+
+def _static_row(provider: str) -> dict | None:
+    return next((row for row in pi_provider_map() if row["provider"] == provider), None)
+
+
+def mapped_provider_rows() -> list[dict]:
+    """Pi's provider map with verified availability merged in; a row still being probed reads
+    'checking provider…' and is not selectable yet."""
+    rows = pi_provider_map()
+    if PROBE_TTL <= 0:
+        return rows
+    merged = []
+    for row in rows:
+        if not row["available"]:
+            merged.append(row)
+            continue
+        state = _probe_state(row["provider"])
+        merged.append({**row, **state} if state else {**row, "available": False, "error": "checking provider…"})
+    return merged
+
+
 def provider_model(provider: str) -> str:
     if provider == RANDOM_PROVIDER:
         return "any available"
@@ -183,20 +270,51 @@ def provider_model(provider: str) -> str:
         return local_model()
     if provider == "openai-codex":
         return "gpt-6-luna"
-    return DEEPSEEK_MODEL
+    if provider in CORE_PROVIDERS:
+        return DEEPSEEK_MODEL
+    candidates = provider_candidates(provider)
+    if not candidates:
+        return ""
+    state = _probe_state(provider)
+    return str(state["model"]) if state and state.get("model") else str(candidates[0]["id"])
+
+
+def provider_ids() -> tuple[str, ...]:
+    """Every selectable condenser: the core backends plus Pi's mapped providers, in map order."""
+    return CORE_PROVIDERS + tuple(row["provider"] for row in pi_provider_map())
 
 
 def provider_available(provider: str) -> bool:
-    return provider == "deepseek" or provider == "local" or (provider == "openai-codex" and codex_discovery().get("available", False))
+    """Selecting a provider needs a verified probe answer; with probing off the static
+    credential + catalog check stands in. Restoring a saved selection uses `provider_ready`."""
+    if provider == "deepseek" or provider == "local":
+        return True
+    if provider == "openai-codex":
+        return bool(codex_discovery().get("available", False))
+    if PROBE_TTL <= 0:
+        row = _static_row(provider)
+        return bool(row and row["available"])
+    state = _probe_state(provider)
+    return bool(state and state["available"])
+
+
+def provider_ready(provider: str) -> bool:
+    """A saved selection may be restored before any probe has run: mapped providers only need a
+    credential, a cached catalog model and a chat-completions endpoint."""
+    if provider in CORE_PROVIDERS:
+        return provider_available(provider)
+    row = _static_row(provider)
+    return bool(row and row["available"])
 
 
 def provider_choices() -> list[dict]:
     codex = codex_discovery()
     return [
-        {"provider": "local", "label": "Local", "model": local_model(), "available": True},
-        {"provider": "deepseek", "label": "DeepSeek", "model": DEEPSEEK_MODEL, "available": True},
+        {"provider": "local", "label": "Local", "model": local_model(), "available": True, "error": ""},
+        {"provider": "deepseek", "label": "DeepSeek", "model": DEEPSEEK_MODEL, "available": True, "error": ""},
         {"provider": "openai-codex", "label": "Codex Luna", "model": codex["model"], "available": bool(codex["available"]), "error": codex["error"]},
-        {"provider": RANDOM_PROVIDER, "label": "Random", "model": "any available", "available": True},
+        *mapped_provider_rows(),
+        {"provider": RANDOM_PROVIDER, "label": "Random", "model": "any available", "available": True, "error": ""},
     ]
 
 
@@ -204,7 +322,7 @@ def resolve_provider(provider: str) -> str:
     """A concrete condenser for one job; 'random' picks any available real provider on every call."""
     if provider != RANDOM_PROVIDER:
         return provider
-    pool = [choice["provider"] for choice in provider_choices() if choice["provider"] in PROVIDERS and choice["available"]]
+    pool = [choice["provider"] for choice in provider_choices() if choice["available"] and choice["provider"] != RANDOM_PROVIDER]
     return random.choice(pool) if pool else "deepseek"
 
 
@@ -217,7 +335,7 @@ def resolve_snapshot(snapshot: dict) -> dict:
 
 
 def set_active_provider(provider: str) -> None:
-    if provider not in PROVIDERS and provider != RANDOM_PROVIDER:
+    if provider not in provider_ids() and provider != RANDOM_PROVIDER:
         raise DebugInputError("unknown condenser provider")
     if provider != RANDOM_PROVIDER and not provider_available(provider):
         raise DebugInputError("condenser provider is unavailable")
@@ -316,9 +434,10 @@ REQUESTS_SCHEMA = (
 # The two dashboard sliders persist here, one row per key, so a restart keeps the chosen threshold instead of
 # reverting to the env default. The DB is already the server's writable state store.
 CONFIG_SCHEMA = "CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL, set_at REAL NOT NULL)"
-# The exact text that already went on the wire for a block, one row per prompt identity. The first serve wins
-# forever (INSERT OR IGNORE), so a later render of the same block never changes the request prefix and never
-# invalidates the provider's prompt cache. `provider` is the slot that actually rendered the pinned text.
+# The exact text that already went on the wire for a block, one row per prompt identity. A real note (primary
+# or fallback slot) is frozen on first serve; an excerpt is a deterministic floor and is never pinned, so the
+# first note replaces it once and then never changes again — a block's wire text changes at most twice: clip to
+# note, then fixed, and a later render never invalidates the provider's prompt cache.
 PINS_SCHEMA = (
     "CREATE TABLE IF NOT EXISTS pins (digest TEXT NOT NULL, prompt_hash TEXT NOT NULL, summary TEXT NOT NULL, "
     "provider TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL, PRIMARY KEY (digest, prompt_hash))"
@@ -468,7 +587,7 @@ def load_config() -> None:
     except (TypeError, ValueError):
         pass
     saved_provider = rows.get("provider", ("deepseek", 0))[0]
-    if saved_provider == RANDOM_PROVIDER or (saved_provider in PROVIDERS and provider_available(saved_provider)):
+    if saved_provider == RANDOM_PROVIDER or (saved_provider in provider_ids() and provider_ready(saved_provider)):
         with PROVIDER_LOCK:
             global ACTIVE_PROVIDER
             ACTIVE_PROVIDER = saved_provider
@@ -543,13 +662,17 @@ def pin_get(digest: str, prompt_hash: str) -> tuple[str, str] | None:
 
 
 def pin_put(digest: str, prompt_hash: str, summary: str, provider: str) -> None:
-    """First serve wins forever: a pinned block is never rewritten by a later render, slot or model."""
+    """The first real note wins forever. A legacy excerpt row (from before excerpts stopped being pinned) is
+    replaced by that note; no later render can touch a real note."""
     try:
         with DB_LOCK:
             conn = db_connect()
             try:
-                conn.execute("INSERT OR IGNORE INTO pins (digest, prompt_hash, summary, provider, created_at) VALUES (?, ?, ?, ?, ?)",
-                             (digest, prompt_hash, summary, provider, time.time()))
+                conn.execute(
+                    "INSERT INTO pins (digest, prompt_hash, summary, provider, created_at) VALUES (?, ?, ?, ?, ?) "
+                    "ON CONFLICT(digest, prompt_hash) DO UPDATE SET summary=excluded.summary, provider=excluded.provider, "
+                    "created_at=excluded.created_at WHERE pins.provider = 'excerpt'",
+                    (digest, prompt_hash, summary, provider, time.time()))
                 conn.commit()
             finally:
                 conn.close()
@@ -841,6 +964,13 @@ def condense_cost(payload: dict, provider: str = "deepseek", model: str | None =
     bump(condenser_tokens_in=fresh + cached, condenser_tokens_out=out, condenser_cost_usd=usd)
 
 
+def condenser_endpoint(provider: str, model: str) -> tuple[str, dict[str, str]]:
+    """Chat URL and headers for the selected condenser; DeepSeek keeps its env-overridable endpoint."""
+    if provider == "deepseek":
+        return DEEPSEEK_URL, {"Content-Type": "application/json", "Authorization": f"Bearer {deepseek_key()}"}
+    return provider_endpoint(provider, model)
+
+
 def call_condenser(prompt: str, target: int | None = None, system_prompt: str | None = None,
                    provider: str | None = None, model: str | None = None) -> str:
     """Call exactly the snapshotted condenser; failures never fall back to another provider."""
@@ -857,20 +987,22 @@ def call_condenser(prompt: str, target: int | None = None, system_prompt: str | 
             text, payload = result
             condense_cost(payload, provider, model)
             return normalize_summary(text)
+        url, headers = condenser_endpoint(provider, model)
         body = {
             "model": model,
             "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt + "\n\n" + hint}],
-            "temperature": DEEPSEEK_TEMPERATURE,
-            "stream": False,
-            "max_tokens": DEEPSEEK_MAX_TOKENS,
         }
-        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {deepseek_key()}"}
-        payload = http_json(DEEPSEEK_URL, body, headers, CONDENSER_TIMEOUT)
+        # DeepSeek's tuned fields stay DeepSeek-only: other vendors' reasoning models reject a custom
+        # temperature or max_tokens outright, and the prompt already sizes the note.
+        if provider == "deepseek":
+            body["temperature"] = DEEPSEEK_TEMPERATURE
+            body["max_tokens"] = DEEPSEEK_MAX_TOKENS
+        payload = http_json(url, body, headers, CONDENSER_TIMEOUT)
         condense_cost(payload, provider, model)
         text = condenser_text(payload)
-        if not text:
+        if not text and provider == "deepseek":
             body["max_tokens"] = int(body.get("max_tokens") or DEEPSEEK_MAX_TOKENS) * 2
-            payload = http_json(DEEPSEEK_URL, body, headers, CONDENSER_TIMEOUT)
+            payload = http_json(url, body, headers, CONDENSER_TIMEOUT)
             condense_cost(payload, provider, model)
             text = condenser_text(payload)
         if not text:
@@ -927,8 +1059,13 @@ def summarize_block(block: list, tokens: int | None = None, model: str | None = 
     return ident, summary
 
 
+def _traced_summary(summary: str) -> str:
+    # An excerpt is only a temporary floor: never stamp it as a finished condensation.
+    return COMPACTED_TRACE + summary if is_current_summary(summary) and not summary.startswith(COMPACTED_TRACE) else summary
+
+
 def summary_item(ident: str, summary: str) -> dict:
-    return {"role": "user", "content": [{"type": "input_text", "text": summary}]}
+    return {"role": "user", "content": [{"type": "input_text", "text": _traced_summary(summary)}]}
 
 
 def schedule_summary(block: list, summarize=summarize_block, snapshot: dict | None = None) -> futures.Future:
@@ -959,10 +1096,10 @@ def pinned_note(digest: str, snapshot: dict) -> tuple[str, str] | None:
     selected slot, then the fallback slot. A rendering keeps the slot, model, word target and output length it
     was rendered with forever; only a new prompt identity starts a new rendering."""
     pinned = pin_get(digest, snapshot["prompt_hash"])
-    if pinned is not None:
+    if pinned is not None and pinned[1] != "excerpt":
         return pinned
     slots = [(snapshot["provider"], snapshot["model"])]
-    if FALLBACK_PROVIDER != snapshot["provider"] and FALLBACK_PROVIDER in PROVIDERS:
+    if FALLBACK_PROVIDER != snapshot["provider"] and FALLBACK_PROVIDER in provider_ids():
         slots.append((FALLBACK_PROVIDER, provider_model(FALLBACK_PROVIDER)))
     for provider, model in slots:
         note = cache_get(digest, provider, snapshot["words"], model, snapshot["prompt_hash"], count_miss=False)
@@ -979,8 +1116,11 @@ def condense_completed(completed: list, summarize=summarize_block, snapshot: dic
     model, word target and prompt identity forever."""
     snapshot = condenser_snapshot() if snapshot is None else snapshot
     snapshots = [resolve_snapshot(snapshot) for _ in completed]
-    pinned = {block_id(block): pinned_note(block_id(block), snapshots[index]) for index, block in enumerate(completed)}
-    waiting = [(index, block) for index, block in enumerate(completed) if pinned[block_id(block)] is None]
+    marked = {index: compacted_note(block) for index, block in enumerate(completed)}
+    pinned = {block_id(block): pinned_note(block_id(block), snapshots[index]) for index, block in enumerate(completed)
+              if marked[index] is None}
+    waiting = [(index, block) for index, block in enumerate(completed)
+               if marked[index] is None and pinned[block_id(block)] is None]
     jobs = [schedule_summary(block, summarize, snapshots[index]) for index, block in waiting]
     deadline = time.monotonic() + WAIT_MS / 1000
     fallback_after = min(FALLBACK_MS, WAIT_MS * 2 / 3) / 1000
@@ -988,7 +1128,7 @@ def condense_completed(completed: list, summarize=summarize_block, snapshot: dic
         futures.wait(jobs, timeout=fallback_after)
     fallbacks = {}
     for (index, block), job in zip(waiting, jobs):
-        if FALLBACK_PROVIDER not in PROVIDERS or FALLBACK_PROVIDER == snapshots[index]["provider"] or (job.done() and job.exception() is None):
+        if FALLBACK_PROVIDER not in provider_ids() or FALLBACK_PROVIDER == snapshots[index]["provider"] or (job.done() and job.exception() is None):
             continue
         fallback_slot = {**snapshots[index], "provider": FALLBACK_PROVIDER, "model": provider_model(FALLBACK_PROVIDER)}
         fallbacks[index] = schedule_summary(block, summarize, fallback_slot) if summarize is summarize_block \
@@ -1000,6 +1140,9 @@ def condense_completed(completed: list, summarize=summarize_block, snapshot: dic
     reported = False
     for index, block in enumerate(completed):
         ident = block_id(block)
+        if marked[index] is not None:
+            out.append((ident, marked[index]))
+            continue
         rendered = pinned[ident]
         if rendered is not None:
             note, provider = rendered
@@ -1030,7 +1173,8 @@ def condense_completed(completed: list, summarize=summarize_block, snapshot: dic
                     note = fallback_note(block)
                     provider = "excerpt"
                 bump(blocks_fallback=1)
-            pin_put(ident, snapshot["prompt_hash"], note, provider)
+            if provider != "excerpt":
+                pin_put(ident, snapshot["prompt_hash"], note, provider)
         out.append((ident, note))
     return out
 
@@ -1072,7 +1216,8 @@ def rewrite_chat(body: dict, token_limit: int, raw: bytes, report: dict | None =
         if estimate_tokens(fixed) > token_limit:
             bump(overflow=1)
         for block in completed:
-            schedule_summary(block, snapshot=snapshot)
+            if compacted_note(block) is None:
+                schedule_summary(block, snapshot=snapshot)
         LAST_COMPACTION["at"] = time.time()
         encoded = compact_json(fixed).encode()
         bump(compacted=1, input_chars_sent=len(encoded))
@@ -1094,7 +1239,7 @@ def rewrite_chat(body: dict, token_limit: int, raw: bytes, report: dict | None =
 
 
 def chat_summary_item(ident: str, summary: str) -> dict:
-    return {"role": "user", "content": summary}
+    return {"role": "user", "content": _traced_summary(summary)}
 
 
 def rewrite_request(raw: bytes, token_limit: int | None = None, report: dict | None = None) -> tuple[bytes, bool]:
@@ -1138,7 +1283,8 @@ def rewrite_request(raw: bytes, token_limit: int | None = None, report: dict | N
         if estimate_tokens(fixed) > token_limit:
             bump(overflow=1)
         for block in completed:
-            schedule_summary(block, snapshot=snapshot)
+            if compacted_note(block) is None:
+                schedule_summary(block, snapshot=snapshot)
         LAST_COMPACTION["at"] = time.time()
         encoded = compact_json(fixed).encode()
         bump(compacted=1, input_chars_sent=len(encoded))
@@ -1435,7 +1581,7 @@ def stats_snapshot() -> dict:
     snapshot["cache_buckets"] = buckets
     snapshot["cache_entries"] = sum(buckets.values())
     snapshot["cache_db"] = DB_PATH
-    calls = sum(snapshot.get(f"condenser_calls_{provider}", 0) for provider in PROVIDERS)
+    calls = sum(snapshot.get(f"condenser_calls_{provider}", 0) for provider in provider_ids())
     snapshot["condenser_calls"] = calls
     snapshot["condenser_avg_ms"] = round(snapshot["condenser_ms_total"] / calls, 1) if calls else 0.0
     with PROVIDER_LOCK:
@@ -1582,6 +1728,47 @@ class RouterHandler(BaseHTTPRequestHandler):
         if path == "/debug/preview" and parsed.query:
             self.send_bytes(400, b'{"error":"debug/preview does not accept query parameters"}')
             return
+        if path == "/master/condense":
+            if parsed.query:
+                self.send_bytes(400, b'{"error":"master/condense does not accept query parameters"}')
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "-1"))
+            except ValueError:
+                self.send_bytes(400, b'{"error":"invalid content length"}')
+                return
+            if length <= 0:
+                self.send_bytes(400, b'{"error":"invalid request body size"}')
+                return
+            if length > 1024 * 1024:
+                self.send_bytes(413, b'{"error":"request body too large"}')
+                return
+            try:
+                payload = json.loads(self.rfile.read(length))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                self.send_bytes(400, b'{"error":"invalid JSON"}')
+                return
+            block = payload.get("block") if isinstance(payload, dict) and set(payload) == {"block"} else None
+            if not isinstance(block, list) or not block or any(
+                    not isinstance(item, dict) or not isinstance(item.get("role"), str) for item in block):
+                self.send_bytes(400, b'{"error":"body must be {\\"block\\": [message objects]}"}')
+                return
+            ident = block_id(block)
+            try:
+                snapshot = resolve_snapshot(condenser_snapshot())
+                note = compacted_note(block)
+                if note is None:
+                    _ident, summary = summarize_block(
+                        block, snapshot["words"], snapshot["model"], snapshot["prompt"], snapshot["prompt_hash"], snapshot["provider"]
+                    )
+                    note = _traced_summary(summary)
+            except (CondenserError, DebugInputError, OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+                bump(condenser_errors=1)
+                print(f"ctx-engine master condense failed ({type(exc).__name__})", file=sys.stderr, flush=True)
+                self.send_bytes(502, b'{"error":"condenser unavailable"}')
+                return
+            self.send_bytes(200, compact_json({"id": ident, "note": note, "prompt_hash": snapshot["prompt_hash"]}).encode())
+            return
         if path == "/debug/preview":
             try:
                 length = int(self.headers.get("Content-Length", "-1"))
@@ -1673,7 +1860,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                 result["summary_words"] = summary_words
             if "provider" in payload:
                 provider = payload["provider"]
-                if not isinstance(provider, str) or (provider not in PROVIDERS and provider != RANDOM_PROVIDER):
+                if not isinstance(provider, str) or (provider not in provider_ids() and provider != RANDOM_PROVIDER):
                     self.send_bytes(400, b'{"error":"unknown condenser provider"}')
                     return
                 if provider != RANDOM_PROVIDER and not provider_available(provider):
