@@ -25,6 +25,16 @@ Condensers are not hard-coded: `/stats` maps Pi's major providers (auth.json cre
 cannot work, and *verifies* the rest with one tiny completion probe per provider — a cached catalog model can
 be retired, unpurchased or unbilled while the credential still looks valid. Only verified rows are selectable;
 `PI_CONTEXT_ROUTER_PROVIDER_PROBE_TTL=0` turns probing off and lets the static check answer.
+
+Multi-tenant SaaS: every dashboard call runs as one logged-in account (seeded on first start:
+`Nikhil` / `Nikhil`, override with `PI_CONTEXT_ROUTER_ADMIN` / `PI_CONTEXT_ROUTER_ADMIN_PASSWORD`), each
+account owns its own ledger, counters and compaction settings, and `/api/register` creates more. The
+operator's account also owns the debugger, the local token journal and `POST /master/condense`; every other
+account gets a 403 there. A tenant's Pi points at `/t/<api-token>/...` for its own proxy traffic. Set
+`PI_CONTEXT_ROUTER_PUBLIC=1` when the router is reachable beyond this machine: bare `/r/...` proxy paths and
+the anonymous operator calls are then refused. `PI_CONTEXT_ROUTER_REQUIRE_LOGIN=0` disables the login
+entirely (tests and local tooling only). The note cache stays content-addressed and shared — a note answers
+only for a byte-identical block.
 """
 
 from __future__ import annotations
@@ -34,6 +44,7 @@ from collections import Counter
 import argparse
 import gzip
 import hashlib
+import hmac
 import http.client
 import inspect
 import compression.zstd as zstd
@@ -42,6 +53,7 @@ import mimetypes
 import os
 import random
 import re
+import secrets
 import socket
 import sqlite3
 import ssl
@@ -57,6 +69,20 @@ from urllib.parse import parse_qs, urlsplit
 # Make the sibling module importable however this file is launched (systemd, importlib by path, cwd elsewhere).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from ctx_engine_utils import *  # noqa: E402,F401,F403
+
+
+# ----------------------------- tenants -----------------------------
+# Accounts and tenant scoping: the seeded operator account is tenant 1 (every legacy row keeps that id),
+# each dashboard call runs as one logged-in account, and a tenant's Pi traffic carries its own token.
+DEFAULT_USER_ID = 1
+DEFAULT_USERNAME = os.environ.get("PI_CONTEXT_ROUTER_ADMIN", "Nikhil")
+DEFAULT_PASSWORD = os.environ.get("PI_CONTEXT_ROUTER_ADMIN_PASSWORD", "Nikhil")
+# PI_CONTEXT_ROUTER_REQUIRE_LOGIN=0 turns the dashboard login off (tests, local tooling); default is required.
+# (PI_CONTEXT_ROUTER_AUTH is already taken: it points at Pi's auth.json.)
+AUTH_ENABLED = os.environ.get("PI_CONTEXT_ROUTER_REQUIRE_LOGIN", "1").strip().lower() not in {"0", "off", "false", "no"}
+# Set when the router is reachable beyond this machine (behind a reverse proxy): bare `/r/...` proxy paths
+# and the operator endpoints then require a session or token. Unset keeps the loopback trust model.
+PUBLIC_DEPLOY = os.environ.get("PI_CONTEXT_ROUTER_PUBLIC", "0").strip().lower() in {"1", "on", "true", "yes"}
 
 
 # The prompt is configuration state, not request-ledger data. Its digest is part of every
@@ -112,6 +138,11 @@ METRICS = {
 }
 LAST_COMPACTION = {"at": 0.0}
 METRICS_LOCK = threading.Lock()
+# Counters are per tenant: the default tenant owns METRICS (what a restart and the test suite reset),
+# every other tenant gets a zeroed copy of it, and a background job carries its tenant on the thread.
+TENANT = threading.local()
+TENANT_METRICS: dict[int, dict] = {}
+METRICS_ZERO: dict = {key: (0.0 if isinstance(value, float) else 0) for key, value in METRICS.items()}
 REQUEST_USAGE = threading.local()
 DB_LOCK = threading.Lock()
 DB_ERROR = {"at": 0.0}
@@ -125,6 +156,8 @@ CORE_PROVIDERS = ("deepseek", "local", "openai-codex")
 RANDOM_PROVIDER = "random"
 PROVIDER_LOCK = threading.RLock()
 ACTIVE_PROVIDER = "deepseek"
+# The provider a tenant without a saved choice starts on: the boot default, not the operator's current pick.
+BOOT_PROVIDER = ACTIVE_PROVIDER
 CODEX_HELPER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "condenser_bridge.mjs")
 BRIDGE_INPUT_MAX_BYTES = 8 * 1024 * 1024
 BRIDGE_OUTPUT_MAX_BYTES = 256 * 1024
@@ -344,11 +377,45 @@ def set_active_provider(provider: str) -> None:
         ACTIVE_PROVIDER = provider
 
 
-def condenser_snapshot(provider: str | None = None) -> dict:
-    with PROVIDER_LOCK:
-        selected = ACTIVE_PROVIDER if provider is None else provider
-    return {"provider": selected, "model": provider_model(selected), "words": summary_target(),
-            "prompt": condenser_prompt(), "prompt_hash": condenser_prompt_hash()}
+def user_settings(user_id: int = DEFAULT_USER_ID) -> dict:
+    """One tenant's compaction settings. The default tenant's values are the live globals (loaded at startup,
+    moved by /config), so a bare loopback client behaves exactly as it did before multi-tenancy; every other
+    tenant reads its own config rows and falls back to the defaults a fresh install starts with."""
+    if user_id == DEFAULT_USER_ID:
+        with PROVIDER_LOCK:
+            provider = ACTIVE_PROVIDER
+        return {"tokens": int(BUDGET["tokens"]), "summary_words": summary_target(),
+                "provider": provider, "set_at": SUMMARY["set_at"] or 0.0}
+    rows: dict[str, tuple] = {}
+    try:
+        with DB_LOCK:
+            conn = db_connect()
+            try:
+                rows = {row[0]: (row[1], row[2]) for row in conn.execute(
+                    "SELECT key, value, set_at FROM config WHERE user_id = ?", (int(user_id),))}
+            finally:
+                conn.close()
+    except sqlite3.Error as exc:
+        cache_error("tenant settings", exc)
+    try:
+        tokens = int(rows["tokens"][0])
+    except (KeyError, TypeError, ValueError):
+        tokens = CONTEXT_TOKENS
+    words_row = rows.get("summary_words")
+    words = snap_summary_words(words_row[0]) if words_row else DEFAULT_SUMMARY_WORDS
+    provider = str(rows.get("provider", (BOOT_PROVIDER, 0))[0])
+    if provider not in provider_ids():
+        provider = BOOT_PROVIDER
+    return {"tokens": tokens, "summary_words": words, "provider": provider,
+            "set_at": float(words_row[1]) if words_row else 0.0}
+
+
+def condenser_snapshot(user_id: int = DEFAULT_USER_ID, provider: str | None = None) -> dict:
+    """Immutable job snapshot for one tenant: its provider/model, its note length and the shared prompt."""
+    settings = user_settings(user_id)
+    selected = settings["provider"] if provider is None else provider
+    return {"provider": selected, "model": provider_model(selected), "words": settings["summary_words"],
+            "prompt": condenser_prompt(), "prompt_hash": condenser_prompt_hash(), "user": int(user_id)}
 # Block compaction runs in background workers, not on the request thread: one job per (block, bucket), the
 # request waits at most WAIT_MS, a still-running job is joined by the fallback slot at FALLBACK_MS, and the
 # request never serves a pending marker — the worst case is the clipped transcript excerpt.
@@ -362,10 +429,38 @@ SUMMARY_JOBS: dict[tuple, futures.Future] = {}
 JOBS_LOCK = threading.Lock()
 
 
+def set_tenant(user_id: int) -> None:
+    """Attribute every counter, ledger row and config write that follows on this thread to one tenant."""
+    TENANT.id = int(user_id)
+
+
+def tenant_id() -> int:
+    return getattr(TENANT, "id", DEFAULT_USER_ID)
+
+
+def tenant_metrics(user_id: int | None = None) -> dict:
+    uid = tenant_id() if user_id is None else int(user_id)
+    if uid == DEFAULT_USER_ID:
+        return METRICS
+    bucket = TENANT_METRICS.get(uid)
+    if bucket is None:
+        bucket = dict(METRICS_ZERO)
+        bucket["started"] = METRICS["started"]
+        TENANT_METRICS[uid] = bucket
+    return bucket
+
+
+def _as_tenant(user_id: int, fn, *args):
+    """Run one background job as the tenant whose request scheduled it."""
+    set_tenant(user_id)
+    return fn(*args)
+
+
 def bump(**deltas: float) -> None:
     with METRICS_LOCK:
+        bucket = tenant_metrics()
         for key, value in deltas.items():
-            METRICS[key] = METRICS.get(key, 0) + value
+            bucket[key] = bucket.get(key, 0) + value
 
 
 WINDOW = 100
@@ -380,12 +475,13 @@ def record_request(entry: dict) -> None:
             conn = db_connect()
             try:
                 conn.execute(
-                    "INSERT INTO requests (at, route, model, result, status, ms, raw_tokens, sent_tokens, provider, detail, raw, plan, cost) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO requests (at, route, model, result, status, ms, raw_tokens, sent_tokens, provider, detail, raw, plan, cost, user_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (entry.get("at", time.time()), entry.get("route", ""), entry.get("model", ""), entry.get("result", ""),
                      entry.get("status"), entry.get("ms"), int(entry.get("raw_tokens") or 0), int(entry.get("sent_tokens") or 0),
                      entry.get("provider") or "deepseek", str(entry.get("detail") or "")[:2000], str(entry.get("raw") or "")[:4000],
-                     str(entry.get("plan") or "")[:PLAN_LIMIT], compact_json(entry["cost"]) if entry.get("cost") else ""),
+                     str(entry.get("plan") or "")[:PLAN_LIMIT], compact_json(entry["cost"]) if entry.get("cost") else "",
+                     int(entry.get("user_id") or tenant_id())),
                 )
                 conn.execute("DELETE FROM requests WHERE id < (SELECT MAX(id) FROM requests) - ?", (REQUESTS_KEEP,))
                 conn.commit()
@@ -429,11 +525,12 @@ REQUESTS_SCHEMA = (
     "CREATE TABLE IF NOT EXISTS requests (id INTEGER PRIMARY KEY AUTOINCREMENT, at REAL NOT NULL, route TEXT NOT NULL DEFAULT '', "
     "model TEXT NOT NULL DEFAULT '', result TEXT NOT NULL DEFAULT '', status INTEGER, ms REAL, raw_tokens INTEGER NOT NULL DEFAULT 0, "
     "sent_tokens INTEGER NOT NULL DEFAULT 0, provider TEXT NOT NULL DEFAULT '', detail TEXT NOT NULL DEFAULT '', raw TEXT NOT NULL DEFAULT '', "
-    "plan TEXT NOT NULL DEFAULT '', cost TEXT NOT NULL DEFAULT '')"
+    "plan TEXT NOT NULL DEFAULT '', cost TEXT NOT NULL DEFAULT '', user_id INTEGER NOT NULL DEFAULT 1)"
 )
-# The two dashboard sliders persist here, one row per key, so a restart keeps the chosen threshold instead of
-# reverting to the env default. The DB is already the server's writable state store.
-CONFIG_SCHEMA = "CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL, set_at REAL NOT NULL)"
+# One row per tenant per key: the operator keeps the legacy rows (migrated to the default tenant id 1) and
+# every other account gets its own compaction threshold, note length and condenser choice.
+CONFIG_SCHEMA = ("CREATE TABLE IF NOT EXISTS config (user_id INTEGER NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, "
+                 "set_at REAL NOT NULL, PRIMARY KEY (user_id, key))")
 # The exact text that already went on the wire for a block, one row per prompt identity. A real note (primary
 # or fallback slot) is frozen on first serve; an excerpt is a deterministic floor and is never pinned, so the
 # first note replaces it once and then never changes again — a block's wire text changes at most twice: clip to
@@ -455,6 +552,23 @@ def _archive_table(conn: sqlite3.Connection, source: str, base: str) -> str:
     return name
 
 
+def _migrate_config_tenant(conn: sqlite3.Connection) -> None:
+    """Move the pre-tenant config table onto (user_id, key); its rows belong to the default tenant.
+    Rows are copied first and the original is archived under a legacy name — never dropped."""
+    info = list(conn.execute("PRAGMA table_info(config)"))
+    pk = {str(item[1]): int(item[5]) for item in info if int(item[5])}
+    if pk == {"user_id": 1, "key": 2}:
+        return
+    columns = {str(item[1]) for item in info}
+    conn.execute("DROP TABLE IF EXISTS config_tenant")
+    conn.execute("CREATE TABLE config_tenant (user_id INTEGER NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, "
+                 "set_at REAL NOT NULL, PRIMARY KEY (user_id, key))")
+    if {"key", "value", "set_at"} <= columns:
+        conn.execute("INSERT INTO config_tenant (user_id, key, value, set_at) SELECT 1, key, value, set_at FROM config")
+    _archive_table(conn, "config", "config_legacy")
+    conn.execute("ALTER TABLE config_tenant RENAME TO config")
+
+
 def _migrate(conn: sqlite3.Connection) -> None:
     """Create or archive cache schemas without allowing stale prompt identities to answer."""
     row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='summaries'").fetchone()
@@ -465,9 +579,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute(PINS_SCHEMA)
         old_setting = conn.execute("SELECT value, set_at FROM config WHERE key = 'summary_tokens'").fetchone()
         if old_setting:
-            conn.execute("INSERT OR IGNORE INTO config (key, value, set_at) VALUES ('summary_tokens_tokens_legacy', ?, ?)", old_setting)
+            conn.execute("INSERT OR IGNORE INTO config (user_id, key, value, set_at) VALUES (1, 'summary_tokens_tokens_legacy', ?, ?)", old_setting)
             conn.execute("DELETE FROM config WHERE key = 'summary_tokens'")
-        conn.execute("INSERT OR IGNORE INTO config (key, value, set_at) VALUES ('summary_length_unit', 'words', ?)", (time.time(),))
+        conn.execute("INSERT OR IGNORE INTO config (user_id, key, value, set_at) VALUES (1, 'summary_length_unit', 'words', ?)", (time.time(),))
         conn.commit()
         return
     info = list(conn.execute("PRAGMA table_info(summaries)"))
@@ -490,6 +604,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE requests ADD COLUMN plan TEXT NOT NULL DEFAULT ''")
     if "cost" not in request_cols:
         conn.execute("ALTER TABLE requests ADD COLUMN cost TEXT NOT NULL DEFAULT ''")
+    if "user_id" not in request_cols:
+        # Existing traffic is the operator's own: it becomes the default tenant's ledger.
+        conn.execute("ALTER TABLE requests ADD COLUMN user_id INTEGER NOT NULL DEFAULT 1")
+    _migrate_config_tenant(conn)
     unit = conn.execute("SELECT value FROM config WHERE key = 'summary_length_unit'").fetchone()
     if unit is None:
         # Token-hint notes and persisted settings cannot be interpreted as word hints. Preserve both,
@@ -498,9 +616,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute(SCHEMA)
         old_setting = conn.execute("SELECT value, set_at FROM config WHERE key = 'summary_tokens'").fetchone()
         if old_setting:
-            conn.execute("INSERT OR IGNORE INTO config (key, value, set_at) VALUES ('summary_tokens_tokens_legacy', ?, ?)", old_setting)
+            conn.execute("INSERT OR IGNORE INTO config (user_id, key, value, set_at) VALUES (1, 'summary_tokens_tokens_legacy', ?, ?)", old_setting)
             conn.execute("DELETE FROM config WHERE key = 'summary_tokens'")
-        conn.execute("INSERT INTO config (key, value, set_at) VALUES ('summary_length_unit', 'words', ?)", (time.time(),))
+        conn.execute("INSERT INTO config (user_id, key, value, set_at) VALUES (1, 'summary_length_unit', 'words', ?)", (time.time(),))
     conn.commit()
 
 
@@ -508,6 +626,7 @@ def db_connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, timeout=5)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
+    ensure_tenants(conn)
     _migrate(conn)
     return conn
 
@@ -537,8 +656,8 @@ def cache_error(action: str, exc: sqlite3.Error) -> None:
 CONFIG_KEYS = ("tokens", "summary_words", "provider")
 
 
-def config_set_many(changes: dict[str, object]) -> bool:
-    """Persist a validated group before callers mutate live state; one transaction is fail-closed."""
+def config_set_many(changes: dict[str, object], user_id: int = DEFAULT_USER_ID) -> bool:
+    """Persist a validated group before callers mutate live state; one transaction, one tenant, fail-closed."""
     try:
         with DB_LOCK:
             conn = db_connect()
@@ -546,9 +665,9 @@ def config_set_many(changes: dict[str, object]) -> bool:
                 for key, value in changes.items():
                     serialized = str(int(value)) if key in {"tokens", "summary_words"} else str(value)
                     conn.execute(
-                        "INSERT INTO config (key, value, set_at) VALUES (?, ?, ?) "
-                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, set_at=excluded.set_at",
-                        (key, serialized, time.time()),
+                        "INSERT INTO config (user_id, key, value, set_at) VALUES (?, ?, ?, ?) "
+                        "ON CONFLICT(user_id, key) DO UPDATE SET value=excluded.value, set_at=excluded.set_at",
+                        (int(user_id), key, serialized, time.time()),
                     )
                 conn.commit()
             finally:
@@ -560,17 +679,18 @@ def config_set_many(changes: dict[str, object]) -> bool:
         return False
 
 
-def config_set(key: str, value: object) -> bool:
-    return config_set_many({key: value})
+def config_set(key: str, value: object, user_id: int = DEFAULT_USER_ID) -> bool:
+    return config_set_many({key: value}, user_id)
 
 
-def load_config() -> None:
-    """Apply persisted sliders over the env defaults; a malformed row falls back to the current value."""
+def load_config(user_id: int = DEFAULT_USER_ID) -> None:
+    """Apply the default tenant's persisted sliders over the env defaults; a malformed row keeps its current value."""
     try:
         with DB_LOCK:
             conn = db_connect()
             try:
-                rows = {row[0]: (row[1], row[2]) for row in conn.execute("SELECT key, value, set_at FROM config")}
+                rows = {row[0]: (row[1], row[2]) for row in conn.execute(
+                    "SELECT key, value, set_at FROM config WHERE user_id = ?", (int(user_id),))}
             finally:
                 conn.close()
     except sqlite3.Error as exc:
@@ -596,6 +716,219 @@ def load_config() -> None:
         with PROMPT_LOCK:
             global CONDENSER_PROMPT
             CONDENSER_PROMPT = prompt_row[0]
+
+
+# ----------------------------- accounts & sessions -----------------------------
+# One account per tenant. The default account is seeded on first use (its id is DEFAULT_USER_ID, which every
+# legacy row already carries), dashboard sessions are cookie tokens, and each account also gets a long-lived
+# api token for its Pi proxy path. Passwords are salted PBKDF2 hashes — never stored in the clear.
+USERS_SCHEMA = (
+    "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL COLLATE NOCASE UNIQUE, "
+    "password TEXT NOT NULL, api_token TEXT NOT NULL UNIQUE, created_at REAL NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, user_id INTEGER NOT NULL, expires_at REAL NOT NULL)",
+)
+SESSION_TTL_S = 30 * 24 * 3600
+SESSION_COOKIE = "ctx_sess"
+USERNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{2,31}$")
+MIN_PASSWORD_CHARS = 6
+PBKDF2_ROUNDS = 200_000
+LOGIN_MAX_ATTEMPTS = 10
+LOGIN_WINDOW_S = 300.0
+LOGIN_ATTEMPTS: dict[str, list[float]] = {}
+LOGIN_LOCK = threading.Lock()
+TENANTS_READY = {"path": None}
+AUTH_MISS = {"at": 0.0}
+
+
+def ensure_tenants(conn: sqlite3.Connection) -> None:
+    """Create the account tables and seed the operator's default tenant once per database file. No lock:
+    two threads seeding at once are resolved by the UNIQUE username, and the loser's insert is ignored."""
+    if TENANTS_READY["path"] == DB_PATH:
+        return
+    for statement in USERS_SCHEMA:
+        conn.execute(statement)
+    if not conn.execute("SELECT 1 FROM users LIMIT 1").fetchone():
+        try:
+            _insert_user(conn, DEFAULT_USERNAME, DEFAULT_PASSWORD)
+        except ValueError as exc:
+            print(f"ctx-engine default tenant not seeded: {exc}", file=sys.stderr, flush=True)
+    conn.commit()
+    TENANTS_READY["path"] = DB_PATH
+
+
+def hash_password(password: str, salt: bytes | None = None) -> str:
+    salt = salt or secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PBKDF2_ROUNDS)
+    return f"pbkdf2_sha256${PBKDF2_ROUNDS}${salt.hex()}${digest.hex()}"
+
+
+def verify_password(stored: str, password: str) -> bool:
+    try:
+        scheme, rounds, salt_hex, digest_hex = str(stored).split("$")
+        digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt_hex), int(rounds))
+    except (ValueError, TypeError, AttributeError):
+        return False
+    return scheme == "pbkdf2_sha256" and hmac.compare_digest(digest.hex(), digest_hex)
+
+
+def _insert_user(conn: sqlite3.Connection, username: str, password: str) -> dict:
+    if not USERNAME_RE.match(str(username or "")):
+        raise ValueError("username must be 3-32 characters: letters, digits, dot, dash or underscore")
+    if len(str(password or "")) < MIN_PASSWORD_CHARS:
+        raise ValueError(f"password must be at least {MIN_PASSWORD_CHARS} characters")
+    token = secrets.token_urlsafe(24)
+    try:
+        cursor = conn.execute("INSERT INTO users (username, password, api_token, created_at) VALUES (?, ?, ?, ?)",
+                              (username, hash_password(password), token, time.time()))
+    except sqlite3.IntegrityError as exc:
+        raise ValueError("username already taken") from exc
+    return {"id": int(cursor.lastrowid), "username": username, "api_token": token}
+
+
+def create_user(username: str, password: str) -> dict:
+    with DB_LOCK:
+        conn = db_connect()
+        try:
+            user = _insert_user(conn, username, password)
+            conn.commit()
+            return user
+        finally:
+            conn.close()
+
+
+def _login_limited(username: str) -> bool:
+    key = str(username or "").lower()
+    now = time.monotonic()
+    with LOGIN_LOCK:
+        attempts = [stamp for stamp in LOGIN_ATTEMPTS.get(key, []) if now - stamp < LOGIN_WINDOW_S]
+        if attempts:
+            LOGIN_ATTEMPTS[key] = attempts
+        else:
+            LOGIN_ATTEMPTS.pop(key, None)
+        if len(LOGIN_ATTEMPTS) > 1024:  # bound the map when bots spray unique usernames
+            LOGIN_ATTEMPTS.clear()
+        return len(attempts) >= LOGIN_MAX_ATTEMPTS
+
+
+def _login_failed(username: str) -> None:
+    with LOGIN_LOCK:
+        LOGIN_ATTEMPTS.setdefault(str(username or "").lower(), []).append(time.monotonic())
+
+
+def authenticate(username: str, password: str) -> dict | None:
+    """One account by name and password, or None; ten failures in five minutes lock that name out."""
+    if _login_limited(username):
+        return None
+    user = find_user(username)
+    if user is None or not verify_password(user["password"], password):
+        _login_failed(username)
+        return None
+    with LOGIN_LOCK:
+        LOGIN_ATTEMPTS.pop(str(username or "").lower(), None)
+    return {"id": user["id"], "username": user["username"], "api_token": user["api_token"]}
+
+
+def _user_row(conn: sqlite3.Connection, where: str, value: object) -> dict | None:
+    row = conn.execute(f"SELECT id, username, api_token FROM users WHERE {where} = ?", (value,)).fetchone()
+    return {"id": int(row[0]), "username": str(row[1]), "api_token": str(row[2])} if row else None
+
+
+def find_user(username: str) -> dict | None:
+    try:
+        with DB_LOCK:
+            conn = db_connect()
+            try:
+                row = conn.execute("SELECT id, username, api_token, password FROM users WHERE username = ?",
+                                   (str(username or ""),)).fetchone()
+            finally:
+                conn.close()
+    except sqlite3.Error as exc:
+        cache_error("user read", exc)
+        return None
+    return dict(zip(("id", "username", "api_token", "password"), row)) if row else None
+
+
+def user_by_id(user_id: int) -> dict | None:
+    try:
+        with DB_LOCK:
+            conn = db_connect()
+            try:
+                return _user_row(conn, "id", int(user_id))
+            finally:
+                conn.close()
+    except sqlite3.Error as exc:
+        cache_error("user read", exc)
+        return None
+
+
+def user_by_api_token(token: str) -> dict | None:
+    if not token:
+        return None
+    try:
+        with DB_LOCK:
+            conn = db_connect()
+            try:
+                return _user_row(conn, "api_token", str(token))
+            finally:
+                conn.close()
+    except sqlite3.Error as exc:
+        cache_error("token read", exc)
+        raise
+
+
+def default_user() -> dict | None:
+    return user_by_id(DEFAULT_USER_ID)
+
+
+def create_session(user_id: int) -> str:
+    token = secrets.token_urlsafe(32)
+    with DB_LOCK:
+        conn = db_connect()
+        try:
+            conn.execute("INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, ?)",
+                         (token, int(user_id), time.time() + SESSION_TTL_S))
+            conn.commit()
+        finally:
+            conn.close()
+    return token
+
+
+def session_user(token: str) -> dict | None:
+    """The logged-in account for a session cookie, or None when it is unknown or expired. A database error
+    is raised, never read as "no session": a locked cache must not kick a signed-in user back to the login."""
+    if not token:
+        return None
+    try:
+        with DB_LOCK:
+            conn = db_connect()
+            try:
+                row = conn.execute("SELECT u.id, u.username, u.api_token, s.expires_at FROM sessions s "
+                                   "JOIN users u ON u.id = s.user_id WHERE s.token = ?", (str(token),)).fetchone()
+                if row and float(row[3]) <= time.time():
+                    conn.execute("DELETE FROM sessions WHERE token = ?", (str(token),))
+                    conn.commit()
+                    row = None
+            finally:
+                conn.close()
+    except sqlite3.Error as exc:
+        cache_error("session read", exc)
+        raise
+    return {"id": int(row[0]), "username": str(row[1]), "api_token": str(row[2])} if row else None
+
+
+def destroy_session(token: str) -> None:
+    if not token:
+        return
+    try:
+        with DB_LOCK:
+            conn = db_connect()
+            try:
+                conn.execute("DELETE FROM sessions WHERE token = ?", (str(token),))
+                conn.commit()
+            finally:
+                conn.close()
+    except sqlite3.Error as exc:
+        cache_error("session drop", exc)
 
 
 def cache_get(digest: str, provider: str, want_tokens: int | None = None, model: str | None = None, prompt_hash: str | None = None,
@@ -700,15 +1033,15 @@ def cache_count() -> int:
     return sum(cache_counts().values())
 
 
-def recent_requests(limit: int = WINDOW) -> list[dict]:
-    """Newest-first router decisions straight from ctx-engine.db, so restarts do not empty the window."""
+def recent_requests(limit: int = WINDOW, user_id: int = DEFAULT_USER_ID) -> list[dict]:
+    """Newest-first router decisions for one tenant straight from ctx-engine.db, so restarts do not empty the window."""
     try:
         with DB_LOCK:
             conn = db_connect()
             try:
                 rows = conn.execute(
                     "SELECT id, at, route, model, result, status, ms, raw_tokens, sent_tokens, provider, detail, raw, cost "
-                    "FROM requests ORDER BY id DESC LIMIT ?", (limit,)
+                    "FROM requests WHERE user_id = ? ORDER BY id DESC LIMIT ?", (int(user_id), limit)
                 ).fetchall()
             finally:
                 conn.close()
@@ -722,15 +1055,16 @@ def recent_requests(limit: int = WINDOW) -> list[dict]:
         return []
 
 
-def request_detail(request_id: int) -> dict | None:
-    """One stored decision plus its parsed compaction plan, for the inspect modal; None when the row is gone."""
+def request_detail(request_id: int, user_id: int = DEFAULT_USER_ID) -> dict | None:
+    """One stored decision plus its parsed compaction plan, for the inspect modal; None when the row is gone
+    or belongs to another tenant."""
     try:
         with DB_LOCK:
             conn = db_connect()
             try:
                 row = conn.execute(
                     "SELECT at, route, model, result, status, ms, raw_tokens, sent_tokens, provider, detail, plan, cost "
-                    "FROM requests WHERE id = ?", (request_id,)
+                    "FROM requests WHERE id = ? AND user_id = ?", (request_id, int(user_id))
                 ).fetchone()
             finally:
                 conn.close()
@@ -800,14 +1134,15 @@ def window_stats(rows: list[dict]) -> dict:
     }
 
 
-def global_stats() -> dict:
-    """Whole retained ledger, so reclaimed context is a running total and not just the last-100 window."""
+def global_stats(user_id: int = DEFAULT_USER_ID) -> dict:
+    """One tenant's whole retained ledger, so reclaimed context is a running total and not just the last-100 window."""
     try:
         with DB_LOCK:
             conn = db_connect()
             try:
-                row = conn.execute("SELECT COUNT(*), COALESCE(SUM(raw_tokens), 0), COALESCE(SUM(sent_tokens), 0), MIN(at), MAX(at) FROM requests").fetchone()
-                costs = [r[0] for r in conn.execute("SELECT cost FROM requests WHERE cost != ''").fetchall()]
+                row = conn.execute("SELECT COUNT(*), COALESCE(SUM(raw_tokens), 0), COALESCE(SUM(sent_tokens), 0), MIN(at), MAX(at) "
+                                   "FROM requests WHERE user_id = ?", (int(user_id),)).fetchone()
+                costs = [r[0] for r in conn.execute("SELECT cost FROM requests WHERE cost != '' AND user_id = ?", (int(user_id),)).fetchall()]
             finally:
                 conn.close()
     except sqlite3.Error as exc:
@@ -830,15 +1165,16 @@ def global_stats() -> dict:
             "first_at": row[3], "last_at": row[4]}
 
 
-def reclaimed_series(hours: int = SERIES_HOURS) -> list[dict]:
-    """Per-minute tokens reclaimed over the last `hours`, the grid behind the dashboard chart."""
+def reclaimed_series(hours: int = SERIES_HOURS, user_id: int = DEFAULT_USER_ID) -> list[dict]:
+    """Per-minute tokens reclaimed for one tenant over the last `hours`, the grid behind the dashboard chart."""
     try:
         with DB_LOCK:
             conn = db_connect()
             try:
                 rows = conn.execute(
                     "SELECT CAST(at / 60 AS INTEGER) AS minute, SUM(raw_tokens), SUM(sent_tokens), COUNT(*), GROUP_CONCAT(cost, char(31)) "
-                    "FROM requests WHERE at >= ? GROUP BY minute ORDER BY minute", (time.time() - hours * 3600,)
+                    "FROM requests WHERE user_id = ? AND at >= ? GROUP BY minute ORDER BY minute",
+                    (int(user_id), time.time() - hours * 3600)
                 ).fetchall()
             finally:
                 conn.close()
@@ -1071,6 +1407,7 @@ def summary_item(ident: str, summary: str) -> dict:
 def schedule_summary(block: list, summarize=summarize_block, snapshot: dict | None = None) -> futures.Future:
     """Start one background condensation for a complete provider/model/length/prompt identity."""
     snapshot = resolve_snapshot(condenser_snapshot() if snapshot is None else snapshot)
+    user_id = int(snapshot.get("user") or DEFAULT_USER_ID)
     key = (block_id(block), snapshot["provider"], snapshot["model"], snapshot["words"], snapshot["prompt_hash"])
     with JOBS_LOCK:
         job = SUMMARY_JOBS.get(key)
@@ -1079,8 +1416,9 @@ def schedule_summary(block: list, summarize=summarize_block, snapshot: dict | No
                 for old in [k for k, f in SUMMARY_JOBS.items() if f.done()]:
                     SUMMARY_JOBS.pop(old, None)
             job = SUMMARY_POOL.submit(
-                summarize, block, snapshot["words"], snapshot["model"], snapshot["prompt"], snapshot["prompt_hash"], snapshot["provider"]
-            ) if summarize is summarize_block else SUMMARY_POOL.submit(summarize, block)
+                _as_tenant, user_id, summarize, block, snapshot["words"], snapshot["model"], snapshot["prompt"],
+                snapshot["prompt_hash"], snapshot["provider"]
+            ) if summarize is summarize_block else SUMMARY_POOL.submit(_as_tenant, user_id, summarize, block)
             SUMMARY_JOBS[key] = job
     return job
 
@@ -1132,7 +1470,7 @@ def condense_completed(completed: list, summarize=summarize_block, snapshot: dic
             continue
         fallback_slot = {**snapshots[index], "provider": FALLBACK_PROVIDER, "model": provider_model(FALLBACK_PROVIDER)}
         fallbacks[index] = schedule_summary(block, summarize, fallback_slot) if summarize is summarize_block \
-            else SUMMARY_POOL.submit(summarize, block)
+            else SUMMARY_POOL.submit(_as_tenant, int(fallback_slot.get("user") or DEFAULT_USER_ID), summarize, block)
     if fallbacks:
         futures.wait(list(fallbacks.values()), timeout=max(0.0, deadline - time.monotonic()))
     authored = {index: job for (index, _), job in zip(waiting, jobs)}
@@ -1242,7 +1580,8 @@ def chat_summary_item(ident: str, summary: str) -> dict:
     return {"role": "user", "content": _traced_summary(summary)}
 
 
-def rewrite_request(raw: bytes, token_limit: int | None = None, report: dict | None = None) -> tuple[bytes, bool]:
+def rewrite_request(raw: bytes, token_limit: int | None = None, report: dict | None = None,
+                    snapshot: dict | None = None) -> tuple[bytes, bool]:
     token_limit = BUDGET["tokens"] if token_limit is None else token_limit
     try:
         body = json.loads(raw)
@@ -1250,7 +1589,7 @@ def rewrite_request(raw: bytes, token_limit: int | None = None, report: dict | N
         return raw, False
     if not isinstance(body, dict):
         return raw, False
-    snapshot = condenser_snapshot()
+    snapshot = condenser_snapshot() if snapshot is None else snapshot
     if report is not None:
         report.update(provider=snapshot["provider"], condenser_model=snapshot["model"])
     if has_image_content(body.get("messages") or []) or has_image_content(body.get("input") or []):
@@ -1566,17 +1905,19 @@ def token_stats() -> dict:
 
 # ----------------------------- dashboard -----------------------------
 
-def stats_snapshot() -> dict:
+def stats_snapshot(user_id: int = DEFAULT_USER_ID) -> dict:
+    """One tenant's dashboard: its counters, its ledger window, its settings — plus the server-wide provider
+    map and cache counters (the note cache is content-addressed, so it is shared by construction)."""
     with METRICS_LOCK:
-        snapshot = dict(METRICS)
+        snapshot = dict(tenant_metrics(user_id))
     # Row `at` is stamped by this process's clock; the dashboard renders age and the 24h window against
     # `now` from the same clock, never the browser's, so a clock-skewed host cannot shift them.
     snapshot["now"] = time.time()
-    recent = recent_requests(WINDOW)
+    recent = recent_requests(WINDOW, user_id)
     snapshot["recent"] = recent
     snapshot["window"] = window_stats(recent)
-    snapshot["global"] = global_stats()
-    snapshot["series"] = reclaimed_series()
+    snapshot["global"] = global_stats(user_id)
+    snapshot["series"] = reclaimed_series(user_id=user_id)
     buckets = cache_counts()
     snapshot["cache_buckets"] = buckets
     snapshot["cache_entries"] = sum(buckets.values())
@@ -1584,15 +1925,14 @@ def stats_snapshot() -> dict:
     calls = sum(snapshot.get(f"condenser_calls_{provider}", 0) for provider in provider_ids())
     snapshot["condenser_calls"] = calls
     snapshot["condenser_avg_ms"] = round(snapshot["condenser_ms_total"] / calls, 1) if calls else 0.0
-    with PROVIDER_LOCK:
-        active_provider = ACTIVE_PROVIDER
-    snapshot["provider"] = active_provider
-    snapshot["model"] = provider_model(active_provider)
+    settings = user_settings(user_id)
+    snapshot["provider"] = settings["provider"]
+    snapshot["model"] = provider_model(settings["provider"])
     snapshot["providers"] = provider_choices()
-    snapshot["token_limit"] = BUDGET["tokens"]
-    snapshot["summary_words"] = summary_target()
+    snapshot["token_limit"] = settings["tokens"]
+    snapshot["summary_words"] = settings["summary_words"]
     snapshot["summary_word_steps"] = list(SUMMARY_WORD_STEPS)
-    snapshot["summary_set_at"] = SUMMARY["set_at"] or None
+    snapshot["summary_set_at"] = settings["set_at"] or None
     raw = snapshot["input_chars_raw"] or 0
     sent = snapshot["input_chars_sent"] or 0
     snapshot["input_tokens_raw_est"] = round(raw / CHARS_PER_TOKEN)
@@ -1603,6 +1943,10 @@ def stats_snapshot() -> dict:
     snapshot["chars_per_token"] = CHARS_PER_TOKEN
     snapshot["db_errors"] = 1 if DB_ERROR["at"] else 0
     snapshot["db_error_at"] = DB_ERROR["at"] or None
+    account = user_by_id(user_id) or {}
+    snapshot["user"] = {"username": str(account.get("username") or ""),
+                        "api_token": str(account.get("api_token") or ""),
+                        "operator": user_id == DEFAULT_USER_ID}
     return snapshot
 
 
@@ -1642,12 +1986,141 @@ class RouterHandler(BaseHTTPRequestHandler):
 
     def send_bytes(self, status: int, body: bytes, content_type: str = "application/json") -> None:
         self.send_response(status)
+        for key, value in getattr(self, "_extra_headers", []):
+            self.send_header(key, value)
+        self._extra_headers = []
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
         self.close_connection = True
+
+    # ----------------------------- authentication -----------------------------
+    def cookie_token(self) -> str:
+        for part in (self.headers.get("Cookie") or "").split(";"):
+            name, _, value = part.strip().partition("=")
+            if name == SESSION_COOKIE:
+                return value
+        return ""
+
+    def principal(self) -> dict | None:
+        """The account behind this call: session cookie first, then X-CTX-Token (a session or a tenant api
+        token). PI_CONTEXT_ROUTER_REQUIRE_LOGIN=0 answers with the default tenant so the test suite and local
+        tooling keep working without a login."""
+        if not AUTH_ENABLED:
+            return default_user()
+        token = self.cookie_token() or self.headers.get("X-CTX-Token", "")
+        return session_user(token) or user_by_api_token(token)
+
+    def require_user(self) -> dict | None:
+        """A logged-in account, or a 401/503 and None; every dashboard read and write runs as that tenant."""
+        try:
+            user = self.principal()
+        except sqlite3.Error:
+            self.send_bytes(503, b'{"error":"ctx-engine database unavailable"}')
+            return None
+        if user is None:
+            self.send_bytes(401, b'{"error":"authentication required"}')
+            self._log_auth_miss()
+            return None
+        set_tenant(user["id"])
+        return user
+
+    def _log_auth_miss(self) -> None:
+        """One rate-limited line when a credential was presented but the store did not recognize it: an
+        anonymous request is just the login screen, a rejected session is worth seeing in the journal."""
+        if not (self.cookie_token() or self.headers.get("X-CTX-Token", "")):
+            return
+        now = time.time()
+        if now - AUTH_MISS["at"] > 60:
+            AUTH_MISS["at"] = now
+            print("ctx-engine session not recognized (expired, logged out, or the account is gone)",
+                  file=sys.stderr, flush=True)
+
+    def require_operator(self) -> bool:
+        """The debugger, local token journal and master condense are the operator's: another account gets a
+        403, and an anonymous call is accepted only while the router keeps its loopback trust model."""
+        try:
+            user = self.principal()
+        except sqlite3.Error:
+            self.send_bytes(503, b'{"error":"ctx-engine database unavailable"}')
+            return False
+        if user is not None:
+            if user["id"] != DEFAULT_USER_ID:
+                self.send_bytes(403, b'{"error":"operator only"}')
+                return False
+            set_tenant(user["id"])
+            return True
+        if PUBLIC_DEPLOY:
+            self.send_bytes(401, b'{"error":"authentication required"}')
+            return False
+        set_tenant(DEFAULT_USER_ID)
+        return True
+
+    def proxy_tenant(self) -> tuple[int | None, str]:
+        """`/t/<api-token>/...` is that tenant's proxy path and works in any deployment. The bare paths stay
+        the operator's own router until the deployment is marked public, which is when they need a token."""
+        path = urlsplit(self.path).path.rstrip("/")
+        match = re.match(r"^/t/([A-Za-z0-9_-]{8,})(/.*)$", path)
+        if match:
+            user = user_by_api_token(match.group(1))
+            if user is None:
+                return None, path
+            set_tenant(user["id"])
+            return user["id"], match.group(2)
+        if PUBLIC_DEPLOY:
+            return None, path
+        set_tenant(DEFAULT_USER_ID)
+        return DEFAULT_USER_ID, path
+
+    def handle_account(self, path: str) -> None:
+        """/api/login, /api/register and /api/logout: one JSON body in, a session cookie out."""
+        if path == "/api/logout":
+            # No body required: signing out must work from a bare `curl -X POST /api/logout`.
+            destroy_session(self.cookie_token())
+            self._extra_headers = [("Set-Cookie", f"{SESSION_COOKIE}=; Path=/; HttpOnly; Max-Age=0")]
+            self.send_bytes(200, b'{"ok":true}')
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self.send_bytes(400, b'{"error":"invalid content length"}')
+            return
+        if length <= 0 or length > 8 * 1024:
+            self.send_bytes(413, b'{"error":"request body size rejected"}')
+            return
+        try:
+            payload = json.loads(self.rfile.read(length))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            self.send_bytes(400, b'{"error":"invalid JSON"}')
+            return
+        if not isinstance(payload, dict):
+            self.send_bytes(400, b'{"error":"invalid JSON"}')
+            return
+        username, password = payload.get("username"), payload.get("password")
+        if not isinstance(username, str) or not isinstance(password, str):
+            self.send_bytes(400, b'{"error":"username and password are required"}')
+            return
+        if path == "/api/login":
+            user = authenticate(username, password)
+            if user is None:
+                self.send_bytes(401, b'{"error":"invalid username or password"}')
+                return
+        else:
+            try:
+                user = create_user(username, password)
+            except ValueError as exc:
+                self.send_bytes(400, compact_json({"error": str(exc)}).encode())
+                return
+            except sqlite3.Error:
+                self.send_bytes(503, b'{"error":"ctx-engine database unavailable"}')
+                return
+        token = create_session(user["id"])
+        secure = "; Secure" if self.headers.get("X-Forwarded-Proto", "").lower() == "https" else ""
+        self._extra_headers = [("Set-Cookie", f"{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; "
+                                        f"Max-Age={SESSION_TTL_S}{secure}")]
+        self.send_bytes(200, compact_json({"user": {**user, "operator": user["id"] == DEFAULT_USER_ID}}).encode())
 
     def serve_dashboard(self, name: str) -> None:
         path = os.path.join(FRONTEND_DIST, name)
@@ -1664,6 +2137,8 @@ class RouterHandler(BaseHTTPRequestHandler):
         path = parsed.path.rstrip("/")
         query = parse_qs(parsed.query, keep_blank_values=True)
         try:
+            if path.startswith("/debug/") and not self.require_operator():
+                return
             if path == "/debug/projects":
                 if query:
                     raise DebugInputError("debug/projects does not accept query parameters")
@@ -1682,7 +2157,10 @@ class RouterHandler(BaseHTTPRequestHandler):
             elif path == "/health":
                 self.send_bytes(200, b'{"status":"ok"}')
             elif path == "/stats":
-                self.send_bytes(200, compact_json(stats_snapshot()).encode())
+                user = self.require_user()
+                if user is None:
+                    return
+                self.send_bytes(200, compact_json(stats_snapshot(user["id"])).encode())
             elif path in ("/dashboard", "/dashboard/index.html", "/dashboard/debugger"):
                 self.serve_dashboard("index.html")
             elif path.startswith("/dashboard/assets/"):
@@ -1692,16 +2170,25 @@ class RouterHandler(BaseHTTPRequestHandler):
                     return
                 self.serve_dashboard("assets/" + name)
             elif path == "/token-stats":
+                if not self.require_operator():
+                    return
                 try:
                     self.send_bytes(200, compact_json(token_stats()).encode())
                 except (sqlite3.Error, OSError) as exc:
                     print(f"ctx-engine token stats error: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
                     self.send_bytes(503, b'{"error":"local token journal unavailable"}')
             elif path.startswith("/request/"):
-                detail = request_detail(int(path.rsplit("/", 1)[-1])) if path.rsplit("/", 1)[-1].isdigit() else None
+                user = self.require_user()
+                if user is None:
+                    return
+                detail = request_detail(int(path.rsplit("/", 1)[-1]), user["id"]) if path.rsplit("/", 1)[-1].isdigit() else None
                 self.send_bytes(200 if detail else 404, compact_json(detail or {"error": "not found"}).encode())
             else:
-                upstream, rest = self.resolve_upstream(path)
+                tenant, rest = self.proxy_tenant()
+                if tenant is None:
+                    self.send_bytes(401, b'{"error":"tenant token required"}')
+                    return
+                upstream, rest = self.resolve_upstream(rest)
                 if upstream is None:
                     self.send_bytes(404, b'{"error":"not found"}')
                     return
@@ -1727,6 +2214,11 @@ class RouterHandler(BaseHTTPRequestHandler):
             return
         if path == "/debug/preview" and parsed.query:
             self.send_bytes(400, b'{"error":"debug/preview does not accept query parameters"}')
+            return
+        if path in ("/api/login", "/api/register", "/api/logout"):
+            self.handle_account(path)
+            return
+        if (path == "/master/condense" or path.startswith("/debug/")) and not self.require_operator():
             return
         if path == "/master/condense":
             if parsed.query:
@@ -1829,6 +2321,9 @@ class RouterHandler(BaseHTTPRequestHandler):
             self.send_bytes(200, compact_json(result).encode())
             return
         if path == "/config":
+            user = self.require_user()
+            if user is None:
+                return
             try:
                 length = int(self.headers.get("Content-Length", "0"))
                 payload = json.loads(self.rfile.read(length) or b"{}")
@@ -1867,19 +2362,30 @@ class RouterHandler(BaseHTTPRequestHandler):
                     self.send_bytes(409, b'{"error":"condenser provider is unavailable"}')
                     return
                 result["provider"] = provider
-            if not result or not config_set_many(result):
+            if not result or not config_set_many(result, user["id"]):
                 self.send_bytes(503, b'{"error":"ctx-engine configuration could not be persisted"}')
                 return
-            now = time.time()
-            if "tokens" in result:
-                BUDGET.update(tokens=result["tokens"], set_at=now)
-            if "summary_words" in result:
-                SUMMARY.update(words=result["summary_words"], set_at=now)
-            if "provider" in result:
-                set_active_provider(result["provider"])
+            if user["id"] == DEFAULT_USER_ID:
+                # The default tenant's live settings are the legacy globals; every other tenant reads its
+                # own rows on the next request, so there is nothing to push here.
+                now = time.time()
+                if "tokens" in result:
+                    BUDGET.update(tokens=result["tokens"], set_at=now)
+                if "summary_words" in result:
+                    SUMMARY.update(words=result["summary_words"], set_at=now)
+                if "provider" in result:
+                    set_active_provider(result["provider"])
             self.send_bytes(200, compact_json(result).encode())
             return
-        upstream, rest = self.resolve_upstream(path)
+        try:
+            tenant, rest = self.proxy_tenant()
+        except sqlite3.Error:
+            self.send_bytes(503, b'{"error":"ctx-engine database unavailable"}')
+            return
+        if tenant is None:
+            self.send_bytes(401, b'{"error":"tenant token required"}')
+            return
+        upstream, rest = self.resolve_upstream(rest)
         if upstream is None:
             self.send_bytes(404, b'{"error":"not found"}')
             return
@@ -1902,7 +2408,9 @@ class RouterHandler(BaseHTTPRequestHandler):
         report: dict = {}
         try:
             decoded = gzip.decompress(raw) if content_encoding == "gzip" else zstd.decompress(raw) if content_encoding == "zstd" else raw
-            body, compacted = rewrite_request(decoded, report=report)
+            settings = user_settings(tenant)
+            body, compacted = rewrite_request(decoded, token_limit=settings["tokens"], report=report,
+                                              snapshot=condenser_snapshot(tenant, settings["provider"]))
             if not compacted:
                 bump(passed=1)
             entry = {"at": time.time(), "route": route_name(path), "model": model_of(body),

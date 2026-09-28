@@ -91,7 +91,16 @@ export interface ProviderChoice {
   error?: string;
 }
 
+// The logged-in account behind this dashboard: its username, the tenant api token its own Pi points at,
+// and whether it is the operator (the seeded default tenant that owns the debugger and master tools).
+export interface Account {
+  username: string;
+  api_token: string;
+  operator: boolean;
+}
+
 export interface Stats {
+  user: Account;
   providers: ProviderChoice[];
   requests: number;
   passed: number;
@@ -232,14 +241,19 @@ export class ApiError extends Error {
   constructor(
     public readonly status: number,
     public readonly path: string,
+    detail = "",
   ) {
-    super(`${path} → HTTP ${status}`);
+    super(detail || `${path} → HTTP ${status}`);
     this.name = "ApiError";
   }
 }
 
 export function isMissingEndpoint(error: unknown): boolean {
   return error instanceof ApiError && (error.status === 404 || error.status === 405 || error.status === 501);
+}
+
+export function isUnauthorized(error: unknown): boolean {
+  return error instanceof ApiError && error.status === 401;
 }
 
 async function getJson<T>(path: string): Promise<T> {
@@ -254,12 +268,24 @@ async function postJson<T>(path: string, body: unknown): Promise<T> {
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
   });
-  if (!res.ok) throw new ApiError(res.status, path);
+  if (!res.ok) {
+    // The router's own `error` text ("invalid username or password", "username already taken") reaches the UI.
+    let detail = "";
+    try {
+      detail = String(((await res.json()) as { error?: string }).error ?? "");
+    } catch {
+      detail = "";
+    }
+    throw new ApiError(res.status, path, detail);
+  }
   return (await res.json()) as T;
 }
 
 export const api = {
   stats: () => getJson<Stats>("/stats"),
+  login: (username: string, password: string) => postJson<{ user: Account }>("/api/login", { username, password }),
+  register: (username: string, password: string) => postJson<{ user: Account }>("/api/register", { username, password }),
+  logout: () => postJson<{ ok: boolean }>("/api/logout", {}),
   tokenStats: () => getJson<TokenStats>("/token-stats"),
   request: (id: number) => getJson<RequestDetail>(`/request/${id}`),
   setConfig: (config: { tokens?: number; summary_words?: number; provider?: string }) => postJson<unknown>("/config", config),

@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api } from "./api";
+import { api, isUnauthorized } from "./api";
+import { Login } from "./Login";
 import { BUDGET_POINTS, SettingSlider, Tabs, type TabDef } from "./components";
 import { clockTime, dur, syncClock } from "./format";
 import { ContextView } from "./views/Context";
@@ -46,6 +47,10 @@ export default function App() {
     mutationFn: (change: { tokens?: number; summary_words?: number; provider?: string }) => api.setConfig(change),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["stats"] }),
   });
+  const logout = useMutation({
+    mutationFn: api.logout,
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["stats"] }),
+  });
 
   const statsQuery = useQuery({
     queryKey: ["stats"],
@@ -57,6 +62,16 @@ export default function App() {
   const stats = statsQuery.data;
   // All relative ages and the 24 h chart window follow the router's own clock, never the browser's.
   if (stats) syncClock(stats.now);
+
+  // No session (or an expired one): this account has no dashboard until it signs in.
+  if (isUnauthorized(statsQuery.error)) {
+    return <Login onDone={() => queryClient.invalidateQueries({ queryKey: ["stats"] })} />;
+  }
+
+  // The debugger and the local token journal read the operator's machine, so only the owner sees them.
+  const operator = stats?.user.operator ?? true;
+  const visibleTabs = operator ? TABS : TABS.filter((item) => item.id === "context" || item.id === "traffic");
+  const active = visibleTabs.some((item) => item.id === tab) ? tab : visibleTabs[0].id;
 
   return (
     <main className="mx-auto max-w-[1800px] px-3.5 pb-8 pt-3">
@@ -88,24 +103,40 @@ export default function App() {
           </div>
         </div>}
         {stats && <span className="text-[12.5px] text-muted">router clock {clockTime(stats.now)}</span>}
-        <Tabs tabs={TABS} active={tab} onChange={navigateTab} />
+        {stats && (
+          <span className="text-[12.5px] text-muted" title={`tenant proxy token ${stats.user.api_token}`}>
+            {stats.user.username}
+            {stats.user.operator ? " · owner" : ""}
+          </span>
+        )}
+        {stats && (
+          <button
+            type="button"
+            onClick={() => logout.mutate()}
+            disabled={logout.isPending}
+            className="border border-line bg-panel px-2.5 py-1 text-[12px] text-muted hover:text-body disabled:opacity-50"
+          >
+            Log out
+          </button>
+        )}
+        <Tabs tabs={visibleTabs} active={active} onChange={navigateTab} />
       </header>
 
       {settings.isError && <p role="alert" className="py-2 text-neg">Could not save setting; refresh to retry.</p>}
       <div
         role="tabpanel"
-        id={`panel-${tab}`}
-        aria-labelledby={`tab-${tab}`}
+        id={`panel-${active}`}
+        aria-labelledby={`tab-${active}`}
         className="mt-2"
       >
-        {tab === "debugger" && <DebuggerView />}
-        {tab !== "debugger" && statsQuery.isLoading && <p className="px-1 py-6 text-muted">loading counters…</p>}
-        {tab !== "debugger" && statsQuery.error != null && !stats && (
+        {active === "debugger" && <DebuggerView />}
+        {active !== "debugger" && statsQuery.isLoading && <p className="px-1 py-6 text-muted">loading counters…</p>}
+        {active !== "debugger" && statsQuery.error != null && !stats && !isUnauthorized(statsQuery.error) && (
           <p className="px-1 py-6 text-muted">the router /stats endpoint did not answer — retrying every 5 s.</p>
         )}
-        {stats && tab === "context" && <ContextView stats={stats} />}
-        {stats && tab === "traffic" && <TrafficStatsView stats={stats} />}
-        {tab === "tokens" && <TokenStatsView />}
+        {stats && active === "context" && <ContextView stats={stats} />}
+        {stats && active === "traffic" && <TrafficStatsView stats={stats} />}
+        {active === "tokens" && <TokenStatsView />}
       </div>
     </main>
   );

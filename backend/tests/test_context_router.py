@@ -21,8 +21,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "ctx_engine_server.py"
-# Provider probes are network calls; this suite answers availability from the static map instead.
+# Provider probes are network calls and dashboard login needs a session; this suite answers availability
+# from the static map and runs with auth off (the default tenant), like the pre-multi-tenant router.
 os.environ["PI_CONTEXT_ROUTER_PROVIDER_PROBE_TTL"] = "0"
+os.environ["PI_CONTEXT_ROUTER_REQUIRE_LOGIN"] = "0"
 SPEC = importlib.util.spec_from_file_location("context_router", MODULE_PATH)
 router = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader
@@ -377,7 +379,8 @@ class RouterTests(unittest.TestCase):
     def test_old_token_length_cache_and_config_are_archived_on_word_migration(self):
         conn = sqlite3.connect(router.DB_PATH)
         conn.execute(router.SCHEMA)
-        conn.execute(router.CONFIG_SCHEMA)
+        # The token-era single-tenant config table: the migration must move it onto (user_id, key) first.
+        conn.execute("CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL, set_at REAL NOT NULL)")
         conn.execute("INSERT INTO config VALUES ('summary_tokens', '400', 1.0)")
         note = "- Task/Query: old token note\\n- Actions Performed: old\\n- Conclusion: archived"
         conn.execute("INSERT INTO summaries VALUES ('legacy-digest', 'deepseek', ?, 'deepseek-flash', 400, 'old-prompt-hash', 1.0)", (note,))

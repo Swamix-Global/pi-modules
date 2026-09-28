@@ -206,6 +206,8 @@ export function ContextView({ stats }: { stats: Stats }) {
           <Panel title="Condenser & runtime">
             <Metrics
               rows={[
+                ["Account", stats.user.username],
+                ["Proxy path", `${globalThis.location.origin}/t/${stats.user.api_token}`],
                 ["Active backend", `${stats.provider} · ${stats.model}`],
                 ["Calls total", fmt(condenserCalls)],
                 ["DeepSeek calls", fmt(stats.condenser_calls_deepseek)],
