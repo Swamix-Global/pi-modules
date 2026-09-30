@@ -144,7 +144,7 @@ const NUMERIC_FIELDS: NumericField[] = [
     min: 1,
     step: 1,
     unit: "tokens",
-    help: "DeepSeek output safety headroom; Codex follows the system word-length hint.",
+    help: "DeepSeek output safety headroom; OpenAI subscription follows the system word-length hint.",
   },
 ];
 

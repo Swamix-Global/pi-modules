@@ -23,8 +23,8 @@ export async function condense(
       refreshOnCreate: false,
       signal,
     });
-    const model = runtime.getModel("openai-codex", config.model);
-    if (!model) throw new Error("Codex Luna 6 is missing from Pi's catalog");
+    const model = runtime.getModel("openai", config.model);
+    if (!model) throw new Error("OpenAI Luna 6 is missing from Pi's catalog");
     const result = await runtime.completeSimple(
       model,
       {

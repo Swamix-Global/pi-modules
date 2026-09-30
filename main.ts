@@ -543,10 +543,44 @@ async function forwardProxy(
     trace.compressed = trace.original;
     if (value && typeof value === "object" && !Array.isArray(value)) {
       trace.compressed = null;
-      const result = await compressBody(value, trace.changes);
+      const credential = request.headers
+        .get("authorization")
+        ?.match(/^Bearer\s+(.+)$/i)?.[1];
+      const removed: Item = {};
+      let compatible = value;
+      if (
+        new URL(request.url).pathname === "/r/openai/responses" &&
+        credential &&
+        !credential.startsWith("sk-")
+      ) {
+        // Match Pi's direct-OpenAI subscription normalization, lost with a loopback base URL.
+        compatible = { ...value };
+        for (const key of [
+          "max_output_tokens",
+          "temperature",
+          "prompt_cache_retention",
+          "prompt_cache_options",
+        ]) {
+          if (Object.hasOwn(compatible, key)) {
+            removed[key] = compatible[key];
+            delete compatible[key];
+          }
+        }
+      }
+      const normalized = Object.keys(removed).length > 0;
+      if (normalized)
+        trace.changes.push({
+          kind: "subscription",
+          source_hash: hash(removed),
+          before: removed,
+          after: null,
+          cached: false,
+          fallback: false,
+        });
+      const result = await compressBody(compatible, trace.changes);
       trace.compressed = result.body;
-      trace.changed = result.changed;
-      changed = result.changed;
+      trace.changed = result.changed || normalized;
+      changed = trace.changed;
       if (changed) {
         const wire = Buffer.from(json(result.body));
         body =

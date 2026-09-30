@@ -7,15 +7,15 @@ test("Codex uses native Pi subscription auth, direct catalog model, no tools or 
   const options: any[] = [];
   const model = {
     id: "gpt-6-luna",
-    provider: "openai-codex",
-    baseUrl: "https://chatgpt.com/backend-api",
+    provider: "openai",
+    baseUrl: "https://api.openai.com/v1",
   };
   const create = spyOn(ModelRuntime, "create").mockImplementation(
     async (config) => {
       options.push(config);
       return {
         getModel(provider: string, id: string) {
-          expect(provider).toBe("openai-codex");
+          expect(provider).toBe("openai");
           expect(id).toBe("gpt-6-luna");
           return model;
         },

@@ -1,6 +1,11 @@
 import { test, expect, afterAll, spyOn } from "bun:test";
 import { Database } from "bun:sqlite";
-import { gzipSync, zstdCompressSync } from "node:zlib";
+import {
+  gzipSync,
+  gunzipSync,
+  zstdCompressSync,
+  zstdDecompressSync,
+} from "node:zlib";
 import { hash, json, tokens, turns, transcript } from "../utils.ts";
 import {
   ATTEMPT_TIMEOUT_MS,
@@ -57,7 +62,11 @@ const upstream = Bun.serve({
         ],
       });
     }
-    if (new URL(request.url).pathname === "/stream")
+    if (
+      new URL(request.url).pathname === "/stream" ||
+      (new URL(request.url).pathname === "/v1/responses" &&
+        new URL(request.url).searchParams.has("stream-check"))
+    )
       return new Response(
         new ReadableStream({
           start(c) {
@@ -85,7 +94,10 @@ Object.assign(process.env, {
   PI_CONTEXT_ROUTER_TOKENS: "600",
   PI_CONTEXT_ROUTER_KEEP_TURNS: "2",
   PI_CONTEXT_ROUTER_CONDENSER_URL: `${upstream.url}condense`,
-  PI_CONTEXT_ROUTER_ROUTES: json({ test: upstream.url.toString() }),
+  PI_CONTEXT_ROUTER_ROUTES: json({
+    test: upstream.url.toString(),
+    openai: `${upstream.url}v1`,
+  }),
   PI_CONTEXT_ROUTER_UPSTREAM: upstream.url.toString(),
   PI_CONTEXT_ROUTER_MAX_BODY_BYTES: "16384",
 });
@@ -693,18 +705,138 @@ test("proxy passes original bytes and credentials, including gzip and zstd", asy
   expect(new URL(recordedUrl).pathname).toBe("/encoded%2Fsegment");
   expect(new URL(recordedUrl).search).toBe("?key=%2F");
 });
+test("OpenAI route proxies Responses through compression without redirecting or changing credentials", async () => {
+  const original = longBody();
+  original.messages[1].content = "openai-routing-unique " + "R".repeat(1300);
+  const body = {
+    model: "gpt-6-luna",
+    instructions: original.messages[0].content,
+    input: original.messages.slice(1),
+  };
+  const result = await fetch(`${base}/r/openai/responses?trace=kept`, {
+    method: "POST",
+    redirect: "manual",
+    headers: { Authorization: "Bearer new-openai-subscription" },
+    body: json(body),
+  });
+  expect(result.status).toBe(200);
+  expect(result.headers.has("Location")).toBe(false);
+  expect(result.headers.get("X-Context-Router")).toBe("compacted");
+  expect(result.headers.get("X-Upstream-Auth")).toBe(
+    "Bearer new-openai-subscription",
+  );
+  expect(new URL(recordedUrl).pathname).toBe("/v1/responses");
+  expect(new URL(recordedUrl).search).toBe("?trace=kept");
+  const sent = await result.json();
+  expect(sent.input[0]).toEqual({
+    role: "user",
+    content: [
+      {
+        type: "input_text",
+        text: "Concise useful result with exact identifiers.",
+      },
+    ],
+  });
+  expect(sent.input.slice(-4)).toEqual(body.input.slice(-4));
+  expect(sent.instructions).toBe(body.instructions);
+  expect(tokens(sent)).toBeLessThanOrEqual(600);
+  const models = await fetch(`${base}/r/openai/models`);
+  expect(models.status).toBe(200);
+  expect(new URL(recordedUrl).pathname).toBe("/v1/models");
+});
+
+test("OpenAI subscription normalization removes only unsupported fields; API-key bytes stay intact", async () => {
+  const value = {
+    model: "openai-normalization-test",
+    instructions: "Keep these instructions.",
+    input: [{ role: "user", content: "small" }],
+    max_output_tokens: 256,
+    temperature: 0.2,
+    prompt_cache_retention: "24h",
+    prompt_cache_options: { mode: "explicit" },
+    store: false,
+    stream: true,
+    reasoning: { effort: "low" },
+  };
+  const raw = Buffer.from(JSON.stringify(value));
+  for (const credential of ["subscription-token", "sk-api-key"]) {
+    for (const [encoding, wire] of [
+      ["identity", raw],
+      ["gzip", gzipSync(raw)],
+      ["zstd", zstdCompressSync(raw)],
+    ] as const) {
+      const result = await fetch(`${base}/r/openai/responses`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${credential}`,
+          "Content-Encoding": encoding,
+        },
+        body: wire,
+      });
+      expect(result.status).toBe(200);
+      expect(result.headers.get("X-Upstream-Auth")).toBe(
+        `Bearer ${credential}`,
+      );
+      const received = Buffer.from(await result.arrayBuffer());
+      if (credential.startsWith("sk-")) {
+        expect(received).toEqual(wire);
+        expect(result.headers.get("X-Context-Router")).toBe("pass");
+      } else {
+        const decoded =
+          encoding === "gzip"
+            ? gunzipSync(received)
+            : encoding === "zstd"
+              ? zstdDecompressSync(received)
+              : received;
+        const sent = JSON.parse(decoded.toString());
+        const {
+          max_output_tokens,
+          temperature,
+          prompt_cache_retention,
+          prompt_cache_options,
+          ...expected
+        } = value;
+        expect(sent).toEqual(expected);
+        expect(result.headers.get("X-Context-Router")).toBe("compacted");
+        const list = await (
+          await fetch(
+            `${base}/api/history?search=openai-normalization-test&limit=1`,
+          )
+        ).json();
+        const detail = await (
+          await fetch(`${base}/api/history/${list.items[0].id}`)
+        ).json();
+        expect(detail.original).toEqual(value);
+        expect(detail.compressed).toEqual(expected);
+        expect(detail.changes[0]).toMatchObject({
+          kind: "subscription",
+          before: {
+            max_output_tokens,
+            temperature,
+            prompt_cache_retention,
+            prompt_cache_options,
+          },
+          after: null,
+        });
+      }
+    }
+  }
+});
+
 test("proxy streams the first chunk without waiting for the end", async () => {
-  const result = await fetch(`${base}/r/test/stream`),
-    reader = result.body!.getReader();
-  expect(new TextDecoder().decode((await reader.read()).value)).toBe(
-    "data: first\n\n",
-  );
-  streamController!.enqueue(Buffer.from("data: last\n\n"));
-  streamController!.close();
-  expect(new TextDecoder().decode((await reader.read()).value)).toBe(
-    "data: last\n\n",
-  );
-  expect((await reader.read()).done).toBe(true);
+  for (const path of ["/r/test/stream", "/r/openai/responses?stream-check"]) {
+    const result = await fetch(`${base}${path}`),
+      reader = result.body!.getReader();
+    expect(new TextDecoder().decode((await reader.read()).value)).toBe(
+      "data: first\n\n",
+    );
+    streamController!.enqueue(Buffer.from("data: last\n\n"));
+    streamController!.close();
+    expect(new TextDecoder().decode((await reader.read()).value)).toBe(
+      "data: last\n\n",
+    );
+    expect((await reader.read()).done).toBe(true);
+  }
 });
 test("explicit Elysia routes reject unrelated paths and methods", async () => {
   expect(app.routes.map(({ method, path }) => `${method} ${path}`)).toEqual([
