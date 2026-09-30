@@ -52,7 +52,7 @@ Object.assign(process.env, {
   PI_CONTEXT_ROUTER_AUTH: "",
   PI_CONTEXT_ROUTER_API_KEY: "test",
   PI_CONTEXT_ROUTER_TOKENS: "600",
-  PI_CONTEXT_ROUTER_TOOL_OUTPUT_TOKENS: "80",
+  PI_CONTEXT_ROUTER_TOOL_OUTPUT_TOKENS: "100",
   PI_CONTEXT_ROUTER_KEEP_TURNS: "2",
   PI_CONTEXT_ROUTER_TRIM_FLOOR: "40",
   PI_CONTEXT_ROUTER_FALLBACK_CHARS: "180",
@@ -157,6 +157,32 @@ test("concurrent identical blocks deduplicate by internal hash", async () => {
   const [a, b] = await Promise.all([compressBody(body), compressBody(body)]);
   expect(a.body).toEqual(b.body);
   expect(calls - before).toBe(1);
+});
+test("tool outputs compress strictly above 100 estimated tokens", async () => {
+  const before = calls;
+  for (const [length, estimate] of [
+    [346, 99],
+    [350, 100],
+    [351, 101],
+  ]) {
+    const content = "T".repeat(length);
+    expect(tokens(content)).toBe(estimate);
+    const body = {
+      messages: [
+        { role: "user", content: "read threshold file" },
+        { role: "tool", tool_call_id: "threshold", content },
+      ],
+    };
+    expect(tokens(body)).toBeLessThan(600);
+    const result = await compressBody(body);
+    expect(result.changed).toBe(estimate > 100);
+    expect(result.body.messages[1].content).toBe(
+      estimate > 100
+        ? "Concise useful result with exact identifiers."
+        : content,
+    );
+    expect(calls - before).toBe(estimate > 100 ? 1 : 0);
+  }
 });
 test("tool output only: preserve tool-call ids, arguments and images", async () => {
   const image = {
