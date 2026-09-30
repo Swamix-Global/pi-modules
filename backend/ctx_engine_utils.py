@@ -65,6 +65,7 @@ ROUTES = {
     "groq": os.environ.get("PI_CONTEXT_ROUTER_ROUTE_GROQ", "https://api.groq.com/openai/v1"),
     "cerebras": os.environ.get("PI_CONTEXT_ROUTER_ROUTE_CEREBRAS", "https://api.cerebras.ai/v1"),
     "qwen-token-plan": os.environ.get("PI_CONTEXT_ROUTER_ROUTE_QWEN", "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"),
+    "xiaomi-token-plan-sgp": os.environ.get("PI_CONTEXT_ROUTER_ROUTE_XIAOMI", "https://token-plan-sgp.xiaomimimo.com/v1"),
     "lmstudio": os.environ.get("PI_CONTEXT_ROUTER_ROUTE_LMSTUDIO", "http://127.0.0.1:11434/v1"),
 }
 

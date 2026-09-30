@@ -2,15 +2,35 @@ import { useState } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { api } from "./api";
 
+// Remembered identity for the next visit. The password is deliberately never persisted: the session
+// itself is the 30-day HttpOnly cookie the router already hands out, so a remembered username plus a
+// live cookie gives the "remember me" experience without leaving credentials readable from the DOM.
+const REMEMBERED_USER = "ctx.remembered-user";
+
+function rememberedUser(): string {
+  try {
+    return window.localStorage.getItem(REMEMBERED_USER) ?? "";
+  } catch {
+    return ""; // storage blocked (private mode, cookie policy): just don't remember
+  }
+}
+
 // One screen for both entry points: sign in, or create an account (open registration — put the router
 // behind your own gateway auth if you do not want that).
 export function Login({ onDone }: { onDone: () => void }) {
-  const [username, setUsername] = useState("");
+  const [username, setUsername] = useState(rememberedUser);
   const [password, setPassword] = useState("");
   const [mode, setMode] = useState<"login" | "register">("login");
   const session = useMutation({
     mutationFn: () => (mode === "login" ? api.login(username, password) : api.register(username, password)),
-    onSuccess: onDone,
+    onSuccess: () => {
+      try {
+        window.localStorage.setItem(REMEMBERED_USER, username);
+      } catch {
+        // storage blocked: the session cookie still keeps this tab signed in
+      }
+      onDone();
+    },
   });
 
   return (
@@ -35,7 +55,7 @@ export function Login({ onDone }: { onDone: () => void }) {
           <label className="flex flex-col gap-1 text-[12px] text-muted">
             username
             <input
-              className="border border-line bg-body px-2 py-1.5 text-[13px] text-body outline-none focus:border-accent"
+              className="border border-line bg-panel px-2 py-1.5 text-[13px] text-body outline-none focus:border-accent"
               value={username}
               autoComplete="username"
               autoFocus
@@ -45,7 +65,7 @@ export function Login({ onDone }: { onDone: () => void }) {
           <label className="flex flex-col gap-1 text-[12px] text-muted">
             password
             <input
-              className="border border-line bg-body px-2 py-1.5 text-[13px] text-body outline-none focus:border-accent"
+              className="border border-line bg-panel px-2 py-1.5 text-[13px] text-body outline-none focus:border-accent"
               type="password"
               value={password}
               autoComplete={mode === "login" ? "current-password" : "new-password"}

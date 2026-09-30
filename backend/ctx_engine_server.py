@@ -456,11 +456,44 @@ def _as_tenant(user_id: int, fn, *args):
     return fn(*args)
 
 
+# ----------------------------- live dashboard events -----------------------------
+# One push channel per open dashboard instead of client polling: any state change bumps that tenant's
+# generation and wakes every /api/events subscriber, which answers with a single SSE frame. The frame
+# carries no payload — the client refetches the same plain /stats read, so the push only decides *when*
+# a refetch happens and can never desynchronize two tenants' caches.
+LIVE = threading.Condition()
+LIVE_GEN: dict[int, int] = {}
+LIVE_HEARTBEAT_S = 15.0
+
+
+def live_notify(user_id: int = 0) -> None:
+    """Wake the SSE subscribers of `user_id`; 0 targets every tenant (sign-in and sign-out do)."""
+    with LIVE:
+        LIVE_GEN[int(user_id)] = LIVE_GEN.get(int(user_id), 0) + 1
+        LIVE.notify_all()
+
+
+def live_wait(tenant: int, seen: tuple[int, int], timeout: float) -> tuple[tuple[int, int], bool]:
+    """Block until this tenant's or the global generation moves, or `timeout` elapses. It returns the
+    generation a subscriber has actually observed, so `(seen, False)` means nothing new happened."""
+    with LIVE:
+        deadline = time.monotonic() + timeout
+        while True:
+            current = (LIVE_GEN.get(tenant, 0), LIVE_GEN.get(0, 0))
+            if current != seen:
+                return current, True
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return seen, False
+            LIVE.wait(left)
+
+
 def bump(**deltas: float) -> None:
     with METRICS_LOCK:
         bucket = tenant_metrics()
         for key, value in deltas.items():
             bucket[key] = bucket.get(key, 0) + value
+    live_notify(tenant_id())
 
 
 WINDOW = 100
@@ -489,6 +522,7 @@ def record_request(entry: dict) -> None:
                 conn.close()
     except sqlite3.Error as exc:
         cache_error("requests", exc)
+    live_notify(int(entry.get("user_id") or tenant_id()))
 
 
 def route_name(path: str) -> str:
@@ -672,6 +706,7 @@ def config_set_many(changes: dict[str, object], user_id: int = DEFAULT_USER_ID) 
                 conn.commit()
             finally:
                 conn.close()
+        live_notify(int(user_id))
         return True
     except (sqlite3.Error, ValueError, TypeError) as exc:
         if isinstance(exc, sqlite3.Error):
@@ -2080,6 +2115,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             # No body required: signing out must work from a bare `curl -X POST /api/logout`.
             destroy_session(self.cookie_token())
             self._extra_headers = [("Set-Cookie", f"{SESSION_COOKIE}=; Path=/; HttpOnly; Max-Age=0")]
+            live_notify(0)
             self.send_bytes(200, b'{"ok":true}')
             return
         try:
@@ -2117,6 +2153,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                 self.send_bytes(503, b'{"error":"ctx-engine database unavailable"}')
                 return
         token = create_session(user["id"])
+        live_notify(0)
         secure = "; Secure" if self.headers.get("X-Forwarded-Proto", "").lower() == "https" else ""
         self._extra_headers = [("Set-Cookie", f"{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; "
                                         f"Max-Age={SESSION_TTL_S}{secure}")]
@@ -2161,6 +2198,11 @@ class RouterHandler(BaseHTTPRequestHandler):
                 if user is None:
                     return
                 self.send_bytes(200, compact_json(stats_snapshot(user["id"])).encode())
+            elif path == "/api/events":
+                user = self.require_user()
+                if user is None:
+                    return
+                self.serve_events(user)
             elif path in ("/dashboard", "/dashboard/index.html", "/dashboard/debugger"):
                 self.serve_dashboard("index.html")
             elif path.startswith("/dashboard/assets/"):
@@ -2518,6 +2560,45 @@ class RouterHandler(BaseHTTPRequestHandler):
                 entry["usage"] = usage_from_tail(bytes(tail))
         finally:
             conn.close()
+            self.close_connection = True
+
+    # ----------------------------- server-sent events -----------------------------
+    def _sse_frame(self, text: str) -> None:
+        """One HTTP/1.1 chunk: an endless stream has no other framing under keep-alive."""
+        data = text.encode("utf-8")
+        self.wfile.write(b"%X\r\n" % len(data) + data + b"\r\n")
+        self.wfile.flush()
+
+    def serve_events(self, user: dict) -> None:
+        """`GET /api/events`: the dashboard's push channel. One `change` frame per state bump, a comment
+        heartbeat every LIVE_HEARTBEAT_S so idle proxies keep the socket open, and the loop ends on the
+        first failed write — a closed tab then costs one thread and one socket, nothing more."""
+        tenant = int(user["id"])
+        with LIVE:
+            seen = (LIVE_GEN.get(tenant, 0), LIVE_GEN.get(0, 0))
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        try:
+            self._sse_frame("event: ready\ndata: {}\n\n")
+            while True:
+                current, changed = live_wait(tenant, seen, LIVE_HEARTBEAT_S)
+                if changed:
+                    seen = current
+                    self._sse_frame("event: change\ndata: {}\n\n")
+                else:
+                    self._sse_frame(": ping\n\n")
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        finally:
+            try:
+                self.wfile.write(b"0\r\n\r\n")
+            except OSError:
+                pass
             self.close_connection = True
 
 

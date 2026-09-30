@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { api, isUnauthorized } from "./api";
 import { Login } from "./Login";
 import { BUDGET_POINTS, SettingSlider, Tabs, type TabDef } from "./components";
@@ -30,12 +30,69 @@ function tabFromPath(path: string): string {
   return "context";
 }
 
+// The dashboard's push channel: `/api/events` says "this tenant's state moved" and the read it already
+// knows how to make is refetched. Bursts collapse into one refetch, a dropped socket falls back to the
+// old 5 s poll, and a signed-out tab stops opening sockets entirely.
+function useLiveUpdates(enabled: boolean, queryClient: QueryClient): boolean {
+  const [connected, setConnected] = useState(false);
+
+  useEffect(() => {
+    if (!enabled) {
+      setConnected(false);
+      return;
+    }
+    let source: EventSource | null = null;
+    let retryTimer = 0;
+    let flushTimer = 0;
+    let attempt = 0;
+    const flush = () => queryClient.invalidateQueries({ queryKey: ["stats"] });
+
+    const open = () => {
+      source = new EventSource("/api/events");
+      source.addEventListener("ready", () => {
+        attempt = 0;
+        setConnected(true);
+      });
+      source.addEventListener("change", () => {
+        // One frame per state bump; a burst of routed requests becomes a single refetch.
+        window.clearTimeout(flushTimer);
+        flushTimer = window.setTimeout(flush, 400);
+      });
+      source.onerror = () => {
+        setConnected(false);
+        if (source?.readyState !== EventSource.CLOSED) return; // the browser is reconnecting on its own
+        source.close(); // fatal (401, router restarted): back off instead of hammering the endpoint
+        attempt = Math.min(attempt + 1, 6);
+        retryTimer = window.setTimeout(open, 1000 * 2 ** attempt);
+      };
+    };
+    open();
+
+    return () => {
+      window.clearTimeout(retryTimer);
+      window.clearTimeout(flushTimer);
+      source?.close();
+      setConnected(false);
+    };
+  }, [enabled, queryClient]);
+
+  return connected;
+}
+
 export default function App() {
   const [tab, setTab] = useState(() => tabFromPath(window.location.pathname));
+  const [signedIn, setSignedIn] = useState(false);
+  const [, setClockTick] = useState(0);
   useEffect(() => {
     const onPopState = () => setTab(tabFromPath(window.location.pathname));
     window.addEventListener("popstate", onPopState);
     return () => window.removeEventListener("popstate", onPopState);
+  }, []);
+  // Ages and the 24 h window are read off the router's clock: a render every 5 s keeps them moving even
+  // when no event has arrived and no request has been refetched.
+  useEffect(() => {
+    const id = window.setInterval(() => setClockTick((value) => value + 1), 5000);
+    return () => window.clearInterval(id);
   }, []);
   const navigateTab = (next: string) => {
     setTab(next);
@@ -49,15 +106,24 @@ export default function App() {
   });
   const logout = useMutation({
     mutationFn: api.logout,
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["stats"] }),
+    // Drop every cached read: the next account in this tab must never see the previous one's ledger.
+    onSuccess: () => queryClient.clear(),
   });
+
+  const live = useLiveUpdates(signedIn, queryClient);
 
   const statsQuery = useQuery({
     queryKey: ["stats"],
     queryFn: api.stats,
-    refetchInterval: 5000,
+    // Push decides the rhythm while the socket is up; the poll is only the safety net under it.
+    refetchInterval: live ? false : 5000,
     retry: false,
   });
+
+  useEffect(() => {
+    if (statsQuery.data) setSignedIn(true);
+    else if (isUnauthorized(statsQuery.error)) setSignedIn(false);
+  }, [statsQuery.data, statsQuery.error]);
 
   const stats = statsQuery.data;
   // All relative ages and the 24 h chart window follow the router's own clock, never the browser's.
@@ -69,9 +135,10 @@ export default function App() {
   }
 
   // The debugger and the local token journal read the operator's machine, so only the owner sees them.
-  const operator = stats?.user.operator ?? true;
-  const visibleTabs = operator ? TABS : TABS.filter((item) => item.id === "context" || item.id === "traffic");
-  const active = visibleTabs.some((item) => item.id === tab) ? tab : visibleTabs[0].id;
+  // Tabs stay hidden until /stats has answered — an owner-only tab must not flash for another account.
+  const operator = stats?.user.operator ?? false;
+  const visibleTabs = stats ? (operator ? TABS : TABS.filter((item) => item.id === "context" || item.id === "traffic")) : [];
+  const active = visibleTabs.some((item) => item.id === tab) ? tab : (visibleTabs[0]?.id ?? "context");
 
   return (
     <main className="mx-auto max-w-[1800px] px-3.5 pb-8 pt-3">
@@ -132,7 +199,7 @@ export default function App() {
         {active === "debugger" && <DebuggerView />}
         {active !== "debugger" && statsQuery.isLoading && <p className="px-1 py-6 text-muted">loading counters…</p>}
         {active !== "debugger" && statsQuery.error != null && !stats && !isUnauthorized(statsQuery.error) && (
-          <p className="px-1 py-6 text-muted">the router /stats endpoint did not answer — retrying every 5 s.</p>
+          <p className="px-1 py-6 text-muted">the router /stats endpoint did not answer — retrying every 5 s while the push channel is down.</p>
         )}
         {stats && active === "context" && <ContextView stats={stats} />}
         {stats && active === "traffic" && <TrafficStatsView stats={stats} />}
