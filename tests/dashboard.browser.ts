@@ -69,9 +69,20 @@ try {
   await page
     .getByRole("heading", { name: "Lifetime history (persisted)" })
     .waitFor();
+  await page
+    .getByRole("heading", {
+      name: "Rolling 24h Activity & Context Savings (5m granularity)",
+    })
+    .waitFor();
+  assert.equal(await page.locator(".graph-card").count(), 2);
+  assert.equal(await page.locator(".graph-svg").count(), 2);
   for (const label of ["Tool outputs compressed", "References clipped"])
     assert.equal(await page.getByText(label, { exact: true }).count(), 0);
   assert.equal(await page.locator(".cards").count(), 2);
+  if (process.env.SCREENSHOT_PATH)
+    await page.screenshot({
+      path: `${process.env.SCREENSHOT_PATH}.overview.png`,
+    });
   const contrast = await page.locator(".app-title").evaluate((el) => ({
     foreground: getComputedStyle(el).color,
     background: getComputedStyle(document.body).backgroundColor,

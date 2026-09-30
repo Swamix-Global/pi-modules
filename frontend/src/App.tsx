@@ -38,6 +38,15 @@ interface HistoryStats {
   duration_ms: number;
 }
 
+interface TimelinePoint {
+  time: number;
+  requests: number;
+  compacted: number;
+  errors: number;
+  before_tokens: number;
+  after_tokens: number;
+}
+
 interface Stats {
   requests: number;
   blocks: number;
@@ -45,6 +54,7 @@ interface Stats {
   errors: number;
   cache: { n: number };
   history?: HistoryStats;
+  timeline?: TimelinePoint[];
 }
 
 interface HistoryItem {
@@ -439,6 +449,557 @@ function Metric({
   );
 }
 
+function compile24hTimeline(timeline: TimelinePoint[] = []): TimelinePoint[] {
+  const BUCKET = 300_000;
+  const now = Date.now();
+  const end = Math.floor(now / BUCKET) * BUCKET;
+  const start = end - 287 * BUCKET;
+  const map = new Map<number, TimelinePoint>();
+  for (const pt of timeline) {
+    map.set(pt.time, pt);
+  }
+  const series: TimelinePoint[] = [];
+  for (let t = start; t <= end; t += BUCKET) {
+    const existing = map.get(t);
+    series.push(
+      existing ?? {
+        time: t,
+        requests: 0,
+        compacted: 0,
+        errors: 0,
+        before_tokens: 0,
+        after_tokens: 0,
+      },
+    );
+  }
+  return series;
+}
+
+function formatAxisNumber(val: number): string {
+  if (val >= 1_000_000) return `${(val / 1_000_000).toFixed(1)}M`;
+  if (val >= 1_000) return `${(val / 1_000).toFixed(0)}k`;
+  return String(Math.round(val));
+}
+
+function formatBucketTime(ms: number): string {
+  const d1 = new Date(ms);
+  const d2 = new Date(ms + 300_000);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${pad(d1.getHours())}:${pad(d1.getMinutes())}–${pad(d2.getHours())}:${pad(d2.getMinutes())}`;
+}
+
+function formatHour(ms: number): string {
+  const d = new Date(ms);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function buildSvgArea(
+  values: number[],
+  maxY: number,
+  x0: number,
+  y0: number,
+  pw: number,
+  ph: number,
+): { linePath: string; areaPath: string } {
+  const n = values.length;
+  if (n === 0) return { linePath: "", areaPath: "" };
+  const baseline = y0 + ph;
+  const points = values.map((v, i) => {
+    const x = x0 + (i / Math.max(1, n - 1)) * pw;
+    const y = baseline - (maxY > 0 ? (v / maxY) * ph : 0);
+    return [x, y];
+  });
+  const linePath = points
+    .map(
+      ([x, y], i) => `${i === 0 ? "M" : "L"} ${x.toFixed(1)} ${y.toFixed(1)}`,
+    )
+    .join(" ");
+  const areaPath = `${linePath} L ${points[n - 1][0].toFixed(1)} ${baseline} L ${points[0][0].toFixed(1)} ${baseline} Z`;
+  return { linePath, areaPath };
+}
+
+function WideActivityGraph({ series }: { series: TimelinePoint[] }) {
+  const [hoverIndex, setHoverIndex] = useState<number | null>(null);
+  const x0 = 55,
+    y0 = 15,
+    pw = 925,
+    ph = 115,
+    baseline = y0 + ph;
+  const maxY = Math.max(
+    5,
+    ...series.map((p) => p.requests),
+    ...series.map((p) => p.errors),
+  );
+
+  const reqPaths = buildSvgArea(
+    series.map((p) => p.requests),
+    maxY,
+    x0,
+    y0,
+    pw,
+    ph,
+  );
+  const compPaths = buildSvgArea(
+    series.map((p) => p.compacted),
+    maxY,
+    x0,
+    y0,
+    pw,
+    ph,
+  );
+
+  const timeTicks = [0, 48, 96, 144, 192, 240, 287].filter(
+    (i) => i < series.length,
+  );
+  const hovered = hoverIndex !== null ? series[hoverIndex] : null;
+
+  return (
+    <div className="graph-card">
+      <div className="graph-head">
+        <div className="graph-title">
+          <Activity size={16} style={{ color: "var(--primary)" }} />
+          <span>Requests & Activity</span>
+        </div>
+        <div className="graph-readout">
+          {hovered ? (
+            <span>
+              {formatBucketTime(hovered.time)} ·{" "}
+              <strong>{hovered.requests} reqs</strong> ({hovered.compacted}{" "}
+              compacted, {hovered.errors} errors)
+            </span>
+          ) : (
+            <span className="muted">
+              24h rolling · 5m granularity (288 buckets)
+            </span>
+          )}
+        </div>
+        <div className="graph-legend">
+          <div className="graph-legend-item">
+            <span
+              className="graph-legend-dot"
+              style={{ background: "var(--primary)" }}
+            />
+            <span>Total</span>
+          </div>
+          <div className="graph-legend-item">
+            <span
+              className="graph-legend-dot"
+              style={{ background: "var(--ok-text)" }}
+            />
+            <span>Compacted</span>
+          </div>
+          <div className="graph-legend-item">
+            <span
+              className="graph-legend-dot"
+              style={{ background: "var(--error-text)" }}
+            />
+            <span>Errors</span>
+          </div>
+        </div>
+      </div>
+      <svg
+        viewBox="0 0 1000 160"
+        className="graph-svg"
+        onPointerLeave={() => setHoverIndex(null)}
+      >
+        <line
+          x1={x0}
+          y1={y0}
+          x2={x0 + pw}
+          y2={y0}
+          stroke="var(--border)"
+          strokeDasharray="2 2"
+        />
+        <text
+          x={x0 - 8}
+          y={y0 + 4}
+          textAnchor="end"
+          fill="var(--muted)"
+          fontSize="10"
+        >
+          {formatAxisNumber(maxY)}
+        </text>
+
+        <line
+          x1={x0}
+          y1={y0 + ph / 2}
+          x2={x0 + pw}
+          y2={y0 + ph / 2}
+          stroke="var(--border)"
+          strokeDasharray="2 2"
+        />
+        <text
+          x={x0 - 8}
+          y={y0 + ph / 2 + 4}
+          textAnchor="end"
+          fill="var(--muted)"
+          fontSize="10"
+        >
+          {formatAxisNumber(maxY / 2)}
+        </text>
+
+        <line
+          x1={x0}
+          y1={baseline}
+          x2={x0 + pw}
+          y2={baseline}
+          stroke="var(--border-strong)"
+        />
+        <text
+          x={x0 - 8}
+          y={baseline + 4}
+          textAnchor="end"
+          fill="var(--muted)"
+          fontSize="10"
+        >
+          0
+        </text>
+
+        {timeTicks.map((idx) => {
+          const x = x0 + (idx / Math.max(1, series.length - 1)) * pw;
+          return (
+            <g key={idx}>
+              <line
+                x1={x}
+                y1={baseline}
+                x2={x}
+                y2={baseline + 4}
+                stroke="var(--border-strong)"
+              />
+              <text
+                x={x}
+                y={baseline + 16}
+                textAnchor="middle"
+                fill="var(--muted)"
+                fontSize="10"
+              >
+                {formatHour(series[idx].time)}
+              </text>
+            </g>
+          );
+        })}
+
+        <path d={reqPaths.areaPath} fill="rgba(11, 87, 208, 0.12)" />
+        <path
+          d={reqPaths.linePath}
+          fill="none"
+          stroke="var(--primary)"
+          strokeWidth="1.5"
+        />
+
+        <path d={compPaths.areaPath} fill="rgba(11, 107, 47, 0.15)" />
+        <path
+          d={compPaths.linePath}
+          fill="none"
+          stroke="var(--ok-text)"
+          strokeWidth="1.5"
+        />
+
+        {series.map((p, idx) => {
+          if (p.errors <= 0) return null;
+          const x = x0 + (idx / Math.max(1, series.length - 1)) * pw;
+          const y = baseline - (p.errors / maxY) * ph;
+          return (
+            <circle
+              key={idx}
+              cx={x}
+              cy={y}
+              r="3"
+              fill="var(--error-text)"
+              stroke="var(--surface)"
+              strokeWidth="1"
+            />
+          );
+        })}
+
+        {hoverIndex !== null && hovered && (
+          <g>
+            <line
+              x1={x0 + (hoverIndex / Math.max(1, series.length - 1)) * pw}
+              y1={y0}
+              x2={x0 + (hoverIndex / Math.max(1, series.length - 1)) * pw}
+              y2={baseline}
+              stroke="var(--border-strong)"
+              strokeDasharray="3 3"
+            />
+            {hovered.requests > 0 && (
+              <circle
+                cx={x0 + (hoverIndex / Math.max(1, series.length - 1)) * pw}
+                cy={baseline - (hovered.requests / maxY) * ph}
+                r="4"
+                fill="var(--primary)"
+              />
+            )}
+            {hovered.compacted > 0 && (
+              <circle
+                cx={x0 + (hoverIndex / Math.max(1, series.length - 1)) * pw}
+                cy={baseline - (hovered.compacted / maxY) * ph}
+                r="3"
+                fill="var(--ok-text)"
+              />
+            )}
+          </g>
+        )}
+
+        <rect
+          x={x0}
+          y={y0}
+          width={pw}
+          height={ph}
+          fill="transparent"
+          style={{ cursor: "crosshair" }}
+          onPointerMove={(e) => {
+            const rect = e.currentTarget.getBoundingClientRect();
+            const relX = ((e.clientX - rect.left) / rect.width) * 1000;
+            const idx = Math.min(
+              series.length - 1,
+              Math.max(0, Math.round(((relX - x0) / pw) * (series.length - 1))),
+            );
+            setHoverIndex(idx);
+          }}
+        />
+      </svg>
+    </div>
+  );
+}
+
+function WideTokensGraph({ series }: { series: TimelinePoint[] }) {
+  const [hoverIndex, setHoverIndex] = useState<number | null>(null);
+  const x0 = 55,
+    y0 = 15,
+    pw = 925,
+    ph = 115,
+    baseline = y0 + ph;
+  const maxY = Math.max(
+    10_000,
+    ...series.map((p) => p.before_tokens),
+    ...series.map((p) => p.after_tokens),
+  );
+
+  const beforePaths = buildSvgArea(
+    series.map((p) => p.before_tokens),
+    maxY,
+    x0,
+    y0,
+    pw,
+    ph,
+  );
+  const afterPaths = buildSvgArea(
+    series.map((p) => p.after_tokens),
+    maxY,
+    x0,
+    y0,
+    pw,
+    ph,
+  );
+
+  const timeTicks = [0, 48, 96, 144, 192, 240, 287].filter(
+    (i) => i < series.length,
+  );
+  const hovered = hoverIndex !== null ? series[hoverIndex] : null;
+
+  return (
+    <div className="graph-card">
+      <div className="graph-head">
+        <div className="graph-title">
+          <Layers size={16} style={{ color: "var(--ok-text)" }} />
+          <span>Context Tokens & Savings</span>
+        </div>
+        <div className="graph-readout">
+          {hovered ? (
+            <span>
+              {formatBucketTime(hovered.time)} ·{" "}
+              {formatTokens(hovered.before_tokens)} →{" "}
+              {formatTokens(hovered.after_tokens)}{" "}
+              {hovered.before_tokens > 0 ? (
+                <span
+                  className="badge badge-ok"
+                  style={{ fontSize: "11px", padding: "1px 6px" }}
+                >
+                  -
+                  {(
+                    ((hovered.before_tokens - hovered.after_tokens) /
+                      hovered.before_tokens) *
+                    100
+                  ).toFixed(1)}
+                  %
+                </span>
+              ) : null}
+            </span>
+          ) : (
+            <span className="muted">
+              24h rolling · 5m granularity (288 buckets)
+            </span>
+          )}
+        </div>
+        <div className="graph-legend">
+          <div className="graph-legend-item">
+            <span
+              className="graph-legend-dot"
+              style={{ background: "var(--muted)" }}
+            />
+            <span>Before (raw)</span>
+          </div>
+          <div className="graph-legend-item">
+            <span
+              className="graph-legend-dot"
+              style={{ background: "var(--ok-text)" }}
+            />
+            <span>After (compressed)</span>
+          </div>
+        </div>
+      </div>
+      <svg
+        viewBox="0 0 1000 160"
+        className="graph-svg"
+        onPointerLeave={() => setHoverIndex(null)}
+      >
+        <line
+          x1={x0}
+          y1={y0}
+          x2={x0 + pw}
+          y2={y0}
+          stroke="var(--border)"
+          strokeDasharray="2 2"
+        />
+        <text
+          x={x0 - 8}
+          y={y0 + 4}
+          textAnchor="end"
+          fill="var(--muted)"
+          fontSize="10"
+        >
+          {formatAxisNumber(maxY)}
+        </text>
+
+        <line
+          x1={x0}
+          y1={y0 + ph / 2}
+          x2={x0 + pw}
+          y2={y0 + ph / 2}
+          stroke="var(--border)"
+          strokeDasharray="2 2"
+        />
+        <text
+          x={x0 - 8}
+          y={y0 + ph / 2 + 4}
+          textAnchor="end"
+          fill="var(--muted)"
+          fontSize="10"
+        >
+          {formatAxisNumber(maxY / 2)}
+        </text>
+
+        <line
+          x1={x0}
+          y1={baseline}
+          x2={x0 + pw}
+          y2={baseline}
+          stroke="var(--border-strong)"
+        />
+        <text
+          x={x0 - 8}
+          y={baseline + 4}
+          textAnchor="end"
+          fill="var(--muted)"
+          fontSize="10"
+        >
+          0
+        </text>
+
+        {timeTicks.map((idx) => {
+          const x = x0 + (idx / Math.max(1, series.length - 1)) * pw;
+          return (
+            <g key={idx}>
+              <line
+                x1={x}
+                y1={baseline}
+                x2={x}
+                y2={baseline + 4}
+                stroke="var(--border-strong)"
+              />
+              <text
+                x={x}
+                y={baseline + 16}
+                textAnchor="middle"
+                fill="var(--muted)"
+                fontSize="10"
+              >
+                {formatHour(series[idx].time)}
+              </text>
+            </g>
+          );
+        })}
+
+        <path d={beforePaths.areaPath} fill="rgba(75, 85, 99, 0.12)" />
+        <path
+          d={beforePaths.linePath}
+          fill="none"
+          stroke="var(--muted)"
+          strokeWidth="1.5"
+          strokeDasharray="3 2"
+        />
+
+        <path d={afterPaths.areaPath} fill="rgba(11, 107, 47, 0.2)" />
+        <path
+          d={afterPaths.linePath}
+          fill="none"
+          stroke="var(--ok-text)"
+          strokeWidth="2"
+        />
+
+        {hoverIndex !== null && hovered && (
+          <g>
+            <line
+              x1={x0 + (hoverIndex / Math.max(1, series.length - 1)) * pw}
+              y1={y0}
+              x2={x0 + (hoverIndex / Math.max(1, series.length - 1)) * pw}
+              y2={baseline}
+              stroke="var(--border-strong)"
+              strokeDasharray="3 3"
+            />
+            {hovered.before_tokens > 0 && (
+              <circle
+                cx={x0 + (hoverIndex / Math.max(1, series.length - 1)) * pw}
+                cy={baseline - (hovered.before_tokens / maxY) * ph}
+                r="4"
+                fill="var(--muted)"
+              />
+            )}
+            {hovered.after_tokens > 0 && (
+              <circle
+                cx={x0 + (hoverIndex / Math.max(1, series.length - 1)) * pw}
+                cy={baseline - (hovered.after_tokens / maxY) * ph}
+                r="4"
+                fill="var(--ok-text)"
+              />
+            )}
+          </g>
+        )}
+
+        <rect
+          x={x0}
+          y={y0}
+          width={pw}
+          height={ph}
+          fill="transparent"
+          style={{ cursor: "crosshair" }}
+          onPointerMove={(e) => {
+            const rect = e.currentTarget.getBoundingClientRect();
+            const relX = ((e.clientX - rect.left) / rect.width) * 1000;
+            const idx = Math.min(
+              series.length - 1,
+              Math.max(0, Math.round(((relX - x0) / pw) * (series.length - 1))),
+            );
+            setHoverIndex(idx);
+          }}
+        />
+      </svg>
+    </div>
+  );
+}
+
 function Overview() {
   const [stats, setStats] = useState<Stats | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -467,6 +1028,7 @@ function Overview() {
   }, []);
 
   const history = stats?.history;
+  const timelineSeries = compile24hTimeline(stats?.timeline);
 
   return (
     <>
@@ -480,6 +1042,14 @@ function Overview() {
         <p className="muted">Loading overview…</p>
       ) : (
         <>
+          <section className="section">
+            <div className="section-head">
+              <h2>Rolling 24h Activity & Context Savings (5m granularity)</h2>
+            </div>
+            <WideActivityGraph series={timelineSeries} />
+            <WideTokensGraph series={timelineSeries} />
+          </section>
+
           <section className="section">
             <div className="section-head">
               <h2>Since restart</h2>

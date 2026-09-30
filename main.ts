@@ -15,6 +15,36 @@ import { S } from "./settings.ts";
 import { json, hash, tokens, turns, transcript, type Item } from "./utils.ts";
 
 import { condense, ATTEMPT_TIMEOUT_MS, MAX_ATTEMPTS } from "./condenser.ts";
+import { CacheWarmer, warmPlan, warmUsage, type WarmPlan } from "./warmer.ts";
+
+export const warmer = new CacheWarmer(async (plan: WarmPlan, signal) => {
+  const request = new Request(plan.url, {
+    method: "POST",
+    headers: plan.headers,
+    signal,
+  });
+  const upstream = await send(
+    new URL(plan.url),
+    request,
+    Buffer.from(plan.wire),
+    false,
+  );
+  if (upstream.statusCode !== 200) {
+    upstream.destroy();
+    throw new Error("cache warm upstream failure");
+  }
+  const chunks: Buffer[] = [];
+  let bytes = 0;
+  for await (const chunk of upstream) {
+    bytes += chunk.length;
+    if (bytes > 1024 * 1024) {
+      upstream.destroy();
+      throw new Error("cache warm response too large");
+    }
+    chunks.push(Buffer.from(chunk));
+  }
+  return warmUsage(Buffer.concat(chunks).toString("utf8"));
+});
 
 type Config = typeof S;
 if (S.db !== ":memory:") mkdirSync(dirname(S.db), { recursive: true });
@@ -512,6 +542,7 @@ async function forwardProxy(
   rest: string,
   trace: Trace,
 ) {
+  const receivedAt = Date.now();
   const target = new URL(upstream);
   target.pathname = target.pathname.replace(/\/+$/, "") + rest;
   target.search = new URL(request.url).search;
@@ -595,8 +626,34 @@ async function forwardProxy(
       }
     }
   }
-  const upstreamResponse = await send(target, request, body),
-    headers = new Headers();
+  let finishWarm: ((success: boolean) => void) | undefined;
+  if (trace.compressed && typeof trace.compressed === "object") {
+    const plan = warmPlan(
+      target,
+      request,
+      trace.compressed,
+      (digest) => !!rendered.get(digest),
+    );
+    if (plan) finishWarm = warmer.watch(plan, receivedAt);
+  }
+  let upstreamResponse: IncomingMessage;
+  try {
+    upstreamResponse = await send(target, request, body);
+  } catch (error) {
+    finishWarm?.(false);
+    throw error;
+  }
+  if (finishWarm) {
+    const finish = finishWarm;
+    upstreamResponse.once("end", () =>
+      finish(upstreamResponse.statusCode === 200),
+    );
+    upstreamResponse.once("error", () => finish(false));
+    upstreamResponse.once("close", () => {
+      if (!upstreamResponse.complete) finish(false);
+    });
+  }
+  const headers = new Headers();
   const excluded = new Set([
     ...hop,
     ...String(upstreamResponse.headers.connection ?? "")
@@ -639,6 +696,30 @@ function providerProxy({
 }
 const codexProxy = ({ request }: { request: Request }) =>
   proxy(request, S.upstream, "/codex/responses");
+const timelineQuery = db.query<
+  {
+    time: number;
+    requests: number;
+    compacted: number;
+    errors: number;
+    before_tokens: number;
+    after_tokens: number;
+  },
+  [number]
+>(`
+  SELECT
+    ((created_at / 300000) * 300000) AS time,
+    count(*) AS requests,
+    coalesce(sum(changed), 0) AS compacted,
+    coalesce(sum(status >= 400), 0) AS errors,
+    coalesce(sum(before_tokens), 0) AS before_tokens,
+    coalesce(sum(after_tokens), 0) AS after_tokens
+  FROM history
+  WHERE created_at >= ?
+  GROUP BY time
+  ORDER BY time ASC
+`);
+
 export const app = new Elysia()
   .onError(({ error, code }) => {
     if (error instanceof HttpError)
@@ -668,6 +749,7 @@ export const app = new Elysia()
   .get("/stats", () =>
     response({
       ...stats,
+      warmer: warmer.stats,
       history: db
         .query(
           `SELECT count(*) requests, coalesce(sum(changed),0) compacted,
@@ -676,6 +758,7 @@ export const app = new Elysia()
         )
         .get(),
       cache: db.query("SELECT count(*) AS n FROM compressed").get(),
+      timeline: timelineQuery.all(Date.now() - 86_400_000),
     }),
   )
   .post(
@@ -774,6 +857,7 @@ if (import.meta.main) {
   });
   console.log(`ctx-engine listening on ${S.host}:${app.server!.port}`);
   const stop = async () => {
+    warmer.stop();
     await app.stop(true);
     db.close();
     process.exit(0);
