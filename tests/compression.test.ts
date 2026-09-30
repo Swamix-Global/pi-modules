@@ -609,17 +609,16 @@ test("cache key is message-model-outlen only; failures retry per block", async (
   expect(calls - before).toBe(4);
 });
 
-test("live text is never clipped, even when it exceeds the budget", async () => {
+test("live text over budget is forwarded unchanged, never clipped or rejected", async () => {
   const original = {
     messages: [{ role: "user", content: "live-intact " + "L".repeat(5000) }],
   };
   const frozen = json(original);
   const changes: any[] = [];
   const before = calls;
-  await expect(compressBody(original, changes)).rejects.toThrow(
-    "protected turns or fixed request fields exceed token budget",
-  );
-  expect(json(original)).toBe(frozen);
+  const result = await compressBody(original, changes);
+  expect(json(result.body)).toBe(frozen);
+  expect(result.changed).toBe(false);
   expect(changes).toEqual([]);
   expect(calls).toBe(before);
 });
@@ -659,15 +658,15 @@ test("hung response bodies get three real 10-second deadlines and one critical l
   }
 }, 40_000);
 
-test("immutable fields over budget fail instead of forwarding oversized requests", async () => {
-  await expect(
-    compressBody({
-      instructions: "x".repeat(4000),
-      input: [{ role: "user", content: "small" }],
-    }),
-  ).rejects.toThrow(
-    "protected turns or fixed request fields exceed token budget",
-  );
+test("immutable fields over budget are forwarded unchanged, not rejected", async () => {
+  const original = {
+    instructions: "x".repeat(4000),
+    input: [{ role: "user", content: "small" }],
+  };
+  const frozen = json(original);
+  const result = await compressBody(original);
+  expect(json(result.body)).toBe(frozen);
+  expect(result.changed).toBe(false);
 });
 test("cache write failures return 503 without retrying successful inference", async () => {
   const body = longBody();

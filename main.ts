@@ -410,10 +410,13 @@ export async function compressBody(
     body[key] = [...prefix, ...groups.flat()];
     changed = true;
   }
-  if (tokens(body) > S.tokens)
-    throw new HttpError(
-      413,
-      "protected turns or fixed request fields exceed token budget",
+  const remaining = tokens(body);
+  if (remaining > S.tokens)
+    // The configured budget is a soft compaction threshold, not the model's
+    // context window: forward indivisible protected turns and fixed fields
+    // instead of rejecting the request. The upstream enforces its real limit.
+    console.warn(
+      `WARN: protected turns or fixed fields exceed the ${S.tokens}-token budget (${remaining}); forwarding unchanged`,
     );
   return { body: changed ? body : original, changed };
 }

@@ -30,7 +30,7 @@ Turns are grouped before compression. Over budget, all eligible older blocks lau
 
 Transcripts label `user:`, `assistant:`, `tool_call:`, `tool_output:`, `thinking:`. The cache key is exactly `messageHash-model-outputTokenLimit`; rendered-output hashes prevent summarizing a cached note again. No cache tags are injected. A static length instruction interpolates the configured word target and is appended to the condenser's **system prompt**, not the user transcript. Length is a sizing hint; output tokens remain DeepSeek safety headroom. The OpenAI ChatGPT-subscription connection omits hard output-token caps and follows the system word-length hint. Sampling is left to the model defaults.
 
-There are no excerpts or character-clipping functions. Failed summaries leave the block intact. If the request still exceeds the context budget, oldest unprotected turns may be dropped; protected turns or fixed fields alone over budget return **413**, rather than corrupting their text.
+There are no excerpts or character-clipping functions. Failed summaries leave the block intact. If the request still exceeds the context budget, oldest unprotected turns may be dropped. If protected turns or fixed fields alone exceed the budget, the request is forwarded unchanged: the configured budget is a soft compaction threshold, and the upstream model's context window is the only hard limit.
 
 ## API
 
