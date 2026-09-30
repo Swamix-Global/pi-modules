@@ -71,6 +71,181 @@ afterAll(async () => {
   await upstream.stop(true);
   db.close();
 });
+const initialSettings = await (await fetch(`${base}/api/settings`)).json();
+
+test("dashboard settings validate atomically, persist and reject cross-origin changes", async () => {
+  expect(initialSettings.settings.toolTokens).toBe(100);
+  expect(initialSettings.settings).not.toHaveProperty("apiKey");
+  for (const patch of [
+    { toolTokens: 101, workers: 0 },
+    { apiKey: "leak" },
+    { tokens: "100" },
+    { keepTurns: 1.5 },
+    { toolPrompt: "" },
+    { temperature: 3 },
+    { trimFloor: 1 },
+    null,
+  ]) {
+    const result = await fetch(`${base}/api/settings`, {
+      method: "PUT",
+      body: json(patch),
+    });
+    expect(result.status).toBe(400);
+    expect(
+      (await (await fetch(`${base}/api/settings`)).json()).settings,
+    ).toEqual(initialSettings.settings);
+  }
+  for (const headers of [
+    { Origin: "https://evil.example" },
+    { "Sec-Fetch-Site": "cross-site" },
+  ] as Record<string, string>[]) {
+    expect(
+      (
+        await fetch(`${base}/api/settings`, {
+          method: "PUT",
+          headers,
+          body: json({ toolTokens: 150 }),
+        })
+      ).status,
+    ).toBe(403);
+    expect((await fetch(`${base}/api/history`, { headers })).status).toBe(403);
+  }
+  const patch = { toolTokens: 1000, words: 120 };
+  const updated = await fetch(`${base}/api/settings`, {
+    method: "PUT",
+    headers: { Origin: base },
+    body: json(patch),
+  });
+  expect(updated.status).toBe(200);
+  expect((await updated.json()).defaults).toEqual(initialSettings.defaults);
+  expect(
+    JSON.parse(
+      (db.query("SELECT value FROM dashboard_settings WHERE id=1").get() as any)
+        .value,
+    ).toolTokens,
+  ).toBe(1000);
+  const body = { messages: [{ role: "tool", content: "p".repeat(400) }] };
+  const compressed = await fetch(`${base}/compress`, {
+    method: "POST",
+    body: json(body),
+  });
+  expect(compressed.headers.get("X-Context-Router")).toBe("pass");
+  await fetch(`${base}/api/settings`, {
+    method: "PUT",
+    body: json(initialSettings.settings),
+  });
+});
+
+test("full history retains originals, every compression change, cache hits and failed requests", async () => {
+  const body = {
+    model: "history-unique",
+    messages: [
+      { role: "user", content: "read file" },
+      {
+        role: "tool",
+        tool_call_id: "history-id",
+        content: "secret full source " + "h".repeat(600),
+      },
+    ],
+  };
+  for (let i = 0; i < 2; i++) {
+    const result = await fetch(`${base}/compress`, {
+      method: "POST",
+      body: json(body),
+    });
+    expect(result.status).toBe(200);
+    const output = await result.json();
+    const list = await (
+      await fetch(
+        `${base}/api/history?search=history-unique&changed=yes&limit=1`,
+      )
+    ).json();
+    const detail = await (
+      await fetch(`${base}/api/history/${list.items[0].id}`)
+    ).json();
+    expect(detail.original).toEqual(body);
+    expect(detail.compressed).toEqual(output);
+    expect(detail.changes.length).toBe(1);
+    expect(detail.changes[0]).toMatchObject({
+      kind: "tool",
+      before: body.messages[1].content,
+      after: output.messages[1].content,
+      cached: i === 1,
+      fallback: false,
+    });
+    expect(detail.changes[0].source_hash).toBe(hash(body.messages[1].content));
+    expect(detail.before_tokens).toBe(tokens(body));
+    expect(detail.after_tokens).toBe(tokens(output));
+    expect(detail.status).toBe(200);
+  }
+  await fetch(`${base}/compress`, { method: "POST", body: "{not json" });
+  const latest = await (await fetch(`${base}/api/history?limit=1`)).json();
+  const failed = await (
+    await fetch(`${base}/api/history/${latest.items[0].id}`)
+  ).json();
+  expect(failed.status).toBe(400);
+  expect(failed.original).toBe("{not json");
+  expect(failed.error).toBe("invalid JSON");
+  expect(failed.compressed).toBeNull();
+  expect((await fetch(`${base}/api/history/9999999`)).status).toBe(404);
+});
+
+test("history cursor paging has no duplicate or missing rows, filters and metrics agree", async () => {
+  const beforeCount = (db.query("SELECT count(*) n FROM history").get() as any)
+    .n;
+  for (let i = 0; i < 6; i++)
+    await fetch(`${base}/compress`, {
+      method: "POST",
+      body: json({
+        model: "page-history",
+        messages: [{ role: "user", content: `small ${i}` }],
+      }),
+    });
+  let cursor: number | null = null;
+  const ids: number[] = [];
+  do {
+    const page = await (
+      await fetch(
+        `${base}/api/history?limit=2&search=page-history&changed=no${cursor === null ? "" : `&before=${cursor}`}`,
+      )
+    ).json();
+    expect(page.total).toBe(6);
+    ids.push(...page.items.map((item: any) => item.id));
+    cursor = page.next;
+  } while (cursor !== null);
+  expect(ids.length).toBe(6);
+  expect(new Set(ids).size).toBe(6);
+  expect(ids).toEqual([...ids].sort((a, b) => b - a));
+  for (const query of ["limit=0", "limit=101", "before=bad", "changed=invalid"])
+    expect((await fetch(`${base}/api/history?${query}`)).status).toBe(400);
+  const stats = await (await fetch(`${base}/stats`)).json();
+  expect(stats.history.requests).toBe(beforeCount + 6);
+  expect(stats.history).toEqual(
+    db
+      .query(
+        "SELECT count(*) requests,coalesce(sum(changed),0) compacted,coalesce(sum(status>=400),0) errors,coalesce(sum(before_tokens),0) before_tokens,coalesce(sum(after_tokens),0) after_tokens,coalesce(sum(duration_ms),0) duration_ms FROM history",
+      )
+      .get(),
+  );
+});
+
+test("dashboard serves built frontend and explicit asset routes", async () => {
+  const result = await fetch(`${base}/dashboard/`);
+  expect(result.status).toBe(200);
+  expect(result.headers.get("Content-Type")).toContain("text/html");
+  const page = await result.text();
+  const assets = [
+    ...page.matchAll(/(?:src|href)="(\/dashboard\/assets\/[^"]+)"/g),
+  ].map((match) => match[1]);
+  expect(assets.length).toBeGreaterThanOrEqual(2);
+  for (const asset of assets)
+    expect((await fetch(`${base}${asset}`)).status).toBe(200);
+  expect((await fetch(`${base}/dashboard/assets/missing.js`)).status).toBe(404);
+  expect((await fetch(`${base}/dashboard/assets/invalid.exe`)).status).toBe(
+    404,
+  );
+});
+
 const longBody = () => ({
   model: "test",
   messages: [
@@ -335,6 +510,12 @@ test("explicit Elysia routes reject unrelated paths and methods", async () => {
     "GET /health",
     "GET /stats",
     "POST /compress",
+    "GET /api/settings",
+    "PUT /api/settings",
+    "GET /api/history",
+    "GET /api/history/:id",
+    "GET /dashboard",
+    "GET /dashboard/assets/:file",
     "GET /r/:provider/*",
     "POST /r/:provider/*",
     "GET /codex/responses",

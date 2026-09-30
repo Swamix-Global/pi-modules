@@ -1,7 +1,7 @@
 import { Elysia } from "elysia";
 import { Database } from "bun:sqlite";
 import { readFileSync, mkdirSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { request as http, type IncomingMessage } from "node:http";
 import { request as https } from "node:https";
 import { Readable } from "node:stream";
@@ -23,6 +23,7 @@ import {
   type Item,
 } from "./utils.ts";
 
+type Config = typeof S;
 if (S.db !== ":memory:") mkdirSync(dirname(S.db), { recursive: true });
 export const db = new Database(S.db, { create: true });
 export function initCache(database: Database) {
@@ -31,6 +32,23 @@ export function initCache(database: Database) {
     CREATE INDEX IF NOT EXISTS compressed_output ON compressed(kind,output_hash);`);
 }
 initCache(db);
+db.exec(`
+  CREATE TABLE IF NOT EXISTS dashboard_settings (
+    id INTEGER PRIMARY KEY CHECK(id = 1), value TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at INTEGER NOT NULL, route TEXT NOT NULL, model TEXT NOT NULL,
+    status INTEGER NOT NULL, changed INTEGER NOT NULL,
+    before_tokens INTEGER NOT NULL, after_tokens INTEGER NOT NULL,
+    duration_ms INTEGER NOT NULL, error TEXT,
+    original TEXT, compressed TEXT, changes TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS history_created ON history(created_at);
+`);
+db.query(
+  "UPDATE history SET status=502,error='router stopped before completion',duration_ms=max(0,?-created_at) WHERE status=0",
+).run(Date.now());
 const cached = db.query<{ output: string }, [string, string, string]>(
   "SELECT output FROM compressed WHERE source_hash=? AND kind=? AND settings_hash=?",
 );
@@ -57,6 +75,177 @@ class HttpError extends Error {
     super(message);
   }
 }
+const settingLimits = {
+  tokens: [1, 10_000_000],
+  toolTokens: [1, 10_000_000],
+  keepTurns: [1, 1000],
+  words: [1, 100_000],
+  maxTokens: [1, 1_000_000],
+  temperature: [0, 2],
+  workers: [1, 32],
+  trimFloor: [32, 1_000_000],
+  excerpt: [32, 1_000_000],
+  timeout: [100, 600_000],
+} as const;
+const settingKeys = [
+  ...Object.keys(settingLimits),
+  "blockPrompt",
+  "toolPrompt",
+] as (keyof Config)[];
+const defaults = Object.fromEntries(settingKeys.map((key) => [key, S[key]]));
+const currentSettings = () =>
+  Object.fromEntries(settingKeys.map((key) => [key, S[key]]));
+function validateSettings(value: unknown): Record<string, number | string> {
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    throw new HttpError(400, "settings must be an object");
+  for (const [key, item] of Object.entries(value)) {
+    if (!settingKeys.includes(key as keyof Config))
+      throw new HttpError(400, `unknown setting: ${key}`);
+    if (key === "blockPrompt" || key === "toolPrompt") {
+      if (typeof item !== "string" || !item.trim() || item.length > 32_768)
+        throw new HttpError(400, `invalid setting: ${key}`);
+    } else {
+      const [min, max] = settingLimits[key as keyof typeof settingLimits];
+      if (
+        typeof item !== "number" ||
+        !Number.isFinite(item) ||
+        item < min ||
+        item > max ||
+        (key !== "temperature" && !Number.isSafeInteger(item))
+      )
+        throw new HttpError(400, `invalid setting: ${key}`);
+    }
+  }
+  return value as Record<string, number | string>;
+}
+const savedSettings = db
+  .query<{ value: string }, []>(
+    "SELECT value FROM dashboard_settings WHERE id=1",
+  )
+  .get();
+if (savedSettings)
+  Object.assign(S, validateSettings(JSON.parse(savedSettings.value)));
+
+function managementRequest(request: Request) {
+  const url = new URL(request.url);
+  if (!["127.0.0.1", "localhost", "[::1]"].includes(url.hostname))
+    throw new HttpError(403, "local dashboard only");
+  const origin = request.headers.get("origin");
+  if (
+    (origin && origin !== url.origin) ||
+    request.headers.get("sec-fetch-site") === "cross-site"
+  )
+    throw new HttpError(403, "cross-origin dashboard request denied");
+}
+function errorStatus(error: unknown) {
+  if (error instanceof HttpError) return error.status;
+  return error instanceof Error &&
+    (error.name === "SQLiteError" ||
+      (error as NodeJS.ErrnoException).code?.startsWith("SQLITE"))
+    ? 503
+    : 502;
+}
+type Trace = {
+  id: number | bigint;
+  original: any;
+  compressed: any;
+  changed: boolean;
+  changes: Item[];
+};
+function rememberOriginal(trace: Trace) {
+  db.query(
+    "UPDATE history SET original=?,model=?,before_tokens=? WHERE id=?",
+  ).run(
+    json(trace.original),
+    typeof trace.original?.model === "string" ? trace.original.model : "",
+    tokens(trace.original),
+    trace.id,
+  );
+}
+async function tracked(
+  request: Request,
+  action: (trace: Trace) => Promise<Response>,
+) {
+  const start = Date.now();
+  const trace: Trace = {
+    id: 0,
+    original: null,
+    compressed: null,
+    changed: false,
+    changes: [],
+  };
+  const inserted = db
+    .query(
+      "INSERT INTO history(created_at,route,model,status,changed,before_tokens,after_tokens,duration_ms,error,original,compressed,changes) VALUES(?,?,?,0,0,0,0,0,NULL,NULL,NULL,'[]')",
+    )
+    .run(start, `${request.method} ${new URL(request.url).pathname}`, "");
+  trace.id = inserted.lastInsertRowid;
+  stats.requests++;
+  let status = 0,
+    error: string | null = null;
+  try {
+    const result = await action(trace);
+    status = result.status;
+    return result;
+  } catch (cause) {
+    status = errorStatus(cause);
+    error =
+      cause instanceof HttpError
+        ? cause.message
+        : status === 503
+          ? "cache database unavailable"
+          : "context router upstream failure";
+    throw cause;
+  } finally {
+    db.query(
+      "UPDATE history SET model=?,status=?,changed=?,before_tokens=?,after_tokens=?,duration_ms=?,error=?,original=?,compressed=?,changes=? WHERE id=?",
+    ).run(
+      typeof trace.original?.model === "string" ? trace.original.model : "",
+      status,
+      Number(trace.changed),
+      trace.original === null ? 0 : tokens(trace.original),
+      trace.compressed === null ? 0 : tokens(trace.compressed),
+      Date.now() - start,
+      error,
+      trace.original === null ? null : json(trace.original),
+      trace.compressed === null ? null : json(trace.compressed),
+      json(trace.changes),
+      inserted.lastInsertRowid,
+    );
+  }
+}
+function listHistory(request: Request) {
+  managementRequest(request);
+  const query = new URL(request.url).searchParams;
+  const limit = Number(query.get("limit") ?? 50),
+    before = query.has("before") ? Number(query.get("before")) : null;
+  const changed = query.get("changed") ?? "all",
+    search = query.get("search") ?? "";
+  if (
+    !Number.isSafeInteger(limit) ||
+    limit < 1 ||
+    limit > 100 ||
+    (before !== null && (!Number.isSafeInteger(before) || before < 1)) ||
+    !["all", "yes", "no"].includes(changed) ||
+    search.length > 200
+  )
+    throw new HttpError(400, "invalid history query");
+  const where =
+    "(?='all' OR changed=?) AND (instr(lower(route),lower(?))>0 OR instr(lower(model),lower(?))>0)";
+  const filter = [changed, Number(changed === "yes"), search, search] as const;
+  const items = db
+    .query(
+      `SELECT id,created_at,route,model,status,changed,before_tokens,after_tokens,duration_ms,error FROM history WHERE ${where} AND (? IS NULL OR id<?) ORDER BY id DESC LIMIT ?`,
+    )
+    .all(...filter, before, before, limit + 1) as Item[];
+  const total = (
+    db
+      .query(`SELECT count(*) n FROM history WHERE ${where}`)
+      .get(...filter) as { n: number }
+  ).n;
+  const next = items.length > limit ? items[limit - 1].id : null;
+  return response({ items: items.slice(0, limit), total, next });
+}
 const response = (
   value: any,
   status = 200,
@@ -72,7 +261,9 @@ async function summarize(
   input: string,
   kind: "block" | "tool",
   outputHash: (output: string) => string,
+  config: Config,
 ): Promise<string | null> {
+  const S = config;
   const sourceHash = hash(source),
     system = kind === "block" ? S.blockPrompt : S.toolPrompt;
   const settingsHash = hash([
@@ -166,7 +357,10 @@ async function summarize(
 }
 export async function compressBody(
   original: Item,
+  changes: Item[] = [],
+  config: Config = { ...S },
 ): Promise<{ body: Item; changed: boolean }> {
+  const S = config;
   const key = Array.isArray(original.messages)
     ? "messages"
     : Array.isArray(original.input)
@@ -196,16 +390,37 @@ export async function compressBody(
           stats.hits++;
           return;
         }
+        const wasCached = !!cached.get(
+          hash(block),
+          "block",
+          hash([
+            config.url,
+            config.model,
+            config.blockPrompt,
+            config.words,
+            config.maxTokens,
+            config.temperature,
+          ]),
+        );
         const output = await summarize(
           block,
           transcript(block),
           "block",
           (output) => hash([summaryItem(output)]),
+          config,
         );
         // ponytail: an outage uses an uncached excerpt; a later request can still obtain a real summary.
         groups[index] = [
           summaryItem(output ?? clip(transcript(block), S.excerpt)),
         ];
+        changes.push({
+          kind: "block",
+          source_hash: hash(block),
+          before: structuredClone(block),
+          after: groups[index],
+          cached: wasCached,
+          fallback: output === null,
+        });
         changed = true;
       }),
     );
@@ -221,11 +436,24 @@ export async function compressBody(
           stats.hits++;
           return;
         }
+        const wasCached = !!cached.get(
+          hash(value),
+          "tool",
+          hash([
+            config.url,
+            config.model,
+            config.toolPrompt,
+            config.words,
+            config.maxTokens,
+            config.temperature,
+          ]),
+        );
         const output = await summarize(
           value,
           `tool_output:\n${value}\n---\n---------------------------`,
           "tool",
           hash,
+          config,
         );
         const replacement =
           output && Array.from(output).length < Array.from(value).length
@@ -235,6 +463,14 @@ export async function compressBody(
                 Math.min(S.excerpt, Math.floor(Array.from(value).length / 2)),
               );
         if (Array.from(replacement).length < Array.from(value).length) {
+          changes.push({
+            kind: "tool",
+            source_hash: hash(value),
+            before: value,
+            after: replacement,
+            cached: wasCached,
+            fallback: output === null || replacement !== output,
+          });
           ref.owner[ref.key] = replacement;
           changed = true;
         }
@@ -242,7 +478,15 @@ export async function compressBody(
   );
   body[key] = [...prefix, ...groups.flat()];
   while (tokens(body) > S.tokens && groups.length > S.keepTurns) {
-    groups.shift();
+    const removed = groups.shift()!;
+    changes.push({
+      kind: "drop",
+      source_hash: hash(removed),
+      before: structuredClone(removed),
+      after: null,
+      cached: false,
+      fallback: true,
+    });
     body[key] = [...prefix, ...groups.flat()];
     changed = true;
   }
@@ -260,6 +504,7 @@ export async function compressBody(
       Array.from(largest.owner[largest.key]).length <= S.trimFloor
     )
       break;
+    const before = largest.owner[largest.key];
     largest.owner[largest.key] = clip(
       largest.owner[largest.key],
       Math.max(
@@ -267,6 +512,14 @@ export async function compressBody(
         Math.floor(Array.from(largest.owner[largest.key]).length / 2),
       ),
     );
+    changes.push({
+      kind: "clip",
+      source_hash: hash(before),
+      before,
+      after: largest.owner[largest.key],
+      cached: false,
+      fallback: true,
+    });
     stats.clipped++;
     changed = true;
   }
@@ -355,7 +608,17 @@ function send(
     outgoing.end(body);
   });
 }
-async function proxy(request: Request, upstream: string, rest: string) {
+function proxy(request: Request, upstream: string, rest: string) {
+  return tracked(request, (trace) =>
+    forwardProxy(request, upstream, rest, trace),
+  );
+}
+async function forwardProxy(
+  request: Request,
+  upstream: string,
+  rest: string,
+  trace: Trace,
+) {
   const target = new URL(upstream);
   target.pathname = target.pathname.replace(/\/+$/, "") + rest;
   target.search = new URL(request.url).search;
@@ -384,9 +647,15 @@ async function proxy(request: Request, upstream: string, rest: string) {
     try {
       value = JSON.parse(Buffer.from(decoded).toString("utf8"));
     } catch {}
+    trace.original = value ?? Buffer.from(decoded).toString("utf8");
+    rememberOriginal(trace);
     body = raw;
+    trace.compressed = trace.original;
     if (value && typeof value === "object" && !Array.isArray(value)) {
-      const result = await compressBody(value);
+      trace.compressed = null;
+      const result = await compressBody(value, trace.changes);
+      trace.compressed = result.body;
+      trace.changed = result.changed;
       changed = result.changed;
       if (changed) {
         const wire = Buffer.from(json(result.body));
@@ -398,7 +667,6 @@ async function proxy(request: Request, upstream: string, rest: string) {
               : wire;
       }
     }
-    stats.requests++;
   }
   const upstreamResponse = await send(target, request, body),
     headers = new Headers();
@@ -459,32 +727,113 @@ export const app = new Elysia()
       return response({ error: "cache database unavailable" }, 503);
     return response({ error: "context router upstream failure" }, 502);
   })
+  .onBeforeHandle(({ request }) => {
+    const path = new URL(request.url).pathname;
+    if (
+      path.startsWith("/api/") ||
+      path === "/stats" ||
+      path === "/dashboard" ||
+      path.startsWith("/dashboard/")
+    )
+      managementRequest(request);
+  })
   .get("/health", () => response({ status: "ok" }))
   .get("/stats", () =>
     response({
       ...stats,
+      history: db
+        .query(
+          `SELECT count(*) requests, coalesce(sum(changed),0) compacted,
+        coalesce(sum(status>=400),0) errors, coalesce(sum(before_tokens),0) before_tokens,
+        coalesce(sum(after_tokens),0) after_tokens, coalesce(sum(duration_ms),0) duration_ms FROM history`,
+        )
+        .get(),
       cache: db.query("SELECT count(*) AS n FROM compressed").get(),
     }),
   )
   .post(
     "/compress",
+    ({ request }) =>
+      tracked(request, async (trace) => {
+        let value: Item;
+        try {
+          const raw = (await readBody(request)).toString("utf8");
+          trace.original = raw;
+          value = JSON.parse(raw);
+          trace.original = value;
+          rememberOriginal(trace);
+        } catch (error) {
+          if (error instanceof HttpError) throw error;
+          throw new HttpError(400, "invalid JSON");
+        }
+        if (!value || typeof value !== "object" || Array.isArray(value))
+          throw new HttpError(400, "invalid JSON");
+        const result = await compressBody(value, trace.changes);
+        trace.compressed = result.body;
+        trace.changed = result.changed;
+        return response(result.body, 200, {
+          "X-Context-Router": result.changed ? "compacted" : "pass",
+        });
+      }),
+    { parse: "none" },
+  )
+  .get("/api/settings", () =>
+    response({ settings: currentSettings(), defaults }),
+  )
+  .put(
+    "/api/settings",
     async ({ request }) => {
-      let value: Item;
+      let value: unknown;
       try {
         value = JSON.parse((await readBody(request)).toString("utf8"));
       } catch (error) {
         if (error instanceof HttpError) throw error;
         throw new HttpError(400, "invalid JSON");
       }
-      if (!value || typeof value !== "object" || Array.isArray(value))
-        throw new HttpError(400, "invalid JSON");
-      const result = await compressBody(value);
-      return response(result.body, 200, {
-        "X-Context-Router": result.changed ? "compacted" : "pass",
-      });
+      const updated = { ...currentSettings(), ...validateSettings(value) };
+      db.query(
+        "INSERT INTO dashboard_settings(id,value) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value",
+      ).run(json(updated));
+      Object.assign(S, updated);
+      return response({ settings: currentSettings(), defaults });
     },
     { parse: "none" },
   )
+  .get("/api/history", ({ request }) => listHistory(request))
+  .get("/api/history/:id", ({ params }) => {
+    const id = Number(params.id);
+    if (!Number.isSafeInteger(id) || id < 1)
+      throw new HttpError(400, "invalid history id");
+    const row = db
+      .query("SELECT * FROM history WHERE id=?")
+      .get(id) as Item | null;
+    if (!row) throw new HttpError(404, "history not found");
+    return response({
+      ...row,
+      original: row.original === null ? null : JSON.parse(row.original),
+      compressed: row.compressed === null ? null : JSON.parse(row.compressed),
+      changes: JSON.parse(row.changes),
+    });
+  })
+  .get(
+    "/dashboard",
+    () =>
+      new Response(
+        Bun.file(join(import.meta.dir, "frontend/dist/index.html")),
+        { headers: { "Cache-Control": "no-cache" } },
+      ),
+  )
+  .get("/dashboard/assets/:file", async ({ params }) => {
+    if (!/^[A-Za-z0-9_-]+\.(js|css|woff2|svg)$/.test(params.file))
+      throw new HttpError(404, "not found");
+    const file = Bun.file(
+      join(import.meta.dir, "frontend/dist/assets", params.file),
+    );
+    if (!(await file.exists())) throw new HttpError(404, "not found");
+    return new Response(file, {
+      headers: { "Cache-Control": "public, max-age=31536000, immutable" },
+    });
+  })
   .get("/r/:provider/*", providerProxy)
   .post("/r/:provider/*", providerProxy, { parse: "none" })
   .get("/codex/responses", codexProxy)

@@ -1,210 +1,1349 @@
-import { useEffect, useState } from "react";
-import { useMutation, useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
-import { api, isUnauthorized } from "./api";
-import { Login } from "./Login";
-import { BUDGET_POINTS, SettingSlider, Tabs, type TabDef } from "./components";
-import { clockTime, dur, syncClock } from "./format";
-import { ContextView } from "./views/Context";
-import { TokenStatsView } from "./views/TokenStats";
-import { TrafficStatsView } from "./views/TrafficStats";
-import { DebuggerView } from "./views/Debugger";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { diffLines } from "diff";
 
-const TABS: TabDef[] = [
-  { id: "context", label: "Context" },
-  { id: "tokens", label: "Token Stats" },
-  { id: "traffic", label: "Traffic Stats" },
-  { id: "debugger", label: "Debugger" },
+/* Types ------------------------------------------------------------------- */
+
+type Tab = "overview" | "history" | "settings";
+type ChangedFilter = "all" | "yes" | "no";
+
+interface HistoryStats {
+  requests: number;
+  compacted: number;
+  errors: number;
+  before_tokens: number;
+  after_tokens: number;
+  duration_ms: number;
+}
+
+interface Stats {
+  requests: number;
+  blocks: number;
+  tools: number;
+  hits: number;
+  errors: number;
+  clipped: number;
+  cache: { n: number };
+  history?: HistoryStats;
+}
+
+interface HistoryItem {
+  id: number;
+  created_at: number;
+  route: string;
+  model: string;
+  status: number;
+  changed: boolean;
+  before_tokens: number;
+  after_tokens: number;
+  duration_ms: number;
+  error: string | null;
+}
+
+interface HistoryResponse {
+  items: HistoryItem[];
+  total: number;
+  next: number | null;
+}
+
+interface RouterChange {
+  kind: string;
+  source_hash: string;
+  before: unknown;
+  after: unknown;
+  cached: boolean;
+  fallback: boolean;
+}
+
+interface HistoryDetail {
+  id: number;
+  created_at: number;
+  route: string;
+  model: string;
+  status: number;
+  changed: boolean;
+  before_tokens: number;
+  after_tokens: number;
+  duration_ms: number;
+  error: string | null;
+  original: unknown | null;
+  compressed: unknown | null;
+  changes: RouterChange[];
+  [key: string]: unknown;
+}
+
+interface Settings {
+  tokens: number;
+  toolTokens: number;
+  keepTurns: number;
+  words: number;
+  maxTokens: number;
+  temperature: number;
+  workers: number;
+  trimFloor: number;
+  excerpt: number;
+  timeout: number;
+  blockPrompt: string;
+  toolPrompt: string;
+}
+
+interface SettingsResponse {
+  settings: Settings;
+  defaults: Settings;
+}
+
+type NumericKey = Exclude<keyof Settings, "blockPrompt" | "toolPrompt">;
+type PromptKey = "blockPrompt" | "toolPrompt";
+
+interface NumericField {
+  key: NumericKey;
+  label: string;
+  min: number;
+  max?: number;
+  step?: number;
+  unit?: string;
+  help: string;
+}
+
+interface DiffRow {
+  oldNo: number | null;
+  newNo: number | null;
+  type: "add" | "del" | "ctx";
+  text: string;
+}
+
+/* Constants --------------------------------------------------------------- */
+
+const TABS: { id: Tab; label: string }[] = [
+  { id: "overview", label: "Overview" },
+  { id: "history", label: "History" },
+  { id: "settings", label: "Settings" },
 ];
 
-const TAB_PATHS: Record<string, string> = {
-  context: "/dashboard",
-  tokens: "/token-stats",
-  traffic: "/dashboard/traffic",
-  debugger: "/dashboard/debugger",
-};
+const NUMERIC_FIELDS: NumericField[] = [
+  {
+    key: "tokens",
+    label: "Context token budget",
+    min: 1,
+    step: 1,
+    unit: "tokens",
+    help: "Requests estimated above this budget are compressed.",
+  },
+  {
+    key: "toolTokens",
+    label: "Tool output token budget",
+    min: 1,
+    step: 1,
+    unit: "tokens",
+    help: "Tool results estimated above this budget are summarized.",
+  },
+  {
+    key: "keepTurns",
+    label: "Recent turns protected from block summaries",
+    min: 1,
+    step: 1,
+    unit: "turns",
+    help: "Newest turns skip block summaries; oversized tools and emergency clipping still apply.",
+  },
+  {
+    key: "words",
+    label: "Summary target length",
+    min: 1,
+    step: 1,
+    unit: "words",
+    help: "Approximate word count requested from the summarizer.",
+  },
+  {
+    key: "maxTokens",
+    label: "Maximum summary tokens",
+    min: 1,
+    step: 1,
+    unit: "tokens",
+    help: "Upper bound on generated summary length.",
+  },
+  {
+    key: "temperature",
+    label: "Summarizer temperature",
+    min: 0,
+    max: 2,
+    step: 0.1,
+    help: "0 is deterministic, 2 is most random.",
+  },
+  {
+    key: "workers",
+    label: "Parallel summarizer workers",
+    min: 1,
+    max: 32,
+    step: 1,
+    unit: "workers",
+    help: "Maximum concurrent summarizer requests.",
+  },
+  {
+    key: "trimFloor",
+    label: "Minimum clipping size",
+    min: 32,
+    step: 1,
+    unit: "chars",
+    help: "Clipping stops at this many characters.",
+  },
+  {
+    key: "excerpt",
+    label: "Excerpt length",
+    min: 32,
+    step: 1,
+    unit: "chars",
+    help: "Fallback excerpt length used when summarization fails.",
+  },
+  {
+    key: "timeout",
+    label: "Condenser timeout",
+    min: 100,
+    step: 100,
+    unit: "ms",
+    help: "How long a summarizer request may run before it is aborted.",
+  },
+];
 
-function tabFromPath(path: string): string {
-  if (path === "/dashboard/debugger") return "debugger";
-  if (path === "/token-stats") return "tokens";
-  if (path === "/dashboard/traffic") return "traffic";
-  return "context";
+/* Helpers ----------------------------------------------------------------- */
+
+async function readErrorDetail(response: Response): Promise<string> {
+  try {
+    const body = (await response.json()) as { error?: string };
+    return body && typeof body.error === "string" ? body.error : "";
+  } catch {
+    return "";
+  }
 }
 
-// The dashboard's push channel: `/api/events` says "this tenant's state moved" and the read it already
-// knows how to make is refetched. Bursts collapse into one refetch, a dropped socket falls back to the
-// old 5 s poll, and a signed-out tab stops opening sockets entirely.
-function useLiveUpdates(enabled: boolean, queryClient: QueryClient): boolean {
-  const [connected, setConnected] = useState(false);
+async function getJson<T>(url: string): Promise<T> {
+  const response = await fetch(url, {
+    headers: { Accept: "application/json" },
+  });
+  if (!response.ok) {
+    const detail = await readErrorDetail(response);
+    throw new Error(
+      `${response.status} ${response.statusText}${detail ? `: ${detail}` : ""}`,
+    );
+  }
+  return (await response.json()) as T;
+}
 
-  useEffect(() => {
-    if (!enabled) {
-      setConnected(false);
-      return;
+async function putJson<T>(url: string, body: unknown): Promise<T> {
+  const response = await fetch(url, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    const detail = await readErrorDetail(response);
+    throw new Error(
+      `${response.status} ${response.statusText}${detail ? `: ${detail}` : ""}`,
+    );
+  }
+  return (await response.json()) as T;
+}
+
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function formatNumber(value: number): string {
+  return Number.isFinite(value) ? value.toLocaleString() : "—";
+}
+
+function formatTokens(value: number): string {
+  return `~${formatNumber(value)}`;
+}
+
+function formatDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return "—";
+  if (ms < 1000) return `${Math.round(ms)} ms`;
+  const seconds = ms / 1000;
+  if (seconds < 60) return `${seconds.toFixed(1)} s`;
+  const minutes = Math.floor(seconds / 60);
+  const remainder = Math.round(seconds % 60);
+  return `${minutes}m ${remainder}s`;
+}
+
+function formatTime(epochMs: number): string {
+  if (!Number.isFinite(epochMs)) return "—";
+  return new Date(epochMs).toLocaleString();
+}
+
+function pretty(value: unknown): string {
+  const text = JSON.stringify(value, null, 2);
+  return text === undefined ? String(value) : text;
+}
+
+function mergeHistory(
+  existing: HistoryItem[],
+  incoming: HistoryItem[],
+): HistoryItem[] {
+  const byId = new Map<number, HistoryItem>();
+  for (const item of existing) byId.set(item.id, item);
+  for (const item of incoming) byId.set(item.id, item);
+  return Array.from(byId.values()).sort((a, b) => b.id - a.id);
+}
+
+function toNumberStrings(settings: Settings): Record<NumericKey, string> {
+  const out = {} as Record<NumericKey, string>;
+  for (const field of NUMERIC_FIELDS)
+    out[field.key] = String(settings[field.key]);
+  return out;
+}
+
+function buildSettingsPayload(
+  numbers: Record<NumericKey, string>,
+  prompts: Record<PromptKey, string>,
+): { payload?: Record<string, number | string>; error?: string } {
+  const payload: Record<string, number | string> = {};
+  for (const field of NUMERIC_FIELDS) {
+    const raw = numbers[field.key];
+    const value = Number(raw);
+    if (raw.trim() === "" || !Number.isFinite(value)) {
+      return { error: `${field.label} must be a number.` };
     }
-    let source: EventSource | null = null;
-    let retryTimer = 0;
-    let flushTimer = 0;
-    let attempt = 0;
-    const flush = () => queryClient.invalidateQueries({ queryKey: ["stats"] });
-
-    const open = () => {
-      source = new EventSource("/api/events");
-      source.addEventListener("ready", () => {
-        attempt = 0;
-        setConnected(true);
-      });
-      source.addEventListener("change", () => {
-        // One frame per state bump; a burst of routed requests becomes a single refetch.
-        window.clearTimeout(flushTimer);
-        flushTimer = window.setTimeout(flush, 400);
-      });
-      source.onerror = () => {
-        setConnected(false);
-        if (source?.readyState !== EventSource.CLOSED) return; // the browser is reconnecting on its own
-        source.close(); // fatal (401, router restarted): back off instead of hammering the endpoint
-        attempt = Math.min(attempt + 1, 6);
-        retryTimer = window.setTimeout(open, 1000 * 2 ** attempt);
-      };
-    };
-    open();
-
-    return () => {
-      window.clearTimeout(retryTimer);
-      window.clearTimeout(flushTimer);
-      source?.close();
-      setConnected(false);
-    };
-  }, [enabled, queryClient]);
-
-  return connected;
+    if (value < field.min) {
+      return { error: `${field.label} must be at least ${field.min}.` };
+    }
+    if (field.max !== undefined && value > field.max) {
+      return { error: `${field.label} must be at most ${field.max}.` };
+    }
+    payload[field.key] = value;
+  }
+  payload.blockPrompt = prompts.blockPrompt;
+  payload.toolPrompt = prompts.toolPrompt;
+  return { payload };
 }
+
+/* App --------------------------------------------------------------------- */
 
 export default function App() {
-  const [tab, setTab] = useState(() => tabFromPath(window.location.pathname));
-  const [signedIn, setSignedIn] = useState(false);
-  const [, setClockTick] = useState(0);
-  useEffect(() => {
-    const onPopState = () => setTab(tabFromPath(window.location.pathname));
-    window.addEventListener("popstate", onPopState);
-    return () => window.removeEventListener("popstate", onPopState);
-  }, []);
-  // Ages and the 24 h window are read off the router's clock: a render every 5 s keeps them moving even
-  // when no event has arrived and no request has been refetched.
-  useEffect(() => {
-    const id = window.setInterval(() => setClockTick((value) => value + 1), 5000);
-    return () => window.clearInterval(id);
-  }, []);
-  const navigateTab = (next: string) => {
-    setTab(next);
-    const path = TAB_PATHS[next];
-    if (path && window.location.pathname !== path) window.history.pushState({}, "", path);
-  };
-  const queryClient = useQueryClient();
-  const settings = useMutation({
-    mutationFn: (change: { tokens?: number; summary_words?: number; provider?: string }) => api.setConfig(change),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["stats"] }),
-  });
-  const logout = useMutation({
-    mutationFn: api.logout,
-    // Drop every cached read: the next account in this tab must never see the previous one's ledger.
-    onSuccess: () => queryClient.clear(),
-  });
-
-  const live = useLiveUpdates(signedIn, queryClient);
-
-  const statsQuery = useQuery({
-    queryKey: ["stats"],
-    queryFn: api.stats,
-    // Push decides the rhythm while the socket is up; the poll is only the safety net under it.
-    refetchInterval: live ? false : 5000,
-    retry: false,
-  });
-
-  useEffect(() => {
-    if (statsQuery.data) setSignedIn(true);
-    else if (isUnauthorized(statsQuery.error)) setSignedIn(false);
-  }, [statsQuery.data, statsQuery.error]);
-
-  const stats = statsQuery.data;
-  // All relative ages and the 24 h chart window follow the router's own clock, never the browser's.
-  if (stats) syncClock(stats.now);
-
-  // No session (or an expired one): this account has no dashboard until it signs in.
-  if (isUnauthorized(statsQuery.error)) {
-    return <Login onDone={() => queryClient.invalidateQueries({ queryKey: ["stats"] })} />;
-  }
-
-  // The debugger and the local token journal read the operator's machine, so only the owner sees them.
-  // Tabs stay hidden until /stats has answered — an owner-only tab must not flash for another account.
-  const operator = stats?.user.operator ?? false;
-  const visibleTabs = stats ? (operator ? TABS : TABS.filter((item) => item.id === "context" || item.id === "traffic")) : [];
-  const active = visibleTabs.some((item) => item.id === tab) ? tab : (visibleTabs[0]?.id ?? "context");
+  const [tab, setTab] = useState<Tab>("overview");
 
   return (
-    <main className="mx-auto max-w-[1800px] px-3.5 pb-8 pt-3">
-      <header className="flex flex-wrap items-center gap-x-4 gap-y-2 border-b border-line pb-3">
-        <h1 className="text-[15px] font-bold tracking-[0.06em]">
-          <span className="mr-1 text-accent" aria-hidden="true">
-            ⇄
-          </span>
-          CTX ROUTER
-        </h1>
-        <p className="min-w-[200px] flex-1 text-[12.5px] text-muted">
-          {stats
-            ? `${stats.provider} · ${stats.model} · uptime ${dur(stats.uptime_s)}`
-            : "connecting to the context router…"}
+    <div className="app">
+      <header className="app-header">
+        <h1 className="app-title">Context Router</h1>
+        <p className="app-subtitle">
+          Compression dashboard served from /dashboard/ using the same-origin
+          API.
         </p>
-        {stats && <div className="flex flex-wrap gap-2" aria-label="Global settings">
-          <SettingSlider label="Compaction threshold" points={BUDGET_POINTS} value={stats.token_limit}
-            onCommit={(tokens) => settings.mutate({ tokens })} disabled={settings.isPending} />
-          <div className="inline-flex flex-wrap overflow-hidden border border-line bg-panel" role="radiogroup" aria-label="Condenser provider">
-            {stats.providers.map((choice) => {
-              const selected = choice.provider === stats.provider;
-              return <button key={choice.provider} type="button" role="radio" aria-checked={selected} disabled={!choice.available || settings.isPending}
-                title={choice.available ? `${choice.label} · ${choice.model}` : choice.error || `${choice.label} unavailable`}
-                onClick={() => settings.mutate({ provider: choice.provider })}
-                className={`border-l border-line px-2.5 py-1.5 text-[12px] first:border-l-0 ${selected ? "bg-accentbg font-semibold text-accent" : "text-muted hover:text-body"} disabled:cursor-not-allowed disabled:opacity-40`}>
-                {choice.label}
-              </button>;
-            })}
-          </div>
-        </div>}
-        {stats && <span className="text-[12.5px] text-muted">router clock {clockTime(stats.now)}</span>}
-        {stats && (
-          <span className="text-[12.5px] text-muted" title={`tenant proxy token ${stats.user.api_token}`}>
-            {stats.user.username}
-            {stats.user.operator ? " · owner" : ""}
-          </span>
-        )}
-        {stats && (
-          <button
-            type="button"
-            onClick={() => logout.mutate()}
-            disabled={logout.isPending}
-            className="border border-line bg-panel px-2.5 py-1 text-[12px] text-muted hover:text-body disabled:opacity-50"
-          >
-            Log out
-          </button>
-        )}
-        <Tabs tabs={visibleTabs} active={active} onChange={navigateTab} />
+        <nav
+          className="tabs"
+          role="tablist"
+          aria-label="Dashboard sections"
+          onKeyDown={(event) => {
+            if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key))
+              return;
+            event.preventDefault();
+            const index = TABS.findIndex((entry) => entry.id === tab);
+            const next =
+              event.key === "Home"
+                ? 0
+                : event.key === "End"
+                  ? TABS.length - 1
+                  : (index +
+                      (event.key === "ArrowRight" ? 1 : -1) +
+                      TABS.length) %
+                    TABS.length;
+            setTab(TABS[next].id);
+            document.getElementById(`tab-${TABS[next].id}`)?.focus();
+          }}
+        >
+          {TABS.map((entry) => (
+            <button
+              key={entry.id}
+              id={`tab-${entry.id}`}
+              type="button"
+              role="tab"
+              aria-selected={tab === entry.id}
+              aria-controls={`panel-${entry.id}`}
+              tabIndex={tab === entry.id ? 0 : -1}
+              className="tab"
+              onClick={() => setTab(entry.id)}
+            >
+              {entry.label}
+            </button>
+          ))}
+        </nav>
       </header>
 
-      {settings.isError && <p role="alert" className="py-2 text-neg">Could not save setting; refresh to retry.</p>}
-      <div
-        role="tabpanel"
-        id={`panel-${active}`}
-        aria-labelledby={`tab-${active}`}
-        className="mt-2"
-      >
-        {active === "debugger" && <DebuggerView />}
-        {active !== "debugger" && statsQuery.isLoading && <p className="px-1 py-6 text-muted">loading counters…</p>}
-        {active !== "debugger" && statsQuery.error != null && !stats && !isUnauthorized(statsQuery.error) && (
-          <p className="px-1 py-6 text-muted">the router /stats endpoint did not answer — retrying every 5 s while the push channel is down.</p>
-        )}
-        {stats && active === "context" && <ContextView stats={stats} />}
-        {stats && active === "traffic" && <TrafficStatsView stats={stats} />}
-        {active === "tokens" && <TokenStatsView />}
+      <main className="app-main">
+        <section
+          id="panel-overview"
+          role="tabpanel"
+          aria-labelledby="tab-overview"
+          hidden={tab !== "overview"}
+        >
+          <Overview />
+        </section>
+
+        <section
+          id="panel-history"
+          role="tabpanel"
+          aria-labelledby="tab-history"
+          hidden={tab !== "history"}
+        >
+          <HistoryPanel />
+        </section>
+
+        <section
+          id="panel-settings"
+          role="tabpanel"
+          aria-labelledby="tab-settings"
+          hidden={tab !== "settings"}
+        >
+          <SettingsPanel />
+        </section>
+      </main>
+    </div>
+  );
+}
+
+/* Overview ---------------------------------------------------------------- */
+
+function Metric({
+  label,
+  value,
+  help,
+}: {
+  label: string;
+  value: string;
+  help: string;
+}) {
+  return (
+    <div className="card">
+      <p className="metric-label">{label}</p>
+      <p className="metric-value">{value}</p>
+      <p className="metric-help">{help}</p>
+    </div>
+  );
+}
+
+function Overview() {
+  const [stats, setStats] = useState<Stats | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let active = true;
+
+    const load = async () => {
+      try {
+        const data = await getJson<Stats>("/stats");
+        if (active) {
+          setStats(data);
+          setError(null);
+        }
+      } catch (loadError) {
+        if (active) setError(messageOf(loadError));
+      }
+    };
+
+    void load();
+    const timer = window.setInterval(() => void load(), 5000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, []);
+
+  const history = stats?.history;
+
+  return (
+    <>
+      {error && (
+        <div className="banner banner-error" role="alert">
+          Failed to load /stats: {error}
+        </div>
+      )}
+
+      {!stats ? (
+        <p className="muted">Loading overview…</p>
+      ) : (
+        <>
+          <section className="section">
+            <div className="section-head">
+              <h2>Since restart</h2>
+              <p className="section-note">
+                In-memory counters for the current process.
+              </p>
+            </div>
+            <div className="cards">
+              <Metric
+                label="Requests"
+                value={formatNumber(stats.requests)}
+                help="Proxy and /compress requests handled since restart."
+              />
+              <Metric
+                label="Blocks compressed"
+                value={formatNumber(stats.blocks)}
+                help="Conversation blocks summarized since restart."
+              />
+              <Metric
+                label="Tool outputs compressed"
+                value={formatNumber(stats.tools)}
+                help="Tool results summarized since restart."
+              />
+              <Metric
+                label="Cache hits"
+                value={formatNumber(stats.hits)}
+                help="Summaries reused from the SQLite cache since restart."
+              />
+              <Metric
+                label="Errors"
+                value={formatNumber(stats.errors)}
+                help="Summarizer failures since restart."
+              />
+              <Metric
+                label="References clipped"
+                value={formatNumber(stats.clipped)}
+                help="Oversized references trimmed to fit the budget."
+              />
+              <Metric
+                label="Cached summaries"
+                value={formatNumber(stats.cache.n)}
+                help="Rows currently stored in the compressed cache."
+              />
+            </div>
+          </section>
+
+          <section className="section">
+            <div className="section-head">
+              <h2>Lifetime history (persisted)</h2>
+              <p className="section-note">
+                Aggregated from SQLite history and survives restarts. Token
+                counts are estimates (~).
+              </p>
+            </div>
+            <div className="cards">
+              <Metric
+                label="Requests recorded"
+                value={formatNumber(history?.requests ?? 0)}
+                help="Compression requests written to history."
+              />
+              <Metric
+                label="Requests compacted"
+                value={formatNumber(history?.compacted ?? 0)}
+                help="Requests whose forwarded body differed from the original."
+              />
+              <Metric
+                label="History errors"
+                value={formatNumber(history?.errors ?? 0)}
+                help="History records that recorded an error."
+              />
+              <Metric
+                label="Estimated tokens before"
+                value={formatTokens(history?.before_tokens ?? 0)}
+                help="Sum of estimated original token counts."
+              />
+              <Metric
+                label="Estimated tokens after"
+                value={formatTokens(history?.after_tokens ?? 0)}
+                help="Sum of estimated forwarded token counts."
+              />
+              <Metric
+                label="Total processing time"
+                value={formatDuration(history?.duration_ms ?? 0)}
+                help="Time to compression completion or upstream headers; excludes streamed response time."
+              />
+            </div>
+          </section>
+        </>
+      )}
+    </>
+  );
+}
+
+/* History ----------------------------------------------------------------- */
+
+function HistoryPanel() {
+  const [search, setSearch] = useState("");
+  const [debouncedSearch, setDebouncedSearch] = useState("");
+  const [changed, setChanged] = useState<ChangedFilter>("all");
+  const [items, setItems] = useState<HistoryItem[]>([]);
+  const [total, setTotal] = useState(0);
+  const [next, setNext] = useState<number | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loadingOlder, setLoadingOlder] = useState(false);
+  const [detailId, setDetailId] = useState<number | null>(null);
+  const olderLoaded = useRef(false);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => setDebouncedSearch(search), 300);
+    return () => window.clearTimeout(timer);
+  }, [search]);
+
+  const buildUrl = useCallback(
+    (before?: number) => {
+      const params = new URLSearchParams();
+      params.set("limit", "50");
+      if (before !== undefined) params.set("before", String(before));
+      if (changed !== "all") params.set("changed", changed);
+      if (debouncedSearch.trim()) params.set("search", debouncedSearch.trim());
+      return `/api/history?${params.toString()}`;
+    },
+    [changed, debouncedSearch],
+  );
+
+  useEffect(() => {
+    let active = true;
+
+    let newest: number | null = null;
+    let polling = false;
+    const loadFirst = async () => {
+      setLoadingOlder(false);
+      try {
+        const data = await getJson<HistoryResponse>(buildUrl());
+        if (!active) return;
+        setItems(data.items);
+        setTotal(data.total);
+        setNext(data.next);
+        olderLoaded.current = false;
+        newest = data.items[0]?.id ?? null;
+        setError(null);
+      } catch (loadError) {
+        if (active) setError(messageOf(loadError));
+      }
+    };
+
+    const poll = async () => {
+      if (polling) return;
+      polling = true;
+      try {
+        let data = await getJson<HistoryResponse>(buildUrl());
+        const incoming = [...data.items];
+        const latest = data.items[0]?.id ?? newest;
+        // Fill gaps when more than one page arrives between polls.
+        while (
+          active &&
+          newest !== null &&
+          data.next !== null &&
+          data.items[data.items.length - 1]?.id > newest
+        ) {
+          data = await getJson<HistoryResponse>(buildUrl(data.next));
+          incoming.push(...data.items);
+        }
+        if (!active) return;
+        newest = latest;
+        setItems((previous) => mergeHistory(previous, incoming));
+        setTotal(data.total);
+        if (!olderLoaded.current) setNext(data.next);
+        setError(null);
+      } catch (pollError) {
+        if (active) setError(messageOf(pollError));
+      } finally {
+        polling = false;
+      }
+    };
+
+    void loadFirst();
+    const timer = window.setInterval(() => void poll(), 5000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [buildUrl]);
+
+  const activeQuery = useRef(buildUrl);
+  activeQuery.current = buildUrl;
+  const loadOlder = async () => {
+    const query = buildUrl;
+    if (next === null) return;
+    setLoadingOlder(true);
+    try {
+      const data = await getJson<HistoryResponse>(buildUrl(next));
+      if (activeQuery.current !== query) return;
+      olderLoaded.current = true;
+      setItems((previous) => mergeHistory(previous, data.items));
+      setTotal(data.total);
+      setNext(data.next);
+      setError(null);
+    } catch (loadError) {
+      if (activeQuery.current === query) setError(messageOf(loadError));
+    } finally {
+      if (activeQuery.current === query) setLoadingOlder(false);
+    }
+  };
+
+  useEffect(() => {
+    if (detailId === null) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setDetailId(null);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [detailId]);
+
+  return (
+    <>
+      {error && (
+        <div className="banner banner-error" role="alert">
+          Failed to load history: {error}
+        </div>
+      )}
+
+      <div className="banner banner-warning">
+        History stores full request payloads locally in SQLite. Sensitive
+        content is retained with no automatic pruning. Recording starts at this
+        deployment; earlier unrecorded payloads cannot be recovered.
       </div>
-    </main>
+
+      <div className="toolbar">
+        <div className="field">
+          <label htmlFor="history-search">Search route or model</label>
+          <input
+            id="history-search"
+            type="search"
+            placeholder="e.g. openai/gpt or claude"
+            value={search}
+            onChange={(event) => setSearch(event.target.value)}
+          />
+        </div>
+        <div className="field">
+          <label htmlFor="history-changed">Changed</label>
+          <select
+            id="history-changed"
+            value={changed}
+            onChange={(event) =>
+              setChanged(event.target.value as ChangedFilter)
+            }
+          >
+            <option value="all">All requests</option>
+            <option value="yes">Changed only</option>
+            <option value="no">Unchanged only</option>
+          </select>
+        </div>
+        <p className="field-help">
+          Showing {formatNumber(items.length)} of {formatNumber(total)} matching
+          records. Newest first; use “Load older” for anything beyond the first
+          page.
+        </p>
+      </div>
+
+      <div className="table-wrap">
+        <table>
+          <caption className="sr-only">Compression history</caption>
+          <thead>
+            <tr>
+              <th scope="col">When</th>
+              <th scope="col">Route</th>
+              <th scope="col">Model</th>
+              <th scope="col">Status</th>
+              <th scope="col">Changed</th>
+              <th scope="col">Tokens (est.)</th>
+              <th scope="col">Duration</th>
+              <th scope="col">Error</th>
+            </tr>
+          </thead>
+          <tbody>
+            {items.length === 0 ? (
+              <tr>
+                <td colSpan={8} className="empty-state">
+                  No history records match the current filters.
+                </td>
+              </tr>
+            ) : (
+              items.map((item) => (
+                <tr
+                  key={item.id}
+                  className={item.changed ? "row-changed" : undefined}
+                  tabIndex={0}
+                  aria-label={`Inspect history entry ${item.id}`}
+                  onClick={() => setDetailId(item.id)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") setDetailId(item.id);
+                  }}
+                >
+                  <td className="nowrap-cell">{formatTime(item.created_at)}</td>
+                  <td className="mono">{item.route}</td>
+                  <td className="mono">{item.model}</td>
+                  <td>{item.status || "pending"}</td>
+                  <td>
+                    <span
+                      className={
+                        item.changed ? "badge badge-ok" : "badge badge-muted"
+                      }
+                    >
+                      {item.changed ? "yes" : "no"}
+                    </span>
+                  </td>
+                  <td className="nowrap-cell">
+                    {formatTokens(item.before_tokens)} →{" "}
+                    {formatTokens(item.after_tokens)}
+                  </td>
+                  <td className="nowrap-cell">
+                    {formatDuration(item.duration_ms)}
+                  </td>
+                  <td>
+                    {item.error ? (
+                      <span className="badge badge-error">error</span>
+                    ) : (
+                      "—"
+                    )}
+                  </td>
+                </tr>
+              ))
+            )}
+          </tbody>
+        </table>
+        {next !== null && (
+          <div className="pagination">
+            <button
+              type="button"
+              className="btn"
+              onClick={() => void loadOlder()}
+              disabled={loadingOlder}
+            >
+              {loadingOlder ? "Loading…" : "Load older"}
+            </button>
+          </div>
+        )}
+      </div>
+
+      {detailId !== null && (
+        <HistoryDetailModal id={detailId} onClose={() => setDetailId(null)} />
+      )}
+    </>
+  );
+}
+
+/* History detail ---------------------------------------------------------- */
+
+function HistoryDetailModal({
+  id,
+  onClose,
+}: {
+  id: number;
+  onClose: () => void;
+}) {
+  const [detail, setDetail] = useState<HistoryDetail | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [wrap, setWrap] = useState(false);
+  const dialog = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const previous = document.activeElement as HTMLElement | null;
+    const bodyOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    dialog.current?.querySelector<HTMLButtonElement>("button")?.focus();
+    const trap = (event: KeyboardEvent) => {
+      if (event.key !== "Tab") return;
+      const controls = [
+        ...(dialog.current?.querySelectorAll<HTMLElement>(
+          'button:not(:disabled), input:not(:disabled), a[href], [tabindex="0"]',
+        ) ?? []),
+      ];
+      const first = controls[0],
+        last = controls[controls.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last?.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first?.focus();
+      }
+    };
+    document.addEventListener("keydown", trap);
+    return () => {
+      document.removeEventListener("keydown", trap);
+      document.body.style.overflow = bodyOverflow;
+      previous?.focus();
+    };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    setLoading(true);
+    setError(null);
+    setDetail(null);
+
+    getJson<HistoryDetail>(`/api/history/${id}`)
+      .then((data) => {
+        if (active) {
+          setDetail(data);
+          setLoading(false);
+        }
+      })
+      .catch((loadError) => {
+        if (active) {
+          setError(messageOf(loadError));
+          setLoading(false);
+        }
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [id]);
+
+  const download = () => {
+    if (!detail) return;
+    const payload = {
+      metadata: {
+        id: detail.id,
+        created_at: detail.created_at,
+        route: detail.route,
+        model: detail.model,
+        status: detail.status,
+        changed: detail.changed,
+        before_tokens: detail.before_tokens,
+        after_tokens: detail.after_tokens,
+        duration_ms: detail.duration_ms,
+        error: detail.error,
+      },
+      original: detail.original,
+      compressed: detail.compressed,
+      changes: detail.changes,
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], {
+      type: "application/json",
+    });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `history-${detail.id}.json`;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    URL.revokeObjectURL(url);
+  };
+
+  return (
+    <div className="modal-overlay" role="presentation" onClick={onClose}>
+      <div
+        className="modal"
+        ref={dialog}
+        role="dialog"
+        aria-modal="true"
+        aria-label={`History entry ${id}`}
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="modal-header">
+          <h2>History entry #{id}</h2>
+          <button
+            type="button"
+            className="close-btn"
+            aria-label="Close"
+            onClick={onClose}
+          >
+            ×
+          </button>
+        </div>
+
+        <div className="modal-body">
+          {loading && <p className="muted">Loading detail…</p>}
+
+          {error && (
+            <div className="banner banner-error" role="alert">
+              Failed to load /api/history/{id}: {error}
+            </div>
+          )}
+
+          {detail && !loading && !error && (
+            <>
+              <div className="meta-grid">
+                <div className="meta-item">
+                  <dt>Created</dt>
+                  <dd>{formatTime(detail.created_at)}</dd>
+                </div>
+                <div className="meta-item">
+                  <dt>Route</dt>
+                  <dd className="mono">{detail.route}</dd>
+                </div>
+                <div className="meta-item">
+                  <dt>Model</dt>
+                  <dd className="mono">{detail.model}</dd>
+                </div>
+                <div className="meta-item">
+                  <dt>Status</dt>
+                  <dd>{detail.status}</dd>
+                </div>
+                <div className="meta-item">
+                  <dt>Changed</dt>
+                  <dd>{detail.changed ? "yes" : "no"}</dd>
+                </div>
+                <div className="meta-item">
+                  <dt>Tokens (est.)</dt>
+                  <dd>
+                    {formatTokens(detail.before_tokens)} →{" "}
+                    {formatTokens(detail.after_tokens)}
+                  </dd>
+                </div>
+                <div className="meta-item">
+                  <dt>Duration</dt>
+                  <dd>{formatDuration(detail.duration_ms)}</dd>
+                </div>
+                <div className="meta-item">
+                  <dt>Error</dt>
+                  <dd>{detail.error ?? "—"}</dd>
+                </div>
+              </div>
+
+              <div className="toolbar">
+                <label className="field checkbox-field">
+                  <input
+                    type="checkbox"
+                    checked={wrap}
+                    onChange={(event) => setWrap(event.target.checked)}
+                  />
+                  <span>Wrap long lines</span>
+                </label>
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={download}
+                  disabled={!detail}
+                >
+                  Download full JSON
+                </button>
+              </div>
+
+              <section className="detail-block">
+                <h3>Changes ({detail.changes?.length ?? 0})</h3>
+                {!detail.changes || detail.changes.length === 0 ? (
+                  <p className="muted">
+                    No individual changes were recorded for this request.
+                  </p>
+                ) : (
+                  detail.changes.map((change, index) => (
+                    <div
+                      className="change-card"
+                      key={`${change.kind}-${change.source_hash}-${index}`}
+                    >
+                      <div className="change-head">
+                        <strong>{change.kind}</strong>
+                        <span className="badge badge-muted">
+                          source {change.source_hash.slice(0, 12)}
+                        </span>
+                        <span
+                          className={
+                            change.cached
+                              ? "badge badge-ok"
+                              : "badge badge-muted"
+                          }
+                        >
+                          {change.cached ? "cache hit" : "generated"}
+                        </span>
+                        {change.fallback && (
+                          <span className="badge badge-warn">fallback</span>
+                        )}
+                      </div>
+                      <div className="change-values">
+                        <div>
+                          <h4>Before</h4>
+                          <pre className={`json-block ${wrap ? "wrap" : ""}`}>
+                            {pretty(change.before)}
+                          </pre>
+                        </div>
+                        <div>
+                          <h4>After</h4>
+                          <pre className={`json-block ${wrap ? "wrap" : ""}`}>
+                            {pretty(change.after)}
+                          </pre>
+                        </div>
+                      </div>
+                    </div>
+                  ))
+                )}
+              </section>
+
+              <section className="detail-block">
+                <h3>Full original JSON</h3>
+                <pre className={`json-block ${wrap ? "wrap" : ""}`}>
+                  {detail.original === null ? "null" : pretty(detail.original)}
+                </pre>
+              </section>
+
+              <section className="detail-block">
+                <h3>Full forwarded JSON</h3>
+                <pre className={`json-block ${wrap ? "wrap" : ""}`}>
+                  {detail.compressed === null
+                    ? "null"
+                    : pretty(detail.compressed)}
+                </pre>
+              </section>
+
+              <section className="detail-block">
+                <h3>Unified diff (complete)</h3>
+                <DiffView
+                  original={detail.original}
+                  compressed={detail.compressed}
+                  wrap={wrap}
+                />
+              </section>
+            </>
+          )}
+        </div>
+
+        <div className="modal-footer">
+          <button type="button" className="btn" onClick={onClose}>
+            Close
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function DiffView({
+  original,
+  compressed,
+  wrap,
+}: {
+  original: unknown | null;
+  compressed: unknown | null;
+  wrap: boolean;
+}) {
+  if (
+    original === null ||
+    original === undefined ||
+    compressed === null ||
+    compressed === undefined
+  ) {
+    return (
+      <p className="muted">
+        Diff unavailable: this record has no stored original or forwarded
+        payload.
+      </p>
+    );
+  }
+
+  const parts = diffLines(pretty(original), pretty(compressed));
+  const rows: DiffRow[] = [];
+  let oldNo = 1;
+  let newNo = 1;
+
+  for (const part of parts) {
+    const isAdd = Boolean(part.added);
+    const isDel = Boolean(part.removed);
+    const lines = part.value.split("\n");
+    if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+
+    for (const text of lines) {
+      if (isAdd) {
+        rows.push({ oldNo: null, newNo: newNo++, type: "add", text });
+      } else if (isDel) {
+        rows.push({ oldNo: oldNo++, newNo: null, type: "del", text });
+      } else {
+        rows.push({ oldNo: oldNo++, newNo: newNo++, type: "ctx", text });
+      }
+    }
+  }
+
+  return (
+    <div
+      className={`diff ${wrap ? "wrap" : "nowrap"}`}
+      role="table"
+      aria-label="Unified diff"
+    >
+      {rows.map((row, index) => (
+        <div className={`diff-line diff-${row.type}`} role="row" key={index}>
+          <span className="diff-gutter" aria-hidden="true">
+            {row.oldNo ?? ""}
+          </span>
+          <span className="diff-gutter" aria-hidden="true">
+            {row.newNo ?? ""}
+          </span>
+          <span className="diff-sign" aria-hidden="true">
+            {row.type === "add" ? "+" : row.type === "del" ? "-" : " "}
+          </span>
+          <span className="diff-text">{row.text}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/* Settings ---------------------------------------------------------------- */
+
+function SettingsPanel() {
+  const [numbers, setNumbers] = useState<Record<NumericKey, string> | null>(
+    null,
+  );
+  const [prompts, setPrompts] = useState<Record<PromptKey, string> | null>(
+    null,
+  );
+  const [defaults, setDefaults] = useState<Settings | null>(null);
+  const [loaded, setLoaded] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  const applySettings = (settings: Settings) => {
+    setNumbers(toNumberStrings(settings));
+    setPrompts({
+      blockPrompt: settings.blockPrompt,
+      toolPrompt: settings.toolPrompt,
+    });
+  };
+
+  useEffect(() => {
+    let active = true;
+    getJson<SettingsResponse>("/api/settings")
+      .then((data) => {
+        if (!active) return;
+        applySettings(data.settings);
+        setDefaults(data.defaults);
+        setLoaded(true);
+        setError(null);
+      })
+      .catch((loadError) => {
+        if (!active) return;
+        setError(messageOf(loadError));
+        setLoaded(true);
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const save = async () => {
+    if (!numbers || !prompts) return;
+    const { payload, error: validationError } = buildSettingsPayload(
+      numbers,
+      prompts,
+    );
+    if (!payload) {
+      setError(validationError ?? "Invalid settings.");
+      setNotice(null);
+      return;
+    }
+    setSaving(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const data = await putJson<SettingsResponse>("/api/settings", payload);
+      applySettings(data.settings);
+      setDefaults(data.defaults);
+      setNotice("Settings saved to SQLite.");
+    } catch (saveError) {
+      setError(messageOf(saveError));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const reset = () => {
+    if (!defaults) return;
+    applySettings(defaults);
+    setError(null);
+    setNotice("Form reset to .env defaults. Click Save to persist them.");
+  };
+
+  return (
+    <>
+      {error && (
+        <div className="banner banner-error" role="alert">
+          {error}
+        </div>
+      )}
+      {notice && <div className="banner banner-ok">{notice}</div>}
+
+      <div className="banner banner-warning">
+        Settings are persisted in SQLite and take effect for future requests.
+        Credentials, upstream URLs, routes, and the listen address cannot be
+        edited here; change those in the .env file.
+      </div>
+
+      {!loaded || !numbers || !prompts ? (
+        <p className="muted">Loading settings…</p>
+      ) : (
+        <>
+          <div className="settings-grid">
+            {NUMERIC_FIELDS.map((field) => (
+              <div className="field" key={field.key}>
+                <label htmlFor={`setting-${field.key}`}>
+                  {field.label}
+                  {field.unit ? ` (${field.unit})` : ""}
+                </label>
+                <input
+                  id={`setting-${field.key}`}
+                  type="number"
+                  inputMode="decimal"
+                  min={field.min}
+                  max={field.max}
+                  step={field.step ?? 1}
+                  value={numbers[field.key]}
+                  onChange={(event) =>
+                    setNumbers((previous) =>
+                      previous
+                        ? { ...previous, [field.key]: event.target.value }
+                        : previous,
+                    )
+                  }
+                />
+                <span className="field-help">
+                  Range {field.min}
+                  {field.max !== undefined ? `–${field.max}` : "+"}.{" "}
+                  {field.help}
+                </span>
+              </div>
+            ))}
+          </div>
+
+          <div className="prompt-grid">
+            <div className="field">
+              <label htmlFor="setting-blockPrompt">
+                Block summarizer prompt
+              </label>
+              <textarea
+                id="setting-blockPrompt"
+                value={prompts.blockPrompt}
+                onChange={(event) =>
+                  setPrompts((previous) =>
+                    previous
+                      ? { ...previous, blockPrompt: event.target.value }
+                      : previous,
+                  )
+                }
+              />
+              <span className="field-help">
+                System prompt used when summarizing conversation blocks.
+              </span>
+            </div>
+            <div className="field">
+              <label htmlFor="setting-toolPrompt">Tool summarizer prompt</label>
+              <textarea
+                id="setting-toolPrompt"
+                value={prompts.toolPrompt}
+                onChange={(event) =>
+                  setPrompts((previous) =>
+                    previous
+                      ? { ...previous, toolPrompt: event.target.value }
+                      : previous,
+                  )
+                }
+              />
+              <span className="field-help">
+                System prompt used when summarizing tool outputs.
+              </span>
+            </div>
+          </div>
+
+          <div className="settings-actions">
+            <button
+              type="button"
+              className="btn btn-primary"
+              onClick={() => void save()}
+              disabled={saving}
+            >
+              {saving ? "Saving…" : "Save settings"}
+            </button>
+            <button
+              type="button"
+              className="btn"
+              onClick={reset}
+              disabled={!defaults || saving}
+            >
+              Reset to .env defaults
+            </button>
+            <p className="field-help">
+              Nothing is saved automatically. Reset fills the form with the .env
+              defaults without persisting them.
+            </p>
+          </div>
+        </>
+      )}
+    </>
   );
 }

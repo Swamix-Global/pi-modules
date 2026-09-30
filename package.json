@@ -5,14 +5,17 @@
   "scripts": {
     "start": "bun run main.ts",
     "test": "bun test tests",
-    "check": "tsc --noEmit",
-    "format": "prettier --write \"*.ts\" \"tests/**/*.ts\" package.json tsconfig.json"
+    "build": "bun run --cwd frontend build",
+    "test:ui": "bun run tests/dashboard.browser.ts",
+    "check": "tsc --noEmit && bun run --cwd frontend typecheck",
+    "format": "prettier --write \"*.ts\" \"tests/**/*.ts\" \"frontend/src/**/*.{ts,tsx,css}\" frontend/vite.config.ts frontend/index.html frontend/package.json frontend/tsconfig.json package.json tsconfig.json"
   },
   "dependencies": {
     "elysia": "^1.4.30"
   },
   "devDependencies": {
     "@types/bun": "^1.4.2",
+    "playwright-core": "^1.63.0",
     "prettier": "^3.9.9",
     "typescript": "^7.0.2"
   }
