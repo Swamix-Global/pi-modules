@@ -1,6 +1,6 @@
 import { Elysia } from "elysia";
 import { Database } from "bun:sqlite";
-import { readFileSync, mkdirSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { request as http, type IncomingMessage } from "node:http";
 import { request as https } from "node:https";
@@ -12,24 +12,51 @@ import {
   zstdDecompressSync,
 } from "node:zlib";
 import { S } from "./settings.ts";
-import {
-  json,
-  hash,
-  tokens,
-  turns,
-  transcript,
-  textRefs,
-  clip,
-  type Item,
-} from "./utils.ts";
+import { json, hash, tokens, turns, transcript, type Item } from "./utils.ts";
+
+import { condense, ATTEMPT_TIMEOUT_MS, MAX_ATTEMPTS } from "./condenser.ts";
 
 type Config = typeof S;
 if (S.db !== ":memory:") mkdirSync(dirname(S.db), { recursive: true });
 export const db = new Database(S.db, { create: true });
 export function initCache(database: Database) {
-  database.exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;
-    CREATE TABLE IF NOT EXISTS compressed (source_hash TEXT NOT NULL, kind TEXT NOT NULL, settings_hash TEXT NOT NULL, output TEXT NOT NULL, output_hash TEXT NOT NULL, created_at REAL NOT NULL, PRIMARY KEY(source_hash,kind,settings_hash));
-    CREATE INDEX IF NOT EXISTS compressed_output ON compressed(kind,output_hash);`);
+  database.exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;`);
+  const cols = database
+    .query<{ name: string; pk: number }, []>("PRAGMA table_info(compressed)")
+    .all();
+  const pks = cols
+    .filter((c) => c.pk > 0)
+    .sort((a, b) => a.pk - b.pk)
+    .map((c) => c.name);
+  if (cols.length === 0) {
+    database.exec(`
+      CREATE TABLE IF NOT EXISTS compressed (
+        key TEXT NOT NULL PRIMARY KEY,
+        output TEXT NOT NULL,
+        output_hash TEXT NOT NULL,
+        created_at REAL NOT NULL
+      );
+    `);
+  } else if (pks.length !== 1 || pks[0] !== "key") {
+    // Rebuild copies, never drops (per AGENTS.md)
+    const legacyName = `compressed_legacy_${Date.now()}`;
+    database.transaction(() =>
+      database.exec(`
+      ALTER TABLE compressed RENAME TO ${legacyName};
+      CREATE TABLE compressed (
+        key TEXT NOT NULL PRIMARY KEY,
+        output TEXT NOT NULL,
+        output_hash TEXT NOT NULL,
+        created_at REAL NOT NULL
+      );
+      INSERT OR IGNORE INTO compressed(key, output, output_hash, created_at)
+        SELECT source_hash || '-' || settings_hash, output, output_hash, created_at FROM ${legacyName};
+    `),
+    )();
+  }
+  database.exec(
+    "CREATE INDEX IF NOT EXISTS compressed_output_key ON compressed(output_hash)",
+  );
 }
 initCache(db);
 db.exec(`
@@ -49,23 +76,20 @@ db.exec(`
 db.query(
   "UPDATE history SET status=502,error='router stopped before completion',duration_ms=max(0,?-created_at) WHERE status=0",
 ).run(Date.now());
-const cached = db.query<{ output: string }, [string, string, string]>(
-  "SELECT output FROM compressed WHERE source_hash=? AND kind=? AND settings_hash=?",
+const cached = db.query<{ output: string }, [string]>(
+  "SELECT output FROM compressed WHERE key=?",
 );
 const rendered = db.query(
-  "SELECT 1 FROM compressed WHERE kind=? AND output_hash=? LIMIT 1",
+  "SELECT 1 FROM compressed WHERE output_hash=? LIMIT 1",
 );
-const save = db.query("INSERT OR IGNORE INTO compressed VALUES (?,?,?,?,?,?)");
-const jobs = new Map<string, Promise<string | null>>(),
-  waiting: (() => void)[] = [];
-let running = 0;
+const save = db.query(
+  "INSERT OR IGNORE INTO compressed(key, output, output_hash, created_at) VALUES (?,?,?,?)",
+);
 const stats = {
   requests: 0,
   blocks: 0,
-  tools: 0,
   hits: 0,
   errors: 0,
-  clipped: 0,
 };
 class HttpError extends Error {
   constructor(
@@ -77,20 +101,14 @@ class HttpError extends Error {
 }
 const settingLimits = {
   tokens: [1, 10_000_000],
-  toolTokens: [1, 10_000_000],
   keepTurns: [1, 1000],
   words: [1, 100_000],
   maxTokens: [1, 1_000_000],
-  temperature: [0, 2],
-  workers: [1, 32],
-  trimFloor: [32, 1_000_000],
-  excerpt: [32, 1_000_000],
-  timeout: [100, 600_000],
 } as const;
 const settingKeys = [
   ...Object.keys(settingLimits),
   "blockPrompt",
-  "toolPrompt",
+  "model",
 ] as (keyof Config)[];
 const defaults = Object.fromEntries(settingKeys.map((key) => [key, S[key]]));
 const currentSettings = () =>
@@ -101,8 +119,14 @@ function validateSettings(value: unknown): Record<string, number | string> {
   for (const [key, item] of Object.entries(value)) {
     if (!settingKeys.includes(key as keyof Config))
       throw new HttpError(400, `unknown setting: ${key}`);
-    if (key === "blockPrompt" || key === "toolPrompt") {
+    if (key === "blockPrompt") {
       if (typeof item !== "string" || !item.trim() || item.length > 32_768)
+        throw new HttpError(400, `invalid setting: ${key}`);
+    } else if (key === "model") {
+      if (
+        typeof item !== "string" ||
+        !["gpt-6-luna", "deepseek-flash"].includes(item)
+      )
         throw new HttpError(400, `invalid setting: ${key}`);
     } else {
       const [min, max] = settingLimits[key as keyof typeof settingLimits];
@@ -111,7 +135,7 @@ function validateSettings(value: unknown): Record<string, number | string> {
         !Number.isFinite(item) ||
         item < min ||
         item > max ||
-        (key !== "temperature" && !Number.isSafeInteger(item))
+        !Number.isSafeInteger(item)
       )
         throw new HttpError(400, `invalid setting: ${key}`);
     }
@@ -123,8 +147,19 @@ const savedSettings = db
     "SELECT value FROM dashboard_settings WHERE id=1",
   )
   .get();
-if (savedSettings)
-  Object.assign(S, validateSettings(JSON.parse(savedSettings.value)));
+if (savedSettings) {
+  // Remove retired controls from persisted settings before validating the current schema.
+  const value = JSON.parse(savedSettings.value);
+  const retained = Object.fromEntries(
+    Object.entries(value).filter(([key]) =>
+      settingKeys.includes(key as keyof Config),
+    ),
+  );
+  Object.assign(S, validateSettings(retained));
+  db.query("UPDATE dashboard_settings SET value=? WHERE id=1").run(
+    json(currentSettings()),
+  );
+}
 
 function managementRequest(request: Request) {
   const url = new URL(request.url);
@@ -259,101 +294,49 @@ const response = (
 async function summarize(
   source: any,
   input: string,
-  kind: "block" | "tool",
   outputHash: (output: string) => string,
   config: Config,
 ): Promise<string | null> {
   const S = config;
-  const sourceHash = hash(source),
-    system = kind === "block" ? S.blockPrompt : S.toolPrompt;
-  const settingsHash = hash([
-      S.url,
-      S.model,
-      system,
-      S.words,
-      S.maxTokens,
-      S.temperature,
-    ]),
-    key = json([sourceHash, kind, settingsHash]);
-  const hit = cached.get(sourceHash, kind, settingsHash);
+  const key = `${hash(source)}-${S.model}-${S.maxTokens}`;
+  const hit = cached.get(key);
   if (hit) {
     stats.hits++;
     return hit.output;
   }
-  const existing = jobs.get(key);
-  if (existing)
-    return new Promise((resolve) => {
-      const timer = setTimeout(() => resolve(null), S.timeout);
-      existing.then((output) => {
-        clearTimeout(timer);
-        resolve(output);
-      });
-    });
-  const job = Promise.resolve().then(async () => {
-    if (running >= S.workers)
-      await new Promise<void>((resolve) => waiting.push(resolve));
-    else running++;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let output: string;
     try {
-      let apiKey = S.apiKey;
-      if (!apiKey && S.auth) {
-        const auth = JSON.parse(readFileSync(S.auth, "utf8"))[S.provider];
-        apiKey = auth?.key ?? auth?.apiKey ?? "";
-      }
-      const result = await fetch(S.url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
-        },
-        body: json({
-          model: S.model,
-          messages: [
-            { role: "system", content: system },
-            {
-              role: "user",
-              content: `${input}\n\nTarget approximately ${S.words} words; preserve important details.`,
-            },
-          ],
-          max_tokens: S.maxTokens,
-          temperature: S.temperature,
-        }),
-        signal: AbortSignal.timeout(S.timeout),
+      // Bound the entire attempt, including OAuth and response-body reads.
+      const deadline = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          controller.abort();
+          reject(new Error("Condenser timeout"));
+        }, ATTEMPT_TIMEOUT_MS);
       });
-      if (!result.ok) throw new Error(`Condenser HTTP ${result.status}`);
-      const payload = (await result.json()) as Item;
-      const answer = payload.choices?.[0]?.message?.content;
-      if (typeof answer !== "string")
-        throw new Error("Invalid condenser output");
-      const output = answer.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
-      if (!output) throw new Error("Empty condenser output");
-      save.run(
-        sourceHash,
-        kind,
-        settingsHash,
-        output,
-        outputHash(output),
-        Date.now() / 1000,
-      );
-      stats[kind === "block" ? "blocks" : "tools"]++;
-      return output;
+      output = await Promise.race([
+        condense(input, config, controller.signal),
+        deadline,
+      ]);
     } catch {
-      stats.errors++;
-      return null;
+      if (attempt === MAX_ATTEMPTS) {
+        stats.errors++;
+        // Never log credentials, request text or provider response bodies.
+        console.error(
+          `CRITICAL: condenser exhausted ${MAX_ATTEMPTS} attempts (${ATTEMPT_TIMEOUT_MS}ms each); model=${S.model} message=${hash(source)}`,
+        );
+      }
+      continue;
     } finally {
-      const next = waiting.shift();
-      if (next) next();
-      else running--;
-      jobs.delete(key);
-    }
-  });
-  jobs.set(key, job);
-  return new Promise((resolve) => {
-    const timer = setTimeout(() => resolve(null), S.timeout);
-    job.then((output) => {
       clearTimeout(timer);
-      resolve(output);
-    });
-  });
+    }
+    save.run(key, output, outputHash(output), Date.now() / 1000);
+    stats.blocks++;
+    return output;
+  }
+  return null;
 }
 export async function compressBody(
   original: Item,
@@ -381,101 +364,38 @@ export async function compressBody(
       key === "messages" ? output : [{ type: "input_text", text: output }],
   });
   let changed = false;
-  // Group turns BEFORE either compression pass. Never detach live tool calls from their results.
+  // ponytail: unbounded fanout; downstream waits for every settled-turn block.
   if (tokens(body) > S.tokens) {
     const completed = Math.max(0, groups.length - S.keepTurns);
     await Promise.all(
       groups.slice(0, completed).map(async (block, index) => {
-        if (rendered.get("block", hash(block))) {
+        if (rendered.get(hash(block))) {
           stats.hits++;
           return;
         }
-        const wasCached = !!cached.get(
-          hash(block),
-          "block",
-          hash([
-            config.url,
-            config.model,
-            config.blockPrompt,
-            config.words,
-            config.maxTokens,
-            config.temperature,
-          ]),
-        );
+        const key = `${hash(block)}-${config.model}-${config.maxTokens}`;
+        const wasCached = !!cached.get(key);
         const output = await summarize(
           block,
           transcript(block),
-          "block",
           (output) => hash([summaryItem(output)]),
           config,
         );
-        // ponytail: an outage uses an uncached excerpt; a later request can still obtain a real summary.
-        groups[index] = [
-          summaryItem(output ?? clip(transcript(block), S.excerpt)),
-        ];
-        changes.push({
-          kind: "block",
-          source_hash: hash(block),
-          before: structuredClone(block),
-          after: groups[index],
-          cached: wasCached,
-          fallback: output === null,
-        });
-        changed = true;
-      }),
-    );
-  }
-  await Promise.all(
-    groups
-      .flat()
-      .flatMap((item) => textRefs(item, true))
-      .map(async (ref) => {
-        const value = ref.owner[ref.key];
-        if (tokens(value) <= S.toolTokens) return;
-        if (rendered.get("tool", hash(value))) {
-          stats.hits++;
-          return;
-        }
-        const wasCached = !!cached.get(
-          hash(value),
-          "tool",
-          hash([
-            config.url,
-            config.model,
-            config.toolPrompt,
-            config.words,
-            config.maxTokens,
-            config.temperature,
-          ]),
-        );
-        const output = await summarize(
-          value,
-          `tool_output:\n${value}\n---\n---------------------------`,
-          "tool",
-          hash,
-          config,
-        );
-        const replacement =
-          output && Array.from(output).length < Array.from(value).length
-            ? output
-            : clip(
-                value,
-                Math.min(S.excerpt, Math.floor(Array.from(value).length / 2)),
-              );
-        if (Array.from(replacement).length < Array.from(value).length) {
+        if (output) {
+          groups[index] = [summaryItem(output)];
           changes.push({
-            kind: "tool",
-            source_hash: hash(value),
-            before: value,
-            after: replacement,
+            kind: "block",
+            source_hash: hash(block),
+            before: structuredClone(block),
+            after: groups[index],
             cached: wasCached,
-            fallback: output === null || replacement !== output,
+            fallback: false,
           });
-          ref.owner[ref.key] = replacement;
           changed = true;
         }
       }),
-  );
+    );
+  }
   body[key] = [...prefix, ...groups.flat()];
   while (tokens(body) > S.tokens && groups.length > S.keepTurns) {
     const removed = groups.shift()!;
@@ -490,41 +410,11 @@ export async function compressBody(
     body[key] = [...prefix, ...groups.flat()];
     changed = true;
   }
-  while (tokens(body) > S.tokens) {
-    const refs = groups
-      .flat()
-      .flatMap((item) => textRefs(item))
-      .sort(
-        (a, b) =>
-          Array.from(b.owner[b.key]).length - Array.from(a.owner[a.key]).length,
-      );
-    const largest = refs[0];
-    if (
-      !largest ||
-      Array.from(largest.owner[largest.key]).length <= S.trimFloor
-    )
-      break;
-    const before = largest.owner[largest.key];
-    largest.owner[largest.key] = clip(
-      largest.owner[largest.key],
-      Math.max(
-        S.trimFloor,
-        Math.floor(Array.from(largest.owner[largest.key]).length / 2),
-      ),
-    );
-    changes.push({
-      kind: "clip",
-      source_hash: hash(before),
-      before,
-      after: largest.owner[largest.key],
-      cached: false,
-      fallback: true,
-    });
-    stats.clipped++;
-    changed = true;
-  }
   if (tokens(body) > S.tokens)
-    throw new HttpError(413, "fixed request fields exceed token budget");
+    throw new HttpError(
+      413,
+      "protected turns or fixed request fields exceed token budget",
+    );
   return { body: changed ? body : original, changed };
 }
 const hop = new Set([

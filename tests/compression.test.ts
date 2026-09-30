@@ -1,22 +1,52 @@
-import { test, expect, afterAll } from "bun:test";
+import { test, expect, afterAll, spyOn } from "bun:test";
 import { Database } from "bun:sqlite";
 import { gzipSync, zstdCompressSync } from "node:zlib";
-import { hash, json, tokens, turns, transcript, textRefs } from "../utils.ts";
+import { hash, json, tokens, turns, transcript } from "../utils.ts";
+import {
+  ATTEMPT_TIMEOUT_MS,
+  MAX_ATTEMPTS,
+  lengthInstruction,
+} from "../condenser.ts";
 let calls = 0,
   mode = "ok",
   recorded: Uint8Array | undefined,
   recordedUrl = "",
   prompt = "",
+  systemPrompt = "",
+  condenserPayload: any,
+  failuresLeft = 0,
+  arrivals: number[] = [],
+  releases: (() => void)[] = [],
+  fanoutReady: (() => void) | undefined,
   streamController: ReadableStreamDefaultController<Uint8Array> | undefined;
 const upstream = Bun.serve({
   hostname: "127.0.0.1",
   port: 0,
+  idleTimeout: 0,
   async fetch(request) {
     if (new URL(request.url).pathname === "/condense") {
       calls++;
       const payload = (await request.json()) as any;
       prompt = payload.messages[1].content;
-      if (mode === "fail") return new Response("unavailable", { status: 503 });
+      systemPrompt = payload.messages[0].content;
+      condenserPayload = payload;
+      arrivals.push(Date.now());
+      if (mode === "fail" || failuresLeft-- > 0)
+        return new Response("unavailable", { status: 503 });
+      if (mode === "hang")
+        return new Response(
+          new ReadableStream({
+            start(c) {
+              c.enqueue(Buffer.from('{"choices":'));
+            },
+          }),
+        );
+      if (mode === "barrier") {
+        await new Promise<void>((resolve) => {
+          releases.push(resolve);
+          if (releases.length === 5) fanoutReady?.();
+        });
+      }
       return Response.json({
         choices: [
           {
@@ -51,13 +81,9 @@ Object.assign(process.env, {
   PI_CONTEXT_ROUTER_DB: ":memory:",
   PI_CONTEXT_ROUTER_AUTH: "",
   PI_CONTEXT_ROUTER_API_KEY: "test",
+  PI_CONTEXT_ROUTER_CONDENSER_MODEL: "deepseek-flash",
   PI_CONTEXT_ROUTER_TOKENS: "600",
-  PI_CONTEXT_ROUTER_TOOL_OUTPUT_TOKENS: "100",
   PI_CONTEXT_ROUTER_KEEP_TURNS: "2",
-  PI_CONTEXT_ROUTER_TRIM_FLOOR: "40",
-  PI_CONTEXT_ROUTER_FALLBACK_CHARS: "180",
-  PI_CONTEXT_ROUTER_WAIT_MS: "300",
-  PI_CONTEXT_ROUTER_WORKERS: "2",
   PI_CONTEXT_ROUTER_CONDENSER_URL: `${upstream.url}condense`,
   PI_CONTEXT_ROUTER_ROUTES: json({ test: upstream.url.toString() }),
   PI_CONTEXT_ROUTER_UPSTREAM: upstream.url.toString(),
@@ -74,16 +100,34 @@ afterAll(async () => {
 const initialSettings = await (await fetch(`${base}/api/settings`)).json();
 
 test("dashboard settings validate atomically, persist and reject cross-origin changes", async () => {
-  expect(initialSettings.settings.toolTokens).toBe(100);
-  expect(initialSettings.settings).not.toHaveProperty("apiKey");
+  expect(initialSettings.settings.words).toBe(400);
+  expect(Object.keys(initialSettings.settings).sort()).toEqual(
+    [
+      "tokens",
+      "keepTurns",
+      "words",
+      "maxTokens",
+      "blockPrompt",
+      "model",
+    ].sort(),
+  );
+  expect(initialSettings.defaults.model).toBe("deepseek-flash");
   for (const patch of [
-    { toolTokens: 101, workers: 0 },
+    { words: 0 },
     { apiKey: "leak" },
     { tokens: "100" },
     { keepTurns: 1.5 },
-    { toolPrompt: "" },
-    { temperature: 3 },
-    { trimFloor: 1 },
+    { blockPrompt: "" },
+    { model: "unknown" },
+    ...[
+      "temperature",
+      "trimFloor",
+      "workers",
+      "timeout",
+      "excerpt",
+      "toolPrompt",
+      "toolTokens",
+    ].map((key) => ({ [key]: 100 })),
     null,
   ]) {
     const result = await fetch(`${base}/api/settings`, {
@@ -104,13 +148,13 @@ test("dashboard settings validate atomically, persist and reject cross-origin ch
         await fetch(`${base}/api/settings`, {
           method: "PUT",
           headers,
-          body: json({ toolTokens: 150 }),
+          body: json({ words: 150 }),
         })
       ).status,
     ).toBe(403);
     expect((await fetch(`${base}/api/history`, { headers })).status).toBe(403);
   }
-  const patch = { toolTokens: 1000, words: 120 };
+  const patch = { words: 120, maxTokens: 2000 };
   const updated = await fetch(`${base}/api/settings`, {
     method: "PUT",
     headers: { Origin: base },
@@ -122,8 +166,8 @@ test("dashboard settings validate atomically, persist and reject cross-origin ch
     JSON.parse(
       (db.query("SELECT value FROM dashboard_settings WHERE id=1").get() as any)
         .value,
-    ).toolTokens,
-  ).toBe(1000);
+    ).words,
+  ).toBe(120);
   const body = { messages: [{ role: "tool", content: "p".repeat(400) }] };
   const compressed = await fetch(`${base}/compress`, {
     method: "POST",
@@ -138,13 +182,25 @@ test("dashboard settings validate atomically, persist and reject cross-origin ch
 
 test("full history retains originals, every compression change, cache hits and failed requests", async () => {
   const body = {
+    ...longBody(),
     model: "history-unique",
     messages: [
-      { role: "user", content: "read file" },
+      { role: "system", content: "Preserve instructions." },
+      { role: "user", content: "history query " + "h".repeat(1300) },
+      { role: "assistant", content: "history answer " + "h".repeat(1300) },
+      { role: "user", content: "previous query" },
+      { role: "assistant", content: "previous answer" },
+      { role: "user", content: "live query" },
       {
-        role: "tool",
-        tool_call_id: "history-id",
-        content: "secret full source " + "h".repeat(600),
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          {
+            id: "c1",
+            type: "function",
+            function: { name: "read", arguments: '{"path":"exact"}' },
+          },
+        ],
       },
     ],
   };
@@ -165,15 +221,12 @@ test("full history retains originals, every compression change, cache hits and f
     ).json();
     expect(detail.original).toEqual(body);
     expect(detail.compressed).toEqual(output);
-    expect(detail.changes.length).toBe(1);
+    expect(detail.changes.length).toBeGreaterThanOrEqual(1);
     expect(detail.changes[0]).toMatchObject({
-      kind: "tool",
-      before: body.messages[1].content,
-      after: output.messages[1].content,
+      kind: "block",
       cached: i === 1,
       fallback: false,
     });
-    expect(detail.changes[0].source_hash).toBe(hash(body.messages[1].content));
     expect(detail.before_tokens).toBe(tokens(body));
     expect(detail.after_tokens).toBe(tokens(output));
     expect(detail.status).toBe(200);
@@ -309,6 +362,17 @@ test("blocks compress to plain content; cache and rendered hashes prevent repeat
   expect(tokens(first.body)).toBeLessThanOrEqual(600);
   expect(prompt).toContain("user:\nold query");
   expect(prompt).toContain("\n---\nassistant:");
+  expect(prompt).not.toContain("Target approximately");
+  expect(systemPrompt).toBe(
+    `${initialSettings.settings.blockPrompt}\n\n${lengthInstruction(400)}`,
+  );
+  expect(condenserPayload).toMatchObject({
+    model: "deepseek-flash",
+    reasoning_effort: "low",
+    thinking: { type: "enabled" },
+    max_tokens: 4096,
+  });
+  expect(condenserPayload).not.toHaveProperty("temperature");
   await compressBody(original);
   expect(calls - before).toBe(1);
   const repeatCalls = calls;
@@ -317,49 +381,39 @@ test("blocks compress to plain content; cache and rendered hashes prevent repeat
     messages: [
       ...first.body.messages,
       { role: "user", content: "new turn" },
-      { role: "assistant", content: "z".repeat(2000) },
+      { role: "assistant", content: "z".repeat(1600) },
     ],
   });
   expect(calls - repeatCalls).toBe(1); // Only the newly settled turn, never the plain cached note.
-  expect(
-    db.query("SELECT count(*) n FROM compressed WHERE kind='block'").get(),
-  ).toBeTruthy();
+  expect(db.query("SELECT count(*) n FROM compressed").get()).toBeTruthy();
 });
-test("concurrent identical blocks deduplicate by internal hash", async () => {
+test("blocks retry if no cached block present as per key; hits return cached note", async () => {
   const body = longBody();
   body.messages[1].content = "different old query " + "q".repeat(1300);
   const before = calls;
-  const [a, b] = await Promise.all([compressBody(body), compressBody(body)]);
-  expect(a.body).toEqual(b.body);
+  const first = await compressBody(body);
+  expect(first.changed).toBe(true);
   expect(calls - before).toBe(1);
+  const second = await compressBody(body);
+  expect(second.body).toEqual(first.body);
+  expect(calls - before).toBe(1); // Cached as per key: no repeat condenser call
 });
-test("tool outputs compress strictly above 100 estimated tokens", async () => {
+test("tool outputs are preserved as-is under token budget", async () => {
   const before = calls;
-  for (const [length, estimate] of [
-    [346, 99],
-    [350, 100],
-    [351, 101],
-  ]) {
-    const content = "T".repeat(length);
-    expect(tokens(content)).toBe(estimate);
-    const body = {
-      messages: [
-        { role: "user", content: "read threshold file" },
-        { role: "tool", tool_call_id: "threshold", content },
-      ],
-    };
-    expect(tokens(body)).toBeLessThan(600);
-    const result = await compressBody(body);
-    expect(result.changed).toBe(estimate > 100);
-    expect(result.body.messages[1].content).toBe(
-      estimate > 100
-        ? "Concise useful result with exact identifiers."
-        : content,
-    );
-    expect(calls - before).toBe(estimate > 100 ? 1 : 0);
-  }
+  const content = "T".repeat(351);
+  const body = {
+    messages: [
+      { role: "user", content: "read threshold file" },
+      { role: "tool", tool_call_id: "threshold", content },
+    ],
+  };
+  expect(tokens(body)).toBeLessThan(600);
+  const result = await compressBody(body);
+  expect(result.changed).toBe(false);
+  expect(result.body.messages[1].content).toBe(content);
+  expect(calls - before).toBe(0);
 });
-test("tool output only: preserve tool-call ids, arguments and images", async () => {
+test("preserve live tool-call ids, arguments, outputs and images", async () => {
   const image = {
     type: "image_url",
     image_url: { url: "data:image/png;base64," + "X".repeat(3000) },
@@ -389,17 +443,14 @@ test("tool output only: preserve tool-call ids, arguments and images", async () 
   };
   const before = calls,
     result = await compressBody(body);
-  expect(calls - before).toBe(1);
+  expect(calls - before).toBe(0);
+  expect(result.changed).toBe(false);
   expect(result.body.messages[1]).toEqual(body.messages[1]);
   expect(result.body.messages[2].tool_call_id).toBe("keep-id");
   expect(result.body.messages[2].content[1]).toEqual(image);
   expect(result.body.messages[2].content[0].text).toBe(
-    "Concise useful result with exact identifiers.",
+    "large tool output " + "A".repeat(500),
   );
-  await compressBody(body);
-  await compressBody(result.body);
-  expect(calls - before).toBe(1);
-  expect(textRefs(body.messages[1], true)).toEqual([]);
 });
 test("Responses and Anthropic tool results retain their native wrappers", async () => {
   const body = {
@@ -416,7 +467,7 @@ test("Responses and Anthropic tool results retain their native wrappers", async 
   const result = await compressBody(body);
   expect(result.body.input[1]).toEqual(body.input[1]);
   expect(result.body.input[2].call_id).toBe("keep");
-  expect(result.body.input[2].output.length).toBeLessThan(500);
+  expect(result.body.input[2].output).toBe("B".repeat(500));
   const anthropic = {
     messages: [
       { role: "user", content: "question" },
@@ -437,15 +488,29 @@ test("Responses and Anthropic tool results retain their native wrappers", async 
     ],
   };
   expect(turns(anthropic.messages)[1].length).toBe(1);
-  const compressed = await compressBody(anthropic);
-  expect(compressed.body.messages[2].content[0].tool_use_id).toBe("same");
-  expect(compressed.changed).toBe(true);
+  const resultAnthropic = await compressBody(anthropic);
+  expect(resultAnthropic.body.messages[2].content[0].tool_use_id).toBe("same");
+  expect(resultAnthropic.changed).toBe(false);
 });
-test("failed condensation uses an uncached excerpt; retry can recover", async () => {
+test("failed condensation leaves cache empty; retry can recover", async () => {
   const body = longBody();
   body.messages[1].content = "outage " + "Q".repeat(1300);
   mode = "fail";
-  const failed = await compressBody(body);
+  const before = calls;
+  const log = spyOn(console, "error").mockImplementation(() => {});
+  let failed;
+  try {
+    failed = await compressBody(body);
+    expect(calls - before).toBe(3);
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(log.mock.calls[0][0]).toContain(
+      "CRITICAL: condenser exhausted 3 attempts (10000ms each)",
+    );
+    expect(log.mock.calls[0][0]).not.toContain("outage");
+  } finally {
+    log.mockRestore();
+    mode = "ok";
+  }
   expect(failed.changed).toBe(true);
   expect(tokens(failed.body)).toBeLessThanOrEqual(600);
   const count = (db.query("SELECT count(*) n FROM compressed").get() as any).n;
@@ -458,14 +523,150 @@ test("failed condensation uses an uncached excerpt; retry can recover", async ()
     count + 1,
   );
 });
+test("fanout launches even duplicate uncached blocks and waits for the last result", async () => {
+  const body = {
+    messages: [
+      ...Array.from({ length: 5 }, () => ({
+        role: "user",
+        content: "fanout identical uncached source " + "X".repeat(1300),
+      })),
+      { role: "user", content: "protected previous" },
+      { role: "user", content: "protected live" },
+    ],
+  };
+  const before = calls;
+  releases = [];
+  mode = "barrier";
+  let settled = false;
+  const ready = new Promise<void>((resolve) => {
+    fanoutReady = resolve;
+  });
+  const pending = compressBody(body).then((result) => {
+    settled = true;
+    return result;
+  });
+  try {
+    await ready;
+    expect(calls - before).toBe(5);
+    expect(settled).toBe(false);
+    releases.slice(0, 4).forEach((release) => release());
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    releases[4]();
+    const result = await pending;
+    expect(result.body.messages.slice(-2)).toEqual(body.messages.slice(-2));
+    expect(result.body.messages.length).toBe(7);
+  } finally {
+    releases.forEach((release) => release());
+    mode = "ok";
+    fanoutReady = undefined;
+    await pending;
+  }
+});
+
+test("cache key is message-model-outlen only; failures retry per block", async () => {
+  const { S } = await import("../settings.ts");
+  const body = longBody();
+  body.messages[1].content = "cache-key-check " + "K".repeat(1300);
+  const before = calls;
+  failuresLeft = 2;
+  await compressBody(body);
+  expect(calls - before).toBe(3);
+  const block = turns(body.messages)[1][0];
+  expect(
+    db
+      .query("SELECT key FROM compressed WHERE key=?")
+      .get(`${hash(block)}-deepseek-flash-4096`),
+  ).toBeTruthy();
+  await compressBody(body, [], {
+    ...S,
+    words: 25,
+    blockPrompt: "Different sizing hint",
+  });
+  expect(calls - before).toBe(3);
+  await compressBody(body, [], { ...S, maxTokens: 5000 });
+  expect(calls - before).toBe(4);
+});
+
+test("live text is never clipped, even when it exceeds the budget", async () => {
+  const original = {
+    messages: [{ role: "user", content: "live-intact " + "L".repeat(5000) }],
+  };
+  const frozen = json(original);
+  const changes: any[] = [];
+  const before = calls;
+  await expect(compressBody(original, changes)).rejects.toThrow(
+    "protected turns or fixed request fields exceed token budget",
+  );
+  expect(json(original)).toBe(frozen);
+  expect(changes).toEqual([]);
+  expect(calls).toBe(before);
+});
+
+test("hung response bodies get three real 10-second deadlines and one critical log", async () => {
+  expect(ATTEMPT_TIMEOUT_MS).toBe(10_000);
+  expect(MAX_ATTEMPTS).toBe(3);
+  const body = longBody();
+  body.messages[1].content = "timeout-unique " + "H".repeat(1300);
+  const before = calls;
+  const count = (db.query("SELECT count(*) n FROM compressed").get() as any).n;
+  const log = spyOn(console, "error").mockImplementation(() => {});
+  arrivals = [];
+  mode = "hang";
+  const start = Date.now();
+  try {
+    const result = await compressBody(body);
+    const elapsed = Date.now() - start;
+    expect(calls - before).toBe(3);
+    expect(elapsed).toBeGreaterThanOrEqual(29_500);
+    expect(elapsed).toBeLessThan(34_000);
+    for (let i = 1; i < arrivals.length; i++) {
+      expect(arrivals[i] - arrivals[i - 1]).toBeGreaterThanOrEqual(9_500);
+      expect(arrivals[i] - arrivals[i - 1]).toBeLessThan(12_000);
+    }
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(log.mock.calls[0][0]).toContain("CRITICAL:");
+    expect((db.query("SELECT count(*) n FROM compressed").get() as any).n).toBe(
+      count,
+    );
+    expect(result.body.messages).toEqual(
+      body.messages.slice(0, 1).concat(body.messages.slice(3)),
+    );
+  } finally {
+    mode = "ok";
+    log.mockRestore();
+  }
+}, 40_000);
+
 test("immutable fields over budget fail instead of forwarding oversized requests", async () => {
   await expect(
     compressBody({
       instructions: "x".repeat(4000),
       input: [{ role: "user", content: "small" }],
     }),
-  ).rejects.toThrow("fixed request fields exceed token budget");
+  ).rejects.toThrow(
+    "protected turns or fixed request fields exceed token budget",
+  );
 });
+test("cache write failures return 503 without retrying successful inference", async () => {
+  const body = longBody();
+  body.messages[1].content = "database-outage-unique " + "D".repeat(1300);
+  const before = calls;
+  db.exec(
+    "CREATE TRIGGER reject_cache_write BEFORE INSERT ON compressed BEGIN SELECT RAISE(ABORT,'simulated cache failure'); END",
+  );
+  try {
+    const result = await fetch(`${base}/compress`, {
+      method: "POST",
+      body: json(body),
+    });
+    expect(result.status).toBe(503);
+    expect(calls - before).toBe(1);
+  } finally {
+    db.exec("DROP TRIGGER reject_cache_write");
+  }
+});
+
 test("proxy passes original bytes and credentials, including gzip and zstd", async () => {
   const raw = Buffer.from(
     '{ "model": "test", "messages": [{"role":"user","content":"small"}] }',
@@ -570,7 +771,7 @@ test("HTTP health, validation, compression and native cache schema", async () =>
       .filter((col) => col.pk)
       .sort((a, b) => a.pk - b.pk)
       .map((col) => col.name),
-  ).toEqual(["source_hash", "kind", "settings_hash"]);
+  ).toEqual(["key"]);
   const legacy = new Database(":memory:");
   legacy.exec(
     'CREATE TABLE summaries(digest TEXT,summary TEXT); INSERT INTO summaries VALUES("old","keep")',
@@ -584,4 +785,30 @@ test("HTTP health, validation, compression and native cache schema", async () =>
     n: 0,
   });
   legacy.close();
+  const oldCompressed = new Database(":memory:");
+  oldCompressed.exec(
+    'CREATE TABLE compressed (source_hash TEXT NOT NULL, kind TEXT NOT NULL, settings_hash TEXT NOT NULL, output TEXT NOT NULL, output_hash TEXT NOT NULL, created_at REAL NOT NULL, PRIMARY KEY(source_hash,kind,settings_hash)); INSERT INTO compressed VALUES("src","block","set","out","outhash",12345); CREATE INDEX compressed_output ON compressed(output_hash);',
+  );
+  initCache(oldCompressed);
+  initCache(oldCompressed);
+  expect(
+    (oldCompressed.query("PRAGMA index_list(compressed)").all() as any[]).some(
+      (index) => index.name === "compressed_output_key",
+    ),
+  ).toBe(true);
+  expect(
+    oldCompressed.query("SELECT count(*) n FROM compressed").get(),
+  ).toEqual({ n: 1 });
+  expect(
+    (oldCompressed.query("PRAGMA table_info(compressed)").all() as any[])
+      .filter((col) => col.pk)
+      .map((col) => col.name),
+  ).toEqual(["key"]);
+  expect(
+    oldCompressed.query("SELECT key, output FROM compressed").get(),
+  ).toEqual({
+    key: "src-set",
+    output: "out",
+  });
+  oldCompressed.close();
 });

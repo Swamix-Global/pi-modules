@@ -1,6 +1,5 @@
 import { createHash } from "node:crypto";
 export type Item = Record<string, any>;
-export type TextRef = { owner: Item; key: string };
 export const json = (value: any): string =>
   Array.isArray(value)
     ? `[${value.map(json).join(",")}]`
@@ -11,10 +10,12 @@ export const json = (value: any): string =>
           .map((key) => `${JSON.stringify(key)}:${json(value[key])}`)
           .join(",")}}`
       : (JSON.stringify(value) ?? "null");
+
 export const hash = (value: any) =>
   createHash("sha256")
     .update(typeof value === "string" ? value : json(value))
     .digest("hex");
+
 export const image = (value: any) =>
   value &&
   typeof value === "object" &&
@@ -31,6 +32,7 @@ export const text = (value: any): string =>
           : value == null
             ? ""
             : String(value);
+
 export const tokens = (value: any): number =>
   Math.ceil(
     Array.from(typeof value === "string" ? value : json(stripImages(value)))
@@ -46,18 +48,6 @@ function stripImages(value: any): any {
             Object.entries(value).map(([key, v]) => [key, stripImages(v)]),
           )
         : value;
-}
-export function clip(value: string, size: number) {
-  const chars = Array.from(value),
-    marker = "\n[... clipped ...]\n";
-  if (chars.length <= size) return value;
-  const room = Math.max(0, size - marker.length),
-    head = Math.ceil(room / 2);
-  return (
-    chars.slice(0, head).join("") +
-    marker +
-    (room - head ? chars.slice(-(room - head)).join("") : "")
-  );
 }
 export function turns(items: Item[]): [Item[], Item[][]] {
   const prefix: Item[] = [],
@@ -141,33 +131,4 @@ export function transcript(block: Item[]): string {
     })
     .filter(Boolean);
   return grouped.join("\n---\n") + "\n---\n---------------------------";
-}
-export function textRefs(value: any, toolOnly = false): TextRef[] {
-  const refs: TextRef[] = [];
-  const visit = (node: any, tool: boolean) => {
-    if (!node || typeof node !== "object" || image(node)) return;
-    if (Array.isArray(node)) {
-      node.forEach((part) => visit(part, tool));
-      return;
-    }
-    const output =
-      tool ||
-      ["tool", "toolResult"].includes(node.role) ||
-      ["function_call_output", "tool_result"].includes(node.type);
-    for (const [key, value] of Object.entries(node)) {
-      const eligible =
-        ["text", "thinking", "reasoning_content"].includes(key) ||
-        (["content", "output"].includes(key) && (output || !toolOnly));
-      if (typeof value === "string" && eligible && (!toolOnly || output))
-        refs.push({ owner: node, key });
-      else if (
-        value &&
-        typeof value === "object" &&
-        ["content", "output", "summary"].includes(key)
-      )
-        visit(value, output);
-    }
-  };
-  visit(value, false);
-  return refs;
 }

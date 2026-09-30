@@ -18,10 +18,8 @@ interface HistoryStats {
 interface Stats {
   requests: number;
   blocks: number;
-  tools: number;
   hits: number;
   errors: number;
-  clipped: number;
   cache: { n: number };
   history?: HistoryStats;
 }
@@ -71,19 +69,15 @@ interface HistoryDetail {
   [key: string]: unknown;
 }
 
+type ModelId = "gpt-6-luna" | "deepseek-flash";
+
 interface Settings {
   tokens: number;
-  toolTokens: number;
   keepTurns: number;
   words: number;
   maxTokens: number;
-  temperature: number;
-  workers: number;
-  trimFloor: number;
-  excerpt: number;
-  timeout: number;
   blockPrompt: string;
-  toolPrompt: string;
+  model: ModelId;
 }
 
 interface SettingsResponse {
@@ -91,8 +85,8 @@ interface SettingsResponse {
   defaults: Settings;
 }
 
-type NumericKey = Exclude<keyof Settings, "blockPrompt" | "toolPrompt">;
-type PromptKey = "blockPrompt" | "toolPrompt";
+type NumericKey = Exclude<keyof Settings, "blockPrompt" | "model">;
+type PromptKey = "blockPrompt";
 
 interface NumericField {
   key: NumericKey;
@@ -129,20 +123,12 @@ const NUMERIC_FIELDS: NumericField[] = [
     help: "Requests estimated above this budget are compressed.",
   },
   {
-    key: "toolTokens",
-    label: "Tool output token budget",
-    min: 1,
-    step: 1,
-    unit: "tokens",
-    help: "Tool results estimated above this budget are summarized.",
-  },
-  {
     key: "keepTurns",
     label: "Recent turns protected from block summaries",
     min: 1,
     step: 1,
     unit: "turns",
-    help: "Newest turns skip block summaries; oversized tools and emergency clipping still apply.",
+    help: "Newest turns are preserved; no clipping.",
   },
   {
     key: "words",
@@ -158,49 +144,13 @@ const NUMERIC_FIELDS: NumericField[] = [
     min: 1,
     step: 1,
     unit: "tokens",
-    help: "Upper bound on generated summary length.",
+    help: "DeepSeek output safety headroom; Codex follows the system word-length hint.",
   },
-  {
-    key: "temperature",
-    label: "Summarizer temperature",
-    min: 0,
-    max: 2,
-    step: 0.1,
-    help: "0 is deterministic, 2 is most random.",
-  },
-  {
-    key: "workers",
-    label: "Parallel summarizer workers",
-    min: 1,
-    max: 32,
-    step: 1,
-    unit: "workers",
-    help: "Maximum concurrent summarizer requests.",
-  },
-  {
-    key: "trimFloor",
-    label: "Minimum clipping size",
-    min: 32,
-    step: 1,
-    unit: "chars",
-    help: "Clipping stops at this many characters.",
-  },
-  {
-    key: "excerpt",
-    label: "Excerpt length",
-    min: 32,
-    step: 1,
-    unit: "chars",
-    help: "Fallback excerpt length used when summarization fails.",
-  },
-  {
-    key: "timeout",
-    label: "Condenser timeout",
-    min: 100,
-    step: 100,
-    unit: "ms",
-    help: "How long a summarizer request may run before it is aborted.",
-  },
+];
+
+const MODEL_OPTIONS: { value: ModelId; label: string }[] = [
+  { value: "gpt-6-luna", label: "Codex Luna 6 (existing Pi subscription)" },
+  { value: "deepseek-flash", label: "DeepSeek Flash (low reasoning)" },
 ];
 
 /* Helpers ----------------------------------------------------------------- */
@@ -294,6 +244,7 @@ function toNumberStrings(settings: Settings): Record<NumericKey, string> {
 function buildSettingsPayload(
   numbers: Record<NumericKey, string>,
   prompts: Record<PromptKey, string>,
+  model: ModelId,
 ): { payload?: Record<string, number | string>; error?: string } {
   const payload: Record<string, number | string> = {};
   for (const field of NUMERIC_FIELDS) {
@@ -311,7 +262,7 @@ function buildSettingsPayload(
     payload[field.key] = value;
   }
   payload.blockPrompt = prompts.blockPrompt;
-  payload.toolPrompt = prompts.toolPrompt;
+  payload.model = model;
   return { payload };
 }
 
@@ -480,11 +431,6 @@ function Overview() {
                 help="Conversation blocks summarized since restart."
               />
               <Metric
-                label="Tool outputs compressed"
-                value={formatNumber(stats.tools)}
-                help="Tool results summarized since restart."
-              />
-              <Metric
                 label="Cache hits"
                 value={formatNumber(stats.hits)}
                 help="Summaries reused from the SQLite cache since restart."
@@ -493,11 +439,6 @@ function Overview() {
                 label="Errors"
                 value={formatNumber(stats.errors)}
                 help="Summarizer failures since restart."
-              />
-              <Metric
-                label="References clipped"
-                value={formatNumber(stats.clipped)}
-                help="Oversized references trimmed to fit the budget."
               />
               <Metric
                 label="Cached summaries"
@@ -1163,6 +1104,7 @@ function SettingsPanel() {
   const [prompts, setPrompts] = useState<Record<PromptKey, string> | null>(
     null,
   );
+  const [model, setModel] = useState<ModelId | null>(null);
   const [defaults, setDefaults] = useState<Settings | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -1173,8 +1115,8 @@ function SettingsPanel() {
     setNumbers(toNumberStrings(settings));
     setPrompts({
       blockPrompt: settings.blockPrompt,
-      toolPrompt: settings.toolPrompt,
     });
+    setModel(settings.model);
   };
 
   useEffect(() => {
@@ -1198,10 +1140,11 @@ function SettingsPanel() {
   }, []);
 
   const save = async () => {
-    if (!numbers || !prompts) return;
+    if (!numbers || !prompts || !model) return;
     const { payload, error: validationError } = buildSettingsPayload(
       numbers,
       prompts,
+      model,
     );
     if (!payload) {
       setError(validationError ?? "Invalid settings.");
@@ -1245,11 +1188,28 @@ function SettingsPanel() {
         edited here; change those in the .env file.
       </div>
 
-      {!loaded || !numbers || !prompts ? (
+      {!loaded || !numbers || !prompts || !model ? (
         <p className="muted">Loading settings…</p>
       ) : (
         <>
           <div className="settings-grid">
+            <div className="field">
+              <label htmlFor="setting-model">Summarizer model</label>
+              <select
+                id="setting-model"
+                value={model}
+                onChange={(event) => setModel(event.target.value as ModelId)}
+              >
+                {MODEL_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+              <span className="field-help">
+                Summarizer used for block compression.
+              </span>
+            </div>
             {NUMERIC_FIELDS.map((field) => (
               <div className="field" key={field.key}>
                 <label htmlFor={`setting-${field.key}`}>
@@ -1272,6 +1232,39 @@ function SettingsPanel() {
                     )
                   }
                 />
+                {field.key === "tokens" && (
+                  <div
+                    className="prefill-buttons"
+                    style={{
+                      display: "flex",
+                      gap: "6px",
+                      marginTop: "6px",
+                      flexWrap: "wrap",
+                    }}
+                  >
+                    {[
+                      { label: "32k", value: 32000 },
+                      { label: "64k", value: 64000 },
+                      { label: "96k", value: 96000 },
+                      { label: "128k", value: 128000 },
+                    ].map((preset) => (
+                      <button
+                        key={preset.label}
+                        type="button"
+                        className="btn btn-small"
+                        onClick={() =>
+                          setNumbers((previous) =>
+                            previous
+                              ? { ...previous, tokens: String(preset.value) }
+                              : previous,
+                          )
+                        }
+                      >
+                        {preset.label}
+                      </button>
+                    ))}
+                  </div>
+                )}
                 <span className="field-help">
                   Range {field.min}
                   {field.max !== undefined ? `–${field.max}` : "+"}.{" "}
@@ -1298,24 +1291,10 @@ function SettingsPanel() {
                 }
               />
               <span className="field-help">
-                System prompt used when summarizing conversation blocks.
-              </span>
-            </div>
-            <div className="field">
-              <label htmlFor="setting-toolPrompt">Tool summarizer prompt</label>
-              <textarea
-                id="setting-toolPrompt"
-                value={prompts.toolPrompt}
-                onChange={(event) =>
-                  setPrompts((previous) =>
-                    previous
-                      ? { ...previous, toolPrompt: event.target.value }
-                      : previous,
-                  )
-                }
-              />
-              <span className="field-help">
-                System prompt used when summarizing tool outputs.
+                System prompt used when summarizing conversation blocks. The
+                word hint is appended to the system prompt automatically. Each
+                uncached block gets up to three 10-second attempts. All eligible
+                blocks launch together; downstream waits for them.
               </span>
             </div>
           </div>

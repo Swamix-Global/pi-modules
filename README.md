@@ -1,6 +1,6 @@
 # ctx-engine
 
-Loopback context-compression proxy: Bun, Elysia, native `bun:sqlite`. Runtime: `main.ts`, `utils.ts`, `settings.ts`. React/Vite dashboard: `frontend/`.
+Loopback context-compression proxy: Bun, Elysia, native `bun:sqlite`. Runtime: `main.ts`, `condenser.ts`, `utils.ts`, `settings.ts`. Uses the existing Pi installation at `/usr/lib/node_modules/@earendil-works/pi-coding-agent` for native Codex subscription authentication. React/Vite dashboard: `frontend/`.
 
 ```sh
 bun install --frozen-lockfile
@@ -17,18 +17,20 @@ Open **http://127.0.0.1:4141/dashboard/**.
 
 - **Overview:** compression/cache counters since restart and persisted lifetime request totals. Token counts are estimates; durations stop at compression completion or upstream response headers, not the end of streaming.
 - **History:** every proxied GET/POST and `/compress` request, including unchanged and failed requests. Search by route/model, filter changed/unchanged, and load older pages through the full retained history. No automatic pruning.
-- **Inspection:** complete original and forwarded request bodies, every block/tool compression or emergency trim/drop, cache/fallback indicators, full line-by-line diff with no omitted context, wrapping and JSON download. Authorization headers are never recorded. Payloads can contain secrets, so history is sensitive local data.
-- **Settings:** context/tool thresholds, protected recent turns, summary size, temperature, concurrency, fallback/clipping sizes, condenser timeout and prompts. Save explicitly. Validated updates apply to new requests and persist in SQLite; in-flight compression keeps its settings snapshot. Reset fills the form with `.env` defaults; Save applies it. Credentials, routes and condenser URL/model remain in `.env`.
+- **Inspection:** complete original and forwarded request bodies, every block summary or oldest-turn drop, cache/fallback indicators, full line-by-line diff with no omitted context, wrapping and JSON download. Authorization headers are never recorded. Payloads can contain secrets, so history is sensitive local data.
+- **Settings:** context threshold (64k default, with 32k/64k/96k/128k presets), protected recent turns, summary size, block prompt and model selection: Codex Luna 6 or DeepSeek Flash (low reasoning). Save explicitly. Validated updates apply to new requests and persist in SQLite; in-flight compression keeps its settings snapshot. Reset fills the form with `.env` defaults; Save applies it. Credentials, routes and DeepSeek URL remain in `.env`.
 
 Recording starts with this dashboard deployment. Previously unrecorded payloads cannot be recovered. Old SQLite tables are preserved, but are not relabeled as new history. Interrupted requests are marked failed after restart.
 
 ## Configuration and compression
 
-Run from the repository root. `.env` supplies startup configuration; missing settings fail startup. Dashboard overrides live in `dashboard_settings`, not in rewritten environment files. Configure the condenser's OpenAI-compatible URL/model and either its API key or Pi's `auth.json`.
+Run from the repository root. `.env` supplies startup configuration; missing settings fail startup. Dashboard overrides live in `dashboard_settings`, not in rewritten environment files. DeepSeek Flash uses the configured URL and API key or Pi's `auth.json`. Codex Luna 6 uses the same `openai-codex` OAuth credentials as Pi, with native token refresh and the direct catalog upstream; it does not call the router recursively. Pi must already be signed in. Retired controls are removed from saved dashboard settings on startup.
 
-Turns are grouped before compression. Over budget, older turns are summarized while the configured newest turns are excluded from block summarization. Tool outputs above **100 estimated tokens** are eligible by default, including in recent turns. IDs, tool arguments, images and native wrappers are preserved. Emergency trimming may still affect recent text to meet the overall budget.
+Turns are grouped before compression. Over budget, all eligible older blocks launch together via `Promise.all(groups.map(...))`, and downstream waits for every block. There is no worker pool, queue or in-flight deduplication. Each uncached block gets **three total attempts**, each bounded to **10 seconds**, including authentication and response-body reads. Exhaustion logs one `CRITICAL` message with model and message hash, never payloads or credentials. Failed blocks are not cached. The configured newest turns, including tool calls/results and images, remain intact; there is no standalone tool summarizer.
 
-Transcripts label `user:`, `assistant:`, `tool_call:`, `tool_output:`, `thinking:`. Source/settings/output hashes are stored internally in `compressed`; no cache tags are injected. Failed condensation uses uncached excerpts. Oldest turns are dropped and oversized text clipped when necessary; immutable fields alone over budget return 413.
+Transcripts label `user:`, `assistant:`, `tool_call:`, `tool_output:`, `thinking:`. The cache key is exactly `messageHash-model-outputTokenLimit`; rendered-output hashes prevent summarizing a cached note again. No cache tags are injected. A static length instruction interpolates the configured word target and is appended to the condenser's **system prompt**, not the user transcript. Length is a sizing hint; output tokens remain DeepSeek safety headroom. Pi's native Codex subscription API does not send a hard output-token cap, so Codex follows the system word-length hint. Sampling is left to the model defaults.
+
+There are no excerpts or character-clipping functions. Failed summaries leave the block intact. If the request still exceeds the context budget, oldest unprotected turns may be dropped; protected turns or fixed fields alone over budget return **413**, rather than corrupting their text.
 
 ## API
 
@@ -49,9 +51,10 @@ bun run format
 bun run check
 bun test tests
 CHROME_BIN=/path/to/chrome bun run test:ui
+bun run tests/condenser.live.ts # optional: real inference with existing credentials, isolated in-memory DB
 ```
 
-The browser check uses an isolated in-memory database and mock condenser. Build first; it checks metrics, pagination (including bursts larger than one page), full inspection/diffs, download, settings saves and mobile layout. `CHROME_BIN` must point to installed Chrome/Chromium. Persistence tests reopen the database in a new process.
+The browser check uses an isolated in-memory database and mock condenser. Build first; it checks metrics, pagination (including bursts larger than one page), full inspection/diffs, download, settings saves and mobile layout. `CHROME_BIN` must point to installed Chrome/Chromium. Persistence tests reopen the database in a new process, including removal of retired settings. The live check fails unless both models produce real notes and reuse their cache. A Codex `401 token_expired` requires `/login openai-codex` in Pi, then rerun the live check; model catalog presence or mocked tests alone do not establish subscription access.
 
 ## Local deployment
 

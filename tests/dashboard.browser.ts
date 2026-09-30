@@ -18,7 +18,8 @@ Object.assign(process.env, {
   PI_CONTEXT_ROUTER_DB: ":memory:",
   PI_CONTEXT_ROUTER_API_KEY: "test",
   PI_CONTEXT_ROUTER_CONDENSER_URL: upstream.url.toString(),
-  PI_CONTEXT_ROUTER_TOOL_OUTPUT_TOKENS: "100",
+  PI_CONTEXT_ROUTER_TOKENS: "100",
+  PI_CONTEXT_ROUTER_KEEP_TURNS: "1",
 });
 const { app, db } = await import("../main.ts");
 app.listen({ hostname: "127.0.0.1", port: 0 });
@@ -40,12 +41,12 @@ for (let i = 0; i < 55; i++)
 const original = {
   model: "browser-inspection",
   messages: [
-    { role: "user", content: "read" },
+    { role: "user", content: "read " + "x".repeat(300) },
     {
-      role: "tool",
-      tool_call_id: "call-exact",
-      content: "Full original content ".repeat(100) + "ORIGINAL_END_SENTINEL",
+      role: "assistant",
+      content: "Full original content " + "ORIGINAL_END_SENTINEL",
     },
+    { role: "user", content: "latest" },
   ],
 };
 const compression = await fetch(`${base}/compress`, {
@@ -68,6 +69,8 @@ try {
   await page
     .getByRole("heading", { name: "Lifetime history (persisted)" })
     .waitFor();
+  for (const label of ["Tool outputs compressed", "References clipped"])
+    assert.equal(await page.getByText(label, { exact: true }).count(), 0);
   assert.equal(await page.locator(".cards").count(), 2);
   const contrast = await page.locator(".app-title").evaluate((el) => ({
     foreground: getComputedStyle(el).color,
@@ -100,7 +103,6 @@ try {
   const diff = dialog.getByRole("table", { name: "Unified diff" });
   assert((await diff.textContent())!.includes("ORIGINAL_END_SENTINEL"));
   assert((await diff.textContent())!.includes("SUMMARY_END_SENTINEL"));
-  assert((await diff.textContent())!.includes("call-exact"));
   assert((await diff.locator(".diff-add").count()) > 0);
   assert((await diff.locator(".diff-del").count()) > 0);
   assert.equal(await dialog.locator(".change-card").count(), 1);
@@ -117,26 +119,61 @@ try {
     .waitFor();
   assert.equal(await page.locator("#panel-history tbody tr").count(), 116);
   await page.getByRole("tab", { name: "Settings", exact: true }).click();
-  const threshold = page.getByLabel("Tool output token budget", {
+  for (const label of [
+    "Summarizer temperature",
+    "Parallel summarizer workers",
+    "Minimum clipping size",
+    "Condenser timeout",
+  ])
+    assert.equal(await page.getByLabel(label, { exact: false }).count(), 0);
+  const modelSelect = page.getByLabel("Summarizer model");
+  assert.deepEqual(
+    await modelSelect.locator("option").evaluateAll((options) =>
+      options.map((option) => ({
+        value: (option as HTMLOptionElement).value,
+        label: option.textContent,
+      })),
+    ),
+    [
+      { value: "gpt-6-luna", label: "Codex Luna 6 (existing Pi subscription)" },
+      { value: "deepseek-flash", label: "DeepSeek Flash (low reasoning)" },
+    ],
+  );
+  const initialModel = await modelSelect.inputValue();
+  const chosenModel =
+    initialModel === "gpt-6-luna" ? "deepseek-flash" : "gpt-6-luna";
+  const budget = page.getByLabel("Context token budget", { exact: false });
+  for (const [label, value] of [
+    ["32k", "32000"],
+    ["64k", "64000"],
+    ["96k", "96000"],
+    ["128k", "128000"],
+  ]) {
+    await page.getByRole("button", { name: label, exact: true }).click();
+    assert.equal(await budget.inputValue(), value);
+  }
+  const threshold = page.getByLabel("Summary target length", {
     exact: false,
   });
   await threshold.fill("101");
+  await modelSelect.selectOption(chosenModel);
   await page.getByRole("button", { name: "Save settings" }).click();
   await page.getByText("Settings saved to SQLite.", { exact: true }).waitFor();
   const settings = await (await fetch(`${base}/api/settings`)).json();
-  assert.equal(settings.settings.toolTokens, 101);
-  assert.equal(
-    JSON.parse(
-      (
-        db.query("SELECT value FROM dashboard_settings").get() as {
-          value: string;
-        }
-      ).value,
-    ).toolTokens,
-    101,
+  assert.equal(settings.settings.words, 101);
+  assert.equal(settings.settings.model, chosenModel);
+  const stored = JSON.parse(
+    (
+      db.query("SELECT value FROM dashboard_settings").get() as {
+        value: string;
+      }
+    ).value,
   );
+  assert.equal(stored.words, 101);
+  assert.equal(stored.model, chosenModel);
   await page.getByRole("button", { name: "Reset to .env defaults" }).click();
-  assert.equal(await threshold.inputValue(), "100");
+  assert.equal(await threshold.inputValue(), "400");
+  assert.equal(await modelSelect.inputValue(), initialModel);
   await page.setViewportSize({ width: 390, height: 844 });
   assert(
     await page.evaluate(
