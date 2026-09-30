@@ -1,7 +1,7 @@
 import { test, expect, afterAll } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { gzipSync, zstdCompressSync } from 'node:zlib';
-import { hash, json, tokens, turns, transcript, textRefs } from '../utils';
+import { hash, json, tokens, turns, transcript, textRefs } from '../utils.ts';
 let calls=0, mode='ok', recorded:Uint8Array|undefined, recordedUrl='', prompt='', streamController:ReadableStreamDefaultController<Uint8Array>|undefined;
 const upstream=Bun.serve({hostname:'127.0.0.1',port:0,async fetch(request) {
   if (new URL(request.url).pathname==='/condense') {
@@ -13,7 +13,7 @@ const upstream=Bun.serve({hostname:'127.0.0.1',port:0,async fetch(request) {
   recordedUrl=request.url; recorded=new Uint8Array(await request.arrayBuffer()); return new Response(recorded as Uint8Array<ArrayBuffer>,{headers:{'Content-Type':'application/octet-stream','X-Upstream-Auth':request.headers.get('authorization')??''}});
 }});
 Object.assign(process.env,{PI_CONTEXT_ROUTER_DB:':memory:',PI_CONTEXT_ROUTER_AUTH:'',PI_CONTEXT_ROUTER_API_KEY:'test',PI_CONTEXT_ROUTER_TOKENS:'600',PI_CONTEXT_ROUTER_TOOL_OUTPUT_TOKENS:'80',PI_CONTEXT_ROUTER_KEEP_TURNS:'2',PI_CONTEXT_ROUTER_TRIM_FLOOR:'40',PI_CONTEXT_ROUTER_FALLBACK_CHARS:'180',PI_CONTEXT_ROUTER_WAIT_MS:'300',PI_CONTEXT_ROUTER_WORKERS:'2',PI_CONTEXT_ROUTER_CONDENSER_URL:`${upstream.url}condense`,PI_CONTEXT_ROUTER_ROUTES:json({test:upstream.url.toString()}),PI_CONTEXT_ROUTER_UPSTREAM:upstream.url.toString(),PI_CONTEXT_ROUTER_MAX_BODY_BYTES:'16384'});
-const { app, db, compressBody, initCache }=await import('../main');
+const { app, db, compressBody, initCache }=await import('../main.ts');
 app.listen({hostname:'127.0.0.1',port:0,idleTimeout:0});
 const base=`http://127.0.0.1:${app.server!.port}`;
 afterAll(async()=>{await app.stop(true); await upstream.stop(true); db.close();});

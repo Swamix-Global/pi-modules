@@ -6,8 +6,8 @@ import { request as http, type IncomingMessage } from 'node:http';
 import { request as https } from 'node:https';
 import { Readable } from 'node:stream';
 import { gzipSync, gunzipSync, zstdCompressSync, zstdDecompressSync } from 'node:zlib';
-import { S } from './settings';
-import { json, hash, tokens, turns, transcript, textRefs, clip, type Item } from './utils';
+import { S } from './settings.ts';
+import { json, hash, tokens, turns, transcript, textRefs, clip, type Item } from './utils.ts';
 
 if (S.db !== ':memory:') mkdirSync(dirname(S.db),{recursive:true});
 export const db = new Database(S.db,{create:true});
