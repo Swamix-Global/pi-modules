@@ -25,4 +25,14 @@ Configure the condenser's OpenAI-compatible URL/model and either its API key or 
 
 The old dashboard, accounts, provider probes, billing and master-session CLI are intentionally removed. This is a loopback-only compression backend, not a public multi-tenant service. Existing SQLite tables are preserved; the rewrite uses a new `compressed` table.
 
-The running Python service is **not** replaced automatically. To deploy, change its `WorkingDirectory` to this repository and `ExecStart` to the absolute Bun path followed by `run main.ts`, then restart and verify `/health`.
+Local deployment uses the user service `pi-context-router.service`, running Bun from this repository and reading `.env` (no legacy service environment overrides). Install or update it with:
+
+```sh
+install -m 644 pi-context-router.service ~/.config/systemd/user/pi-context-router.service
+systemctl --user daemon-reload
+systemctl --user enable pi-context-router.service
+systemctl --user restart pi-context-router.service
+curl -fsS http://127.0.0.1:4141/health
+```
+
+The unit is enabled for user-session startup and restarts on failure. It retains read-only home/system protections, allowing writes only under `~/.pi/agent` for the database. Pi's existing local provider URLs require no changes. The retired dashboard and other removed endpoints are not deployed.
