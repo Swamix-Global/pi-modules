@@ -2,7 +2,7 @@ import { test, expect, afterAll } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { gzipSync, zstdCompressSync } from 'node:zlib';
 import { hash, json, tokens, turns, transcript, textRefs } from '../utils';
-let calls=0, mode='ok', recorded:Uint8Array|undefined, prompt='', streamController:ReadableStreamDefaultController<Uint8Array>|undefined;
+let calls=0, mode='ok', recorded:Uint8Array|undefined, recordedUrl='', prompt='', streamController:ReadableStreamDefaultController<Uint8Array>|undefined;
 const upstream=Bun.serve({hostname:'127.0.0.1',port:0,async fetch(request) {
   if (new URL(request.url).pathname==='/condense') {
     calls++; const payload=await request.json() as any; prompt=payload.messages[1].content;
@@ -10,10 +10,10 @@ const upstream=Bun.serve({hostname:'127.0.0.1',port:0,async fetch(request) {
     return Response.json({choices:[{message:{content:'Concise useful result with exact identifiers.'}}]});
   }
   if (new URL(request.url).pathname==='/stream') return new Response(new ReadableStream({start(c){streamController=c;c.enqueue(Buffer.from('data: first\n\n'));}}),{headers:{'Content-Type':'text/event-stream'}});
-  recorded=new Uint8Array(await request.arrayBuffer()); return new Response(recorded as Uint8Array<ArrayBuffer>,{headers:{'Content-Type':'application/octet-stream','X-Upstream-Auth':request.headers.get('authorization')??''}});
+  recordedUrl=request.url; recorded=new Uint8Array(await request.arrayBuffer()); return new Response(recorded as Uint8Array<ArrayBuffer>,{headers:{'Content-Type':'application/octet-stream','X-Upstream-Auth':request.headers.get('authorization')??''}});
 }});
 Object.assign(process.env,{PI_CONTEXT_ROUTER_DB:':memory:',PI_CONTEXT_ROUTER_AUTH:'',PI_CONTEXT_ROUTER_API_KEY:'test',PI_CONTEXT_ROUTER_TOKENS:'600',PI_CONTEXT_ROUTER_TOOL_OUTPUT_TOKENS:'80',PI_CONTEXT_ROUTER_KEEP_TURNS:'2',PI_CONTEXT_ROUTER_TRIM_FLOOR:'40',PI_CONTEXT_ROUTER_FALLBACK_CHARS:'180',PI_CONTEXT_ROUTER_WAIT_MS:'300',PI_CONTEXT_ROUTER_WORKERS:'2',PI_CONTEXT_ROUTER_CONDENSER_URL:`${upstream.url}condense`,PI_CONTEXT_ROUTER_ROUTES:json({test:upstream.url.toString()}),PI_CONTEXT_ROUTER_UPSTREAM:upstream.url.toString(),PI_CONTEXT_ROUTER_MAX_BODY_BYTES:'16384'});
-const { app, db, compressBody, resolveUpstream, initCache }=await import('../main');
+const { app, db, compressBody, initCache }=await import('../main');
 app.listen({hostname:'127.0.0.1',port:0,idleTimeout:0});
 const base=`http://127.0.0.1:${app.server!.port}`;
 afterAll(async()=>{await app.stop(true); await upstream.stop(true); db.close();});
@@ -72,13 +72,24 @@ test('proxy passes original bytes and credentials, including gzip and zstd',asyn
     const result=await fetch(`${base}/r/test/echo?key=value`,{method:'POST',headers:{'Content-Encoding':encoding,Authorization:'Bearer caller'},body});
     expect(result.status).toBe(200); expect(result.headers.get('X-Context-Router')).toBe('pass'); expect(result.headers.get('X-Upstream-Auth')).toBe('Bearer caller'); expect(Buffer.from(await result.arrayBuffer())).toEqual(Buffer.from(body));
   }
-  expect(resolveUpstream('/r/unknown/models')).toBeNull();
+  expect((await fetch(`${base}/r/unknown/models`)).status).toBe(404);
+  expect((await fetch(`${base}/r/test/encoded%2Fsegment?key=%2F`)).status).toBe(200);
+  expect(new URL(recordedUrl).pathname).toBe('/encoded%2Fsegment'); expect(new URL(recordedUrl).search).toBe('?key=%2F');
 });
 test('proxy streams the first chunk without waiting for the end',async()=>{
   const result=await fetch(`${base}/r/test/stream`), reader=result.body!.getReader();
   expect(new TextDecoder().decode((await reader.read()).value)).toBe('data: first\n\n');
   streamController!.enqueue(Buffer.from('data: last\n\n')); streamController!.close();
   expect(new TextDecoder().decode((await reader.read()).value)).toBe('data: last\n\n'); expect((await reader.read()).done).toBe(true);
+});
+test('explicit Elysia routes reject unrelated paths and methods',async()=>{
+  expect(app.routes.map(({method,path})=>`${method} ${path}`)).toEqual(['GET /health','GET /stats','POST /compress','GET /r/:provider/*','POST /r/:provider/*','GET /codex/responses','POST /codex/responses']);
+  const before=calls;
+  for (const [method,path] of [['GET','/unknown'],['POST','/health'],['GET','/compress'],['DELETE','/r/test/echo'],['POST','/r/unknown/echo']]) {
+    expect((await fetch(`${base}${path}`,{method})).status).toBe(404);
+  }
+  expect(calls).toBe(before);
+  for (const method of ['GET','POST']) expect((await fetch(`${base}/codex/responses`,{method,...(method==='POST'?{body:json({messages:[{role:'user',content:'small'}]})}:{})})).status).toBe(200);
 });
 test('HTTP health, validation, compression and native cache schema',async()=>{
   expect(await (await fetch(`${base}/health`)).text()).toBe('{"status":"ok"}');

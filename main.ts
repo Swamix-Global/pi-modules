@@ -90,11 +90,6 @@ export async function compressBody(original: Item): Promise<{body:Item;changed:b
   return {body:changed?body:original,changed};
 }
 const hop=new Set(['connection','keep-alive','proxy-authenticate','proxy-authorization','te','trailer','transfer-encoding','upgrade']);
-export function resolveUpstream(route:string): [string,string] | null {
-  if (route==='/codex/responses') return [S.upstream,route];
-  const match=/^\/r\/([a-z0-9_-]+)(\/.*)$/.exec(route);
-  return match && Object.hasOwn(S.routes,match[1]) ? [S.routes[match[1]],match[2]] : null;
-}
 async function readBody(request:Request) {
   const declared=request.headers.get('content-length');
   if (declared!==null && !/^\d+$/.test(declared)) throw new HttpError(400,'invalid content length');
@@ -117,19 +112,8 @@ function send(url:URL,request:Request,body?:Uint8Array,retry=true):Promise<Incom
     outgoing.end(body);
   });
 }
-export const app=new Elysia().all('*',async ({request})=>{
-  try {
-    const url=new URL(request.url), route=url.pathname.replace(/\/+$/,'');
-    if (request.method==='GET' && route==='/health') return response({status:'ok'});
-    if (request.method==='GET' && route==='/stats') return response({...stats,cache:db.query('SELECT count(*) AS n FROM compressed').get()});
-    if (!['GET','POST'].includes(request.method)) throw new HttpError(405,'method not allowed');
-    if (request.method==='POST' && route==='/compress') {
-      let value:Item; try {value=JSON.parse((await readBody(request)).toString('utf8'));} catch(error) {if (error instanceof HttpError) throw error; throw new HttpError(400,'invalid JSON');}
-      if (!value || typeof value!=='object' || Array.isArray(value)) throw new HttpError(400,'invalid JSON');
-      const result=await compressBody(value); return response(result.body,200,{'X-Context-Router':result.changed?'compacted':'pass'});
-    }
-    const upstream=resolveUpstream(route); if (!upstream) throw new HttpError(404,'not found');
-    const target=new URL(upstream[0]); target.pathname=target.pathname.replace(/\/+$/,'')+upstream[1]; target.search=url.search;
+async function proxy(request:Request,upstream:string,rest:string) {
+    const target=new URL(upstream); target.pathname=target.pathname.replace(/\/+$/,'')+rest; target.search=new URL(request.url).search;
     let body:Uint8Array|undefined, changed=false;
     if (request.method==='POST') {
       const encoding=request.headers.get('content-encoding')?.toLowerCase()||'identity';
@@ -152,12 +136,32 @@ export const app=new Elysia().all('*',async ({request})=>{
     const status=upstreamResponse.statusCode!;
     if ([204,304].includes(status)) {upstreamResponse.resume(); return new Response(null,{status,headers});}
     return new Response(Readable.toWeb(upstreamResponse) as unknown as ReadableStream<Uint8Array>,{status,headers});
-  } catch(error:any) {
+}
+function providerProxy({request,params}:{request:Request;params:{provider:string;'*':string}}) {
+  if (!Object.hasOwn(S.routes,params.provider)) throw new HttpError(404,'not found');
+  const pathname=new URL(request.url).pathname;
+  return proxy(request,S.routes[params.provider],pathname.slice(pathname.indexOf('/',3)));
+}
+const codexProxy=({request}:{request:Request})=>proxy(request,S.upstream,'/codex/responses');
+export const app=new Elysia()
+  .onError(({error,code})=>{
     if (error instanceof HttpError) return response({error:error.message},error.status);
-    if (error.name==='SQLiteError' || error.code?.startsWith('SQLITE')) return response({error:'cache database unavailable'},503);
+    if (code==='NOT_FOUND') return response({error:'not found'},404);
+    if (code==='PARSE' || code==='VALIDATION') return response({error:'invalid request'},400);
+    if (error instanceof Error && (error.name==='SQLiteError' || (error as NodeJS.ErrnoException).code?.startsWith('SQLITE'))) return response({error:'cache database unavailable'},503);
     return response({error:'context router upstream failure'},502);
-  }
-},{parse:'none'});
+  })
+  .get('/health',()=>response({status:'ok'}))
+  .get('/stats',()=>response({...stats,cache:db.query('SELECT count(*) AS n FROM compressed').get()}))
+  .post('/compress',async ({request})=>{
+    let value:Item; try {value=JSON.parse((await readBody(request)).toString('utf8'));} catch(error) {if (error instanceof HttpError) throw error; throw new HttpError(400,'invalid JSON');}
+    if (!value || typeof value!=='object' || Array.isArray(value)) throw new HttpError(400,'invalid JSON');
+    const result=await compressBody(value); return response(result.body,200,{'X-Context-Router':result.changed?'compacted':'pass'});
+  },{parse:'none'})
+  .get('/r/:provider/*',providerProxy)
+  .post('/r/:provider/*',providerProxy,{parse:'none'})
+  .get('/codex/responses',codexProxy)
+  .post('/codex/responses',codexProxy,{parse:'none'});
 if (import.meta.main) {
   app.listen({hostname:S.host,port:S.port,maxRequestBodySize:S.maxBody,idleTimeout:0});
   console.log(`ctx-engine listening on ${S.host}:${app.server!.port}`);
