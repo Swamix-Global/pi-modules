@@ -5,6 +5,7 @@ Runtime: `main.ts`, `utils.ts`, `settings.ts` in the repository root. No Python.
 
 ```sh
 bun install --frozen-lockfile
+bun run format
 bun run check
 bun test tests
 bun start
