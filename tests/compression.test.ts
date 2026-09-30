@@ -343,7 +343,11 @@ test("group turns before rendering all five section types", () => {
       tool_calls: [{ function: { name: "read", arguments: "{}" } }],
     },
     { role: "tool", tool_call_id: "c", content: "result" },
-    { type: "reasoning", summary: [{ text: "thought" }] },
+    {
+      type: "reasoning",
+      summary: [{ text: "thought" }],
+      encrypted_content: "gAAAAA-SECRET-BLOB",
+    },
     { role: "user", content: "next" },
   ];
   const [prefix, groups] = turns(items);
@@ -356,6 +360,11 @@ test("group turns before rendering all five section types", () => {
     transcript([groups[0][0], groups[0][3], groups[0][1], groups[0][2]]),
   ).toBe(transcript(groups[0]));
   expect(hash({ b: 1, a: 2 })).toBe(hash({ a: 2, b: 1 }));
+  // Encrypted reasoning blobs must never reach the condenser transcript.
+  expect(transcript(groups[0])).not.toContain("gAAAAA-SECRET-BLOB");
+  expect(
+    transcript([{ type: "reasoning", encrypted_content: "gAAAAA-ONLY-BLOB" }]),
+  ).not.toContain("gAAAAA-ONLY-BLOB");
 });
 test("blocks compress to plain content; cache and rendered hashes prevent repeat calls", async () => {
   const original = longBody(),
