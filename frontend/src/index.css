@@ -103,12 +103,6 @@ pre,
   font-weight: 700;
 }
 
-.app-subtitle {
-  color: var(--muted);
-  font-size: 13px;
-  margin-top: 2px;
-}
-
 .tabs {
   display: flex;
   gap: 4px;
@@ -146,7 +140,8 @@ button:focus-visible,
 input:focus-visible,
 select:focus-visible,
 textarea:focus-visible,
-tr:focus-visible {
+tr:focus-visible,
+summary:focus-visible {
   outline: 3px solid #1a73e8;
   outline-offset: 1px;
 }
@@ -177,11 +172,6 @@ tr:focus-visible {
   font-size: 17px;
 }
 
-.section-note {
-  color: var(--muted);
-  font-size: 13px;
-}
-
 .cards {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
@@ -209,12 +199,6 @@ tr:focus-visible {
   word-break: break-word;
 }
 
-.metric-help {
-  color: var(--muted);
-  font-size: 12px;
-  margin-top: 6px;
-}
-
 /* Banners ----------------------------------------------------------------- */
 
 .banner {
@@ -235,12 +219,6 @@ tr:focus-visible {
   background: var(--ok-bg);
   color: var(--ok-text);
   border-color: #a8d8b5;
-}
-
-.banner-warning {
-  background: var(--warn-bg);
-  color: var(--warn-text);
-  border-color: #f0d38a;
 }
 
 /* Toolbar and controls ---------------------------------------------------- */
@@ -513,6 +491,7 @@ tbody tr:last-child td {
   font-size: 20px;
   line-height: 1;
   cursor: pointer;
+  color: var(--text);
 }
 
 .close-btn:hover {
@@ -550,6 +529,13 @@ tbody tr:last-child td {
 
 .detail-block > h3 {
   font-size: 15px;
+  margin-bottom: 8px;
+}
+
+.detail-block > summary {
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
   margin-bottom: 8px;
 }
 
@@ -620,6 +606,7 @@ tbody tr:last-child td {
 .diff.wrap .diff-text {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+  min-width: 0;
 }
 
 .diff-add {
@@ -654,20 +641,6 @@ tbody tr:last-child td {
 
 .change-head strong {
   font-size: 14px;
-}
-
-.change-values {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-  gap: 10px;
-}
-
-.change-values h4 {
-  margin: 0 0 4px;
-  font-size: 12px;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  color: var(--muted);
 }
 
 /* Settings ---------------------------------------------------------------- */

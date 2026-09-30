@@ -95,7 +95,6 @@ interface NumericField {
   max?: number;
   step?: number;
   unit?: string;
-  help: string;
 }
 
 interface DiffRow {
@@ -120,7 +119,6 @@ const NUMERIC_FIELDS: NumericField[] = [
     min: 1,
     step: 1,
     unit: "tokens",
-    help: "Requests estimated above this budget are compressed.",
   },
   {
     key: "keepTurns",
@@ -128,7 +126,6 @@ const NUMERIC_FIELDS: NumericField[] = [
     min: 1,
     step: 1,
     unit: "turns",
-    help: "Newest turns are preserved; no clipping.",
   },
   {
     key: "words",
@@ -136,7 +133,6 @@ const NUMERIC_FIELDS: NumericField[] = [
     min: 1,
     step: 1,
     unit: "words",
-    help: "Approximate word count requested from the summarizer.",
   },
   {
     key: "maxTokens",
@@ -144,7 +140,6 @@ const NUMERIC_FIELDS: NumericField[] = [
     min: 1,
     step: 1,
     unit: "tokens",
-    help: "DeepSeek output safety headroom; OpenAI subscription follows the system word-length hint.",
   },
 ];
 
@@ -234,6 +229,22 @@ function mergeHistory(
   return Array.from(byId.values()).sort((a, b) => b.id - a.id);
 }
 
+function urlParam(name: string): string | null {
+  return new URLSearchParams(window.location.search).get(name);
+}
+
+function setUrlParam(name: string, value: string | number | null) {
+  const params = new URLSearchParams(window.location.search);
+  if (value === null) params.delete(name);
+  else params.set(name, String(value));
+  const query = params.toString();
+  window.history.replaceState(
+    null,
+    "",
+    `${window.location.pathname}${query ? `?${query}` : ""}`,
+  );
+}
+
 function toNumberStrings(settings: Settings): Record<NumericKey, string> {
   const out = {} as Record<NumericKey, string>;
   for (const field of NUMERIC_FIELDS)
@@ -269,16 +280,21 @@ function buildSettingsPayload(
 /* App --------------------------------------------------------------------- */
 
 export default function App() {
-  const [tab, setTab] = useState<Tab>("overview");
+  const [tab, setTab] = useState<Tab>(() => {
+    const value = urlParam("tab");
+    return TABS.some((entry) => entry.id === value)
+      ? (value as Tab)
+      : "overview";
+  });
+  const selectTab = (next: Tab) => {
+    setTab(next);
+    setUrlParam("tab", next === "overview" ? null : next);
+  };
 
   return (
     <div className="app">
       <header className="app-header">
         <h1 className="app-title">Context Router</h1>
-        <p className="app-subtitle">
-          Compression dashboard served from /dashboard/ using the same-origin
-          API.
-        </p>
         <nav
           className="tabs"
           role="tablist"
@@ -297,7 +313,7 @@ export default function App() {
                       (event.key === "ArrowRight" ? 1 : -1) +
                       TABS.length) %
                     TABS.length;
-            setTab(TABS[next].id);
+            selectTab(TABS[next].id);
             document.getElementById(`tab-${TABS[next].id}`)?.focus();
           }}
         >
@@ -311,7 +327,7 @@ export default function App() {
               aria-controls={`panel-${entry.id}`}
               tabIndex={tab === entry.id ? 0 : -1}
               className="tab"
-              onClick={() => setTab(entry.id)}
+              onClick={() => selectTab(entry.id)}
             >
               {entry.label}
             </button>
@@ -353,20 +369,11 @@ export default function App() {
 
 /* Overview ---------------------------------------------------------------- */
 
-function Metric({
-  label,
-  value,
-  help,
-}: {
-  label: string;
-  value: string;
-  help: string;
-}) {
+function Metric({ label, value }: { label: string; value: string }) {
   return (
     <div className="card">
       <p className="metric-label">{label}</p>
       <p className="metric-value">{value}</p>
-      <p className="metric-help">{help}</p>
     </div>
   );
 }
@@ -415,35 +422,18 @@ function Overview() {
           <section className="section">
             <div className="section-head">
               <h2>Since restart</h2>
-              <p className="section-note">
-                In-memory counters for the current process.
-              </p>
             </div>
             <div className="cards">
-              <Metric
-                label="Requests"
-                value={formatNumber(stats.requests)}
-                help="Proxy and /compress requests handled since restart."
-              />
+              <Metric label="Requests" value={formatNumber(stats.requests)} />
               <Metric
                 label="Blocks compressed"
                 value={formatNumber(stats.blocks)}
-                help="Conversation blocks summarized since restart."
               />
-              <Metric
-                label="Cache hits"
-                value={formatNumber(stats.hits)}
-                help="Summaries reused from the SQLite cache since restart."
-              />
-              <Metric
-                label="Errors"
-                value={formatNumber(stats.errors)}
-                help="Summarizer failures since restart."
-              />
+              <Metric label="Cache hits" value={formatNumber(stats.hits)} />
+              <Metric label="Errors" value={formatNumber(stats.errors)} />
               <Metric
                 label="Cached summaries"
                 value={formatNumber(stats.cache.n)}
-                help="Rows currently stored in the compressed cache."
               />
             </div>
           </section>
@@ -451,41 +441,31 @@ function Overview() {
           <section className="section">
             <div className="section-head">
               <h2>Lifetime history (persisted)</h2>
-              <p className="section-note">
-                Aggregated from SQLite history and survives restarts. Token
-                counts are estimates (~).
-              </p>
             </div>
             <div className="cards">
               <Metric
                 label="Requests recorded"
                 value={formatNumber(history?.requests ?? 0)}
-                help="Compression requests written to history."
               />
               <Metric
                 label="Requests compacted"
                 value={formatNumber(history?.compacted ?? 0)}
-                help="Requests whose forwarded body differed from the original."
               />
               <Metric
                 label="History errors"
                 value={formatNumber(history?.errors ?? 0)}
-                help="History records that recorded an error."
               />
               <Metric
                 label="Estimated tokens before"
                 value={formatTokens(history?.before_tokens ?? 0)}
-                help="Sum of estimated original token counts."
               />
               <Metric
                 label="Estimated tokens after"
                 value={formatTokens(history?.after_tokens ?? 0)}
-                help="Sum of estimated forwarded token counts."
               />
               <Metric
                 label="Total processing time"
                 value={formatDuration(history?.duration_ms ?? 0)}
-                help="Time to compression completion or upstream headers; excludes streamed response time."
               />
             </div>
           </section>
@@ -506,7 +486,14 @@ function HistoryPanel() {
   const [next, setNext] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loadingOlder, setLoadingOlder] = useState(false);
-  const [detailId, setDetailId] = useState<number | null>(null);
+  const [detailId, setDetailId] = useState<number | null>(() => {
+    const value = Number(urlParam("request"));
+    return Number.isInteger(value) && value > 0 ? value : null;
+  });
+  const openDetail = (value: number | null) => {
+    setDetailId(value);
+    setUrlParam("request", value);
+  };
   const olderLoaded = useRef(false);
 
   useEffect(() => {
@@ -609,7 +596,7 @@ function HistoryPanel() {
   useEffect(() => {
     if (detailId === null) return;
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setDetailId(null);
+      if (event.key === "Escape") openDetail(null);
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
@@ -622,12 +609,6 @@ function HistoryPanel() {
           Failed to load history: {error}
         </div>
       )}
-
-      <div className="banner banner-warning">
-        History stores full request payloads locally in SQLite. Sensitive
-        content is retained with no automatic pruning. Recording starts at this
-        deployment; earlier unrecorded payloads cannot be recovered.
-      </div>
 
       <div className="toolbar">
         <div className="field">
@@ -656,8 +637,7 @@ function HistoryPanel() {
         </div>
         <p className="field-help">
           Showing {formatNumber(items.length)} of {formatNumber(total)} matching
-          records. Newest first; use “Load older” for anything beyond the first
-          page.
+          records.
         </p>
       </div>
 
@@ -690,9 +670,9 @@ function HistoryPanel() {
                   className={item.changed ? "row-changed" : undefined}
                   tabIndex={0}
                   aria-label={`Inspect history entry ${item.id}`}
-                  onClick={() => setDetailId(item.id)}
+                  onClick={() => openDetail(item.id)}
                   onKeyDown={(event) => {
-                    if (event.key === "Enter") setDetailId(item.id);
+                    if (event.key === "Enter") openDetail(item.id);
                   }}
                 >
                   <td className="nowrap-cell">{formatTime(item.created_at)}</td>
@@ -742,7 +722,7 @@ function HistoryPanel() {
       </div>
 
       {detailId !== null && (
-        <HistoryDetailModal id={detailId} onClose={() => setDetailId(null)} />
+        <HistoryDetailModal id={detailId} onClose={() => openDetail(null)} />
       )}
     </>
   );
@@ -760,7 +740,7 @@ function HistoryDetailModal({
   const [detail, setDetail] = useState<HistoryDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-  const [wrap, setWrap] = useState(false);
+  const [wrap, setWrap] = useState(true);
   const dialog = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const previous = document.activeElement as HTMLElement | null;
@@ -969,49 +949,31 @@ function HistoryDetailModal({
                           <span className="badge badge-warn">fallback</span>
                         )}
                       </div>
-                      <div className="change-values">
-                        <div>
-                          <h4>Before</h4>
-                          <pre className={`json-block ${wrap ? "wrap" : ""}`}>
-                            {pretty(change.before)}
-                          </pre>
-                        </div>
-                        <div>
-                          <h4>After</h4>
-                          <pre className={`json-block ${wrap ? "wrap" : ""}`}>
-                            {pretty(change.after)}
-                          </pre>
-                        </div>
-                      </div>
+                      <DiffView
+                        original={change.before}
+                        compressed={change.after}
+                        wrap={wrap}
+                      />
                     </div>
                   ))
                 )}
               </section>
 
-              <section className="detail-block">
-                <h3>Full original JSON</h3>
+              <details className="detail-block">
+                <summary>Full original JSON</summary>
                 <pre className={`json-block ${wrap ? "wrap" : ""}`}>
                   {detail.original === null ? "null" : pretty(detail.original)}
                 </pre>
-              </section>
+              </details>
 
-              <section className="detail-block">
-                <h3>Full forwarded JSON</h3>
+              <details className="detail-block">
+                <summary>Full forwarded JSON</summary>
                 <pre className={`json-block ${wrap ? "wrap" : ""}`}>
                   {detail.compressed === null
                     ? "null"
                     : pretty(detail.compressed)}
                 </pre>
-              </section>
-
-              <section className="detail-block">
-                <h3>Unified diff (complete)</h3>
-                <DiffView
-                  original={detail.original}
-                  compressed={detail.compressed}
-                  wrap={wrap}
-                />
-              </section>
+              </details>
             </>
           )}
         </div>
@@ -1036,20 +998,16 @@ function DiffView({
   wrap: boolean;
 }) {
   if (
-    original === null ||
-    original === undefined ||
-    compressed === null ||
-    compressed === undefined
+    (original === null || original === undefined) &&
+    (compressed === null || compressed === undefined)
   ) {
-    return (
-      <p className="muted">
-        Diff unavailable: this record has no stored original or forwarded
-        payload.
-      </p>
-    );
+    return <p className="muted">No stored payload for this change.</p>;
   }
 
-  const parts = diffLines(pretty(original), pretty(compressed));
+  const parts = diffLines(
+    original === null || original === undefined ? "" : pretty(original),
+    compressed === null || compressed === undefined ? "" : pretty(compressed),
+  );
   const rows: DiffRow[] = [];
   let oldNo = 1;
   let newNo = 1;
@@ -1182,12 +1140,6 @@ function SettingsPanel() {
       )}
       {notice && <div className="banner banner-ok">{notice}</div>}
 
-      <div className="banner banner-warning">
-        Settings are persisted in SQLite and take effect for future requests.
-        Credentials, upstream URLs, routes, and the listen address cannot be
-        edited here; change those in the .env file.
-      </div>
-
       {!loaded || !numbers || !prompts || !model ? (
         <p className="muted">Loading settings…</p>
       ) : (
@@ -1206,9 +1158,6 @@ function SettingsPanel() {
                   </option>
                 ))}
               </select>
-              <span className="field-help">
-                Summarizer used for block compression.
-              </span>
             </div>
             {NUMERIC_FIELDS.map((field) => (
               <div className="field" key={field.key}>
@@ -1267,8 +1216,7 @@ function SettingsPanel() {
                 )}
                 <span className="field-help">
                   Range {field.min}
-                  {field.max !== undefined ? `–${field.max}` : "+"}.{" "}
-                  {field.help}
+                  {field.max !== undefined ? `–${field.max}` : "+"}.
                 </span>
               </div>
             ))}
@@ -1290,12 +1238,6 @@ function SettingsPanel() {
                   )
                 }
               />
-              <span className="field-help">
-                System prompt used when summarizing conversation blocks. The
-                word hint is appended to the system prompt automatically. Each
-                uncached block gets up to three 10-second attempts. All eligible
-                blocks launch together; downstream waits for them.
-              </span>
             </div>
           </div>
 
@@ -1316,10 +1258,6 @@ function SettingsPanel() {
             >
               Reset to .env defaults
             </button>
-            <p className="field-help">
-              Nothing is saved automatically. Reset fills the form with the .env
-              defaults without persisting them.
-            </p>
           </div>
         </>
       )}

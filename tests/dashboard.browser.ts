@@ -86,6 +86,7 @@ try {
     "true",
   );
   await page.getByRole("tab", { name: "History", exact: true }).click();
+  assert((await page.url()).includes("tab=history"));
   await page
     .getByText("Showing 50 of 56 matching records.", { exact: false })
     .waitFor();
@@ -97,21 +98,42 @@ try {
     .getByRole("row", { name: "Inspect history entry 56", exact: true })
     .click();
   const dialog = page.getByRole("dialog");
-  await dialog
-    .getByRole("heading", { name: "Unified diff (complete)" })
-    .waitFor();
+  await dialog.getByRole("heading", { name: "Changes (1)" }).waitFor();
   const diff = dialog.getByRole("table", { name: "Unified diff" });
   assert((await diff.textContent())!.includes("ORIGINAL_END_SENTINEL"));
   assert((await diff.textContent())!.includes("SUMMARY_END_SENTINEL"));
   assert((await diff.locator(".diff-add").count()) > 0);
   assert((await diff.locator(".diff-del").count()) > 0);
   assert.equal(await dialog.locator(".change-card").count(), 1);
-  await dialog.getByLabel("Wrap long lines").check();
+  assert(await dialog.getByLabel("Wrap long lines").isChecked());
+  assert((await page.url()).includes("request=56"));
+  if (process.env.SCREENSHOT_PATH)
+    await page.screenshot({ path: `${process.env.SCREENSHOT_PATH}.modal.png` });
+  await page.reload();
+  await page.getByRole("dialog").waitFor();
+  await page
+    .getByRole("dialog")
+    .getByRole("heading", { name: "Changes (1)" })
+    .waitFor();
+  assert.equal(
+    await page
+      .getByRole("tab", { name: "History", exact: true })
+      .getAttribute("aria-selected"),
+    "true",
+  );
   const downloadEvent = page.waitForEvent("download");
-  await dialog.getByRole("button", { name: "Download full JSON" }).click();
+  await page
+    .getByRole("dialog")
+    .getByRole("button", { name: "Download full JSON" })
+    .click();
   assert.equal((await downloadEvent).suggestedFilename(), "history-56.json");
   await page.keyboard.press("Escape");
   assert.equal(await page.getByRole("dialog").count(), 0);
+  assert(!page.url().includes("request="));
+  await page.getByRole("button", { name: "Load older" }).click();
+  await page
+    .getByText("Showing 56 of 56 matching records.", { exact: false })
+    .waitFor();
   for (let i = 0; i < 60; i++)
     insert.run(Date.now(), "POST /compress", `burst-${i}`, payload, payload);
   await page
@@ -193,7 +215,7 @@ try {
       fullPage: false,
     });
   console.log(
-    "Dashboard browser check: metrics, full history, full diff, download, settings, mobile layout passed",
+    "Dashboard browser check: metrics, history, per-change diffs, full verbatim JSON, URL state, download, settings, mobile layout passed",
   );
 } finally {
   await browser.close();
