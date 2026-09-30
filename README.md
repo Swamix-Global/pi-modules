@@ -1,12 +1,12 @@
 # ctx-engine
 
 Loopback compression proxy using **Bun + Elysia + native `bun:sqlite`**.
-Runtime: `backend/main.ts`, `backend/utils.ts`, `backend/settings.ts`. No Python.
+Runtime: `main.ts`, `utils.ts`, `settings.ts` in the repository root. No Python.
 
 ```sh
 bun install --frozen-lockfile
 bun run check
-bun test backend
+bun test tests
 bun start
 curl -fsS http://127.0.0.1:4141/health
 ```
@@ -24,4 +24,4 @@ Configure the condenser's OpenAI-compatible URL/model and either its API key or 
 
 The old dashboard, accounts, provider probes, billing and master-session CLI are intentionally removed. This is a loopback-only compression backend, not a public multi-tenant service. Existing SQLite tables are preserved; the rewrite uses a new `compressed` table.
 
-The running Python service is **not** replaced automatically. To deploy, change its `WorkingDirectory` to this repository and `ExecStart` to the absolute Bun path followed by `run backend/main.ts`, then restart and verify `/health`.
+The running Python service is **not** replaced automatically. To deploy, change its `WorkingDirectory` to this repository and `ExecStart` to the absolute Bun path followed by `run main.ts`, then restart and verify `/health`.

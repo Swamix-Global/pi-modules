@@ -1,1 +1,1 @@
-{"compilerOptions":{"target":"ESNext","module":"Preserve","moduleResolution":"bundler","types":["bun"],"skipLibCheck":true,"noEmit":true,"allowImportingTsExtensions":true},"include":["backend/**/*.ts"]}
+{"compilerOptions":{"target":"ESNext","module":"Preserve","moduleResolution":"bundler","types":["bun"],"skipLibCheck":true,"noEmit":true,"allowImportingTsExtensions":true},"include":["*.ts","tests/**/*.ts"]}

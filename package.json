@@ -3,8 +3,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "bun run backend/main.ts",
-    "test": "bun test backend",
+    "start": "bun run main.ts",
+    "test": "bun test tests",
     "check": "tsc --noEmit"
   },
   "dependencies": {
