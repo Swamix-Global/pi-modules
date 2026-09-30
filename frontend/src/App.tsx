@@ -1,5 +1,28 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { diffLines } from "diff";
+import {
+  useReactTable,
+  getCoreRowModel,
+  flexRender,
+  type ColumnDef,
+} from "@tanstack/react-table";
+import {
+  Activity,
+  Clock,
+  Cpu,
+  CheckCircle2,
+  AlertCircle,
+  Download,
+  Search,
+  Layers,
+  HardDrive,
+  FileText,
+  X,
+  Sliders,
+  BarChart3,
+  History as HistoryIcon,
+  Zap,
+} from "lucide-react";
 
 /* Types ------------------------------------------------------------------- */
 
@@ -106,10 +129,10 @@ interface DiffRow {
 
 /* Constants --------------------------------------------------------------- */
 
-const TABS: { id: Tab; label: string }[] = [
-  { id: "overview", label: "Overview" },
-  { id: "history", label: "History" },
-  { id: "settings", label: "Settings" },
+const TABS: { id: Tab; label: string; icon: typeof BarChart3 }[] = [
+  { id: "overview", label: "Overview", icon: BarChart3 },
+  { id: "history", label: "History", icon: HistoryIcon },
+  { id: "settings", label: "Settings", icon: Sliders },
 ];
 
 const NUMERIC_FIELDS: NumericField[] = [
@@ -294,7 +317,12 @@ export default function App() {
   return (
     <div className="app">
       <header className="app-header">
-        <h1 className="app-title">Context Router</h1>
+        <h1
+          className="app-title"
+          style={{ display: "flex", alignItems: "center", gap: "8px" }}
+        >
+          <Zap size={22} style={{ color: "var(--primary)" }} /> Context Router
+        </h1>
         <nav
           className="tabs"
           role="tablist"
@@ -317,21 +345,30 @@ export default function App() {
             document.getElementById(`tab-${TABS[next].id}`)?.focus();
           }}
         >
-          {TABS.map((entry) => (
-            <button
-              key={entry.id}
-              id={`tab-${entry.id}`}
-              type="button"
-              role="tab"
-              aria-selected={tab === entry.id}
-              aria-controls={`panel-${entry.id}`}
-              tabIndex={tab === entry.id ? 0 : -1}
-              className="tab"
-              onClick={() => selectTab(entry.id)}
-            >
-              {entry.label}
-            </button>
-          ))}
+          {TABS.map((entry) => {
+            const Icon = entry.icon;
+            return (
+              <button
+                key={entry.id}
+                id={`tab-${entry.id}`}
+                type="button"
+                role="tab"
+                aria-selected={tab === entry.id}
+                aria-controls={`panel-${entry.id}`}
+                tabIndex={tab === entry.id ? 0 : -1}
+                className="tab"
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: "6px",
+                }}
+                onClick={() => selectTab(entry.id)}
+              >
+                <Icon size={16} />
+                {entry.label}
+              </button>
+            );
+          })}
         </nav>
       </header>
 
@@ -369,10 +406,34 @@ export default function App() {
 
 /* Overview ---------------------------------------------------------------- */
 
-function Metric({ label, value }: { label: string; value: string }) {
+function Metric({
+  label,
+  value,
+  icon: Icon,
+}: {
+  label: string;
+  value: string;
+  icon?: typeof Activity;
+}) {
   return (
-    <div className="card">
-      <p className="metric-label">{label}</p>
+    <div
+      className="card"
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        justifyContent: "space-between",
+      }}
+    >
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+        }}
+      >
+        <p className="metric-label">{label}</p>
+        {Icon && <Icon size={18} style={{ color: "var(--muted)" }} />}
+      </div>
       <p className="metric-value">{value}</p>
     </div>
   );
@@ -424,16 +485,30 @@ function Overview() {
               <h2>Since restart</h2>
             </div>
             <div className="cards">
-              <Metric label="Requests" value={formatNumber(stats.requests)} />
+              <Metric
+                label="Requests"
+                value={formatNumber(stats.requests)}
+                icon={Activity}
+              />
               <Metric
                 label="Blocks compressed"
                 value={formatNumber(stats.blocks)}
+                icon={Cpu}
               />
-              <Metric label="Cache hits" value={formatNumber(stats.hits)} />
-              <Metric label="Errors" value={formatNumber(stats.errors)} />
+              <Metric
+                label="Cache hits"
+                value={formatNumber(stats.hits)}
+                icon={Zap}
+              />
+              <Metric
+                label="Errors"
+                value={formatNumber(stats.errors)}
+                icon={AlertCircle}
+              />
               <Metric
                 label="Cached summaries"
                 value={formatNumber(stats.cache.n)}
+                icon={HardDrive}
               />
             </div>
           </section>
@@ -446,26 +521,32 @@ function Overview() {
               <Metric
                 label="Requests recorded"
                 value={formatNumber(history?.requests ?? 0)}
+                icon={HistoryIcon}
               />
               <Metric
                 label="Requests compacted"
                 value={formatNumber(history?.compacted ?? 0)}
+                icon={Layers}
               />
               <Metric
                 label="History errors"
                 value={formatNumber(history?.errors ?? 0)}
+                icon={AlertCircle}
               />
               <Metric
                 label="Estimated tokens before"
                 value={formatTokens(history?.before_tokens ?? 0)}
+                icon={FileText}
               />
               <Metric
                 label="Estimated tokens after"
                 value={formatTokens(history?.after_tokens ?? 0)}
+                icon={CheckCircle2}
               />
               <Metric
                 label="Total processing time"
                 value={formatDuration(history?.duration_ms ?? 0)}
+                icon={Clock}
               />
             </div>
           </section>
@@ -602,6 +683,81 @@ function HistoryPanel() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [detailId]);
 
+  const columns = useRef<ColumnDef<HistoryItem>[]>([
+    {
+      accessorKey: "created_at",
+      header: "When",
+      cell: (info) => (
+        <span className="nowrap-cell">
+          {formatTime(info.getValue<number>())}
+        </span>
+      ),
+    },
+    {
+      accessorKey: "route",
+      header: "Route",
+      cell: (info) => <span className="mono">{info.getValue<string>()}</span>,
+    },
+    {
+      accessorKey: "model",
+      header: "Model",
+      cell: (info) => <span className="mono">{info.getValue<string>()}</span>,
+    },
+    {
+      accessorKey: "status",
+      header: "Status",
+      cell: (info) => info.getValue<number>() || "pending",
+    },
+    {
+      accessorKey: "changed",
+      header: "Changed",
+      cell: (info) => (
+        <span
+          className={
+            info.getValue<boolean>() ? "badge badge-ok" : "badge badge-muted"
+          }
+        >
+          {info.getValue<boolean>() ? "yes" : "no"}
+        </span>
+      ),
+    },
+    {
+      id: "tokens",
+      header: "Tokens (est.)",
+      cell: ({ row }) => (
+        <span className="nowrap-cell">
+          {formatTokens(row.original.before_tokens)} →{" "}
+          {formatTokens(row.original.after_tokens)}
+        </span>
+      ),
+    },
+    {
+      accessorKey: "duration_ms",
+      header: "Duration",
+      cell: (info) => (
+        <span className="nowrap-cell">
+          {formatDuration(info.getValue<number>())}
+        </span>
+      ),
+    },
+    {
+      accessorKey: "error",
+      header: "Error",
+      cell: (info) =>
+        info.getValue<string | null>() ? (
+          <span className="badge badge-error">error</span>
+        ) : (
+          "—"
+        ),
+    },
+  ]).current;
+
+  const table = useReactTable({
+    data: items,
+    columns,
+    getCoreRowModel: getCoreRowModel(),
+  });
+
   return (
     <>
       {error && (
@@ -613,13 +769,31 @@ function HistoryPanel() {
       <div className="toolbar">
         <div className="field">
           <label htmlFor="history-search">Search route or model</label>
-          <input
-            id="history-search"
-            type="search"
-            placeholder="e.g. openai/gpt or claude"
-            value={search}
-            onChange={(event) => setSearch(event.target.value)}
-          />
+          <div
+            style={{
+              position: "relative",
+              display: "flex",
+              alignItems: "center",
+            }}
+          >
+            <Search
+              size={16}
+              style={{
+                position: "absolute",
+                left: "10px",
+                color: "var(--muted)",
+                pointerEvents: "none",
+              }}
+            />
+            <input
+              id="history-search"
+              type="search"
+              style={{ paddingLeft: "32px" }}
+              placeholder="e.g. openai/gpt or claude"
+              value={search}
+              onChange={(event) => setSearch(event.target.value)}
+            />
+          </div>
         </div>
         <div className="field">
           <label htmlFor="history-changed">Changed</label>
@@ -645,65 +819,53 @@ function HistoryPanel() {
         <table>
           <caption className="sr-only">Compression history</caption>
           <thead>
-            <tr>
-              <th scope="col">When</th>
-              <th scope="col">Route</th>
-              <th scope="col">Model</th>
-              <th scope="col">Status</th>
-              <th scope="col">Changed</th>
-              <th scope="col">Tokens (est.)</th>
-              <th scope="col">Duration</th>
-              <th scope="col">Error</th>
-            </tr>
+            {table.getHeaderGroups().map((headerGroup) => (
+              <tr key={headerGroup.id}>
+                {headerGroup.headers.map((header) => (
+                  <th key={header.id} scope="col">
+                    {header.isPlaceholder
+                      ? null
+                      : flexRender(
+                          header.column.columnDef.header,
+                          header.getContext(),
+                        )}
+                  </th>
+                ))}
+              </tr>
+            ))}
           </thead>
           <tbody>
-            {items.length === 0 ? (
+            {table.getRowModel().rows.length === 0 ? (
               <tr>
                 <td colSpan={8} className="empty-state">
                   No history records match the current filters.
                 </td>
               </tr>
             ) : (
-              items.map((item) => (
-                <tr
-                  key={item.id}
-                  className={item.changed ? "row-changed" : undefined}
-                  tabIndex={0}
-                  aria-label={`Inspect history entry ${item.id}`}
-                  onClick={() => openDetail(item.id)}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter") openDetail(item.id);
-                  }}
-                >
-                  <td className="nowrap-cell">{formatTime(item.created_at)}</td>
-                  <td className="mono">{item.route}</td>
-                  <td className="mono">{item.model}</td>
-                  <td>{item.status || "pending"}</td>
-                  <td>
-                    <span
-                      className={
-                        item.changed ? "badge badge-ok" : "badge badge-muted"
-                      }
-                    >
-                      {item.changed ? "yes" : "no"}
-                    </span>
-                  </td>
-                  <td className="nowrap-cell">
-                    {formatTokens(item.before_tokens)} →{" "}
-                    {formatTokens(item.after_tokens)}
-                  </td>
-                  <td className="nowrap-cell">
-                    {formatDuration(item.duration_ms)}
-                  </td>
-                  <td>
-                    {item.error ? (
-                      <span className="badge badge-error">error</span>
-                    ) : (
-                      "—"
-                    )}
-                  </td>
-                </tr>
-              ))
+              table.getRowModel().rows.map((row) => {
+                const item = row.original;
+                return (
+                  <tr
+                    key={item.id}
+                    className={item.changed ? "row-changed" : undefined}
+                    tabIndex={0}
+                    aria-label={`Inspect history entry ${item.id}`}
+                    onClick={() => openDetail(item.id)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") openDetail(item.id);
+                    }}
+                  >
+                    {row.getVisibleCells().map((cell) => (
+                      <td key={cell.id}>
+                        {flexRender(
+                          cell.column.columnDef.cell,
+                          cell.getContext(),
+                        )}
+                      </td>
+                    ))}
+                  </tr>
+                );
+              })
             )}
           </tbody>
         </table>
@@ -846,8 +1008,13 @@ function HistoryDetailModal({
             className="close-btn"
             aria-label="Close"
             onClick={onClose}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+            }}
           >
-            ×
+            <X size={18} />
           </button>
         </div>
 
@@ -914,7 +1081,13 @@ function HistoryDetailModal({
                   className="btn"
                   onClick={download}
                   disabled={!detail}
+                  style={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: "6px",
+                  }}
                 >
+                  <Download size={15} />
                   Download full JSON
                 </button>
               </div>
