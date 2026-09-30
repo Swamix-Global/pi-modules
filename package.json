@@ -1,0 +1,17 @@
+{
+  "name": "ctx-engine",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun run backend/main.ts",
+    "test": "bun test backend",
+    "check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "elysia": "^1.4.30"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.2",
+    "typescript": "^7.0.2"
+  }
+}
