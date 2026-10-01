@@ -1,5 +1,7 @@
 import { Elysia } from "elysia";
 import { Database } from "bun:sqlite";
+import { drizzle } from "drizzle-orm/bun-sqlite";
+import { type SQL } from "drizzle-orm";
 import { mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { request as http, type IncomingMessage } from "node:http";
@@ -12,7 +14,15 @@ import {
   zstdDecompressSync,
 } from "node:zlib";
 import { S } from "./settings.ts";
-import { json, hash, tokens, turns, transcript, type Item } from "./utils.ts";
+import {
+  json,
+  hash,
+  tokens,
+  turns,
+  transcript,
+  text,
+  type Item,
+} from "./utils.ts";
 
 import { condense, ATTEMPT_TIMEOUT_MS, MAX_ATTEMPTS } from "./condenser.ts";
 import { CacheWarmer, warmPlan, warmUsage, type WarmPlan } from "./warmer.ts";
@@ -48,8 +58,52 @@ export const warmer = new CacheWarmer(async (plan: WarmPlan, signal) => {
 
 type Config = typeof S;
 if (S.db !== ":memory:") mkdirSync(dirname(S.db), { recursive: true });
-export const db = new Database(S.db, { create: true });
-export function initCache(database: Database) {
+export const sqlite = new Database(S.db, { create: true });
+export const orm = drizzle(sqlite);
+
+export function db_man<T = any>(
+  query: string,
+  ...params: any[]
+): {
+  get: (...args: any[]) => T | null;
+  all: (...args: any[]) => T[];
+  run: (...args: any[]) => {
+    lastInsertRowid: number | bigint;
+    changes: number;
+  };
+  stmt: ReturnType<typeof sqlite.query>;
+};
+export function db_man<T = any>(
+  query: SQL,
+): {
+  get: () => T;
+  all: () => T[];
+  run: () => any;
+};
+export function db_man<T = any>(query: string | SQL, ...params: any[]): any {
+  if (typeof query === "string") {
+    const stmt = sqlite.query<T, any[]>(query);
+    return {
+      get: (...args: any[]) => stmt.get(...(args.length ? args : params)),
+      all: (...args: any[]) => stmt.all(...(args.length ? args : params)),
+      run: (...args: any[]) => stmt.run(...(args.length ? args : params)),
+      stmt,
+    };
+  }
+  return {
+    get: () => orm.get<T>(query),
+    all: () => orm.all<T>(query),
+    run: () => orm.run(query),
+  };
+}
+db_man.exec = (statement: string) => sqlite.exec(statement);
+db_man.close = () => sqlite.close();
+db_man.transaction = <T>(fn: () => T) => sqlite.transaction(fn);
+db_man.orm = orm;
+db_man.sqlite = sqlite;
+export const db = sqlite;
+
+export function initCache(database: Database = sqlite) {
   database.exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;`);
   const cols = database
     .query<{ name: string; pk: number }, []>("PRAGMA table_info(compressed)")
@@ -88,8 +142,8 @@ export function initCache(database: Database) {
     "CREATE INDEX IF NOT EXISTS compressed_output_key ON compressed(output_hash)",
   );
 }
-initCache(db);
-db.exec(`
+initCache(sqlite);
+db_man.exec(`
   CREATE TABLE IF NOT EXISTS dashboard_settings (
     id INTEGER PRIMARY KEY CHECK(id = 1), value TEXT NOT NULL
   );
@@ -103,18 +157,10 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS history_created ON history(created_at);
 `);
-db.query(
+db_man(
   "UPDATE history SET status=502,error='router stopped before completion',duration_ms=max(0,?-created_at) WHERE status=0",
-).run(Date.now());
-const cached = db.query<{ output: string }, [string]>(
-  "SELECT output FROM compressed WHERE key=?",
-);
-const rendered = db.query(
-  "SELECT 1 FROM compressed WHERE output_hash=? LIMIT 1",
-);
-const save = db.query(
-  "INSERT OR IGNORE INTO compressed(key, output, output_hash, created_at) VALUES (?,?,?,?)",
-);
+  Date.now(),
+).run();
 const stats = {
   requests: 0,
   blocks: 0,
@@ -172,11 +218,9 @@ function validateSettings(value: unknown): Record<string, number | string> {
   }
   return value as Record<string, number | string>;
 }
-const savedSettings = db
-  .query<{ value: string }, []>(
-    "SELECT value FROM dashboard_settings WHERE id=1",
-  )
-  .get();
+const savedSettings = db_man<{ value: string }>(
+  "SELECT value FROM dashboard_settings WHERE id=1",
+).get();
 if (savedSettings) {
   // Remove retired controls from persisted settings before validating the current schema.
   const value = JSON.parse(savedSettings.value);
@@ -186,9 +230,10 @@ if (savedSettings) {
     ),
   );
   Object.assign(S, validateSettings(retained));
-  db.query("UPDATE dashboard_settings SET value=? WHERE id=1").run(
+  db_man(
+    "UPDATE dashboard_settings SET value=? WHERE id=1",
     json(currentSettings()),
-  );
+  ).run();
 }
 
 function managementRequest(request: Request) {
@@ -218,14 +263,13 @@ type Trace = {
   changes: Item[];
 };
 function rememberOriginal(trace: Trace) {
-  db.query(
+  db_man(
     "UPDATE history SET original=?,model=?,before_tokens=? WHERE id=?",
-  ).run(
     json(trace.original),
     typeof trace.original?.model === "string" ? trace.original.model : "",
     tokens(trace.original),
     trace.id,
-  );
+  ).run();
 }
 async function tracked(
   request: Request,
@@ -239,11 +283,12 @@ async function tracked(
     changed: false,
     changes: [],
   };
-  const inserted = db
-    .query(
-      "INSERT INTO history(created_at,route,model,status,changed,before_tokens,after_tokens,duration_ms,error,original,compressed,changes) VALUES(?,?,?,0,0,0,0,0,NULL,NULL,NULL,'[]')",
-    )
-    .run(start, `${request.method} ${new URL(request.url).pathname}`, "");
+  const inserted = db_man(
+    "INSERT INTO history(created_at,route,model,status,changed,before_tokens,after_tokens,duration_ms,error,original,compressed,changes) VALUES(?,?,?,0,0,0,0,0,NULL,NULL,NULL,'[]')",
+    start,
+    `${request.method} ${new URL(request.url).pathname}`,
+    "",
+  ).run();
   trace.id = inserted.lastInsertRowid;
   stats.requests++;
   let status = 0,
@@ -262,9 +307,8 @@ async function tracked(
           : "context router upstream failure";
     throw cause;
   } finally {
-    db.query(
+    db_man(
       "UPDATE history SET model=?,status=?,changed=?,before_tokens=?,after_tokens=?,duration_ms=?,error=?,original=?,compressed=?,changes=? WHERE id=?",
-    ).run(
       typeof trace.original?.model === "string" ? trace.original.model : "",
       status,
       Number(trace.changed),
@@ -276,7 +320,7 @@ async function tracked(
       trace.compressed === null ? null : json(trace.compressed),
       json(trace.changes),
       inserted.lastInsertRowid,
-    );
+    ).run();
   }
 }
 function listHistory(request: Request) {
@@ -298,15 +342,18 @@ function listHistory(request: Request) {
   const where =
     "(?='all' OR changed=?) AND (instr(lower(route),lower(?))>0 OR instr(lower(model),lower(?))>0)";
   const filter = [changed, Number(changed === "yes"), search, search] as const;
-  const items = db
-    .query(
-      `SELECT id,created_at,route,model,status,changed,before_tokens,after_tokens,duration_ms,error FROM history WHERE ${where} AND (? IS NULL OR id<?) ORDER BY id DESC LIMIT ?`,
-    )
-    .all(...filter, before, before, limit + 1) as Item[];
+  const items = db_man(
+    `SELECT id,created_at,route,model,status,changed,before_tokens,after_tokens,duration_ms,error FROM history WHERE ${where} AND (? IS NULL OR id<?) ORDER BY id DESC LIMIT ?`,
+    ...filter,
+    before,
+    before,
+    limit + 1,
+  ).all() as Item[];
   const total = (
-    db
-      .query(`SELECT count(*) n FROM history WHERE ${where}`)
-      .get(...filter) as { n: number }
+    db_man(
+      `SELECT count(*) n FROM history WHERE ${where}`,
+      ...filter,
+    ).get() as { n: number }
   ).n;
   const next = items.length > limit ? items[limit - 1].id : null;
   return response({ items: items.slice(0, limit), total, next });
@@ -321,25 +368,28 @@ const response = (
     headers: { "Content-Type": "application/json", ...headers },
   });
 
-async function summarize(
-  source: any,
-  input: string,
-  outputHash: (output: string) => string,
-  config: Config,
-): Promise<string | null> {
-  const S = config;
-  const key = `${hash(source)}-${S.model}-${S.maxTokens}`;
-  const hit = cached.get(key);
+export async function ctx_man(
+  msgs_block: Item[],
+  model: string = S.model,
+  outlen: number = S.maxTokens,
+): Promise<string> {
+  const key = `${hash(msgs_block)}-${model}-${outlen}`;
+  const hit = db_man<{ output: string }>(
+    "SELECT output FROM compressed WHERE key=?",
+    key,
+  ).get();
   if (hit) {
     stats.hits++;
     return hit.output;
   }
+  const input = transcript(msgs_block);
+  const config = { ...S, model: model as any, maxTokens: outlen };
+
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
     let output: string;
     try {
-      // Bound the entire attempt, including OAuth and response-body reads.
       const deadline = new Promise<never>((_, reject) => {
         timer = setTimeout(() => {
           controller.abort();
@@ -353,21 +403,38 @@ async function summarize(
     } catch {
       if (attempt === MAX_ATTEMPTS) {
         stats.errors++;
-        // Never log credentials, request text or provider response bodies.
         console.error(
-          `CRITICAL: condenser exhausted ${MAX_ATTEMPTS} attempts (${ATTEMPT_TIMEOUT_MS}ms each); model=${S.model} message=${hash(source)}`,
+          `CRITICAL: condenser exhausted ${MAX_ATTEMPTS} attempts (${ATTEMPT_TIMEOUT_MS}ms each); model=${model} message=${hash(msgs_block)}`,
         );
       }
       continue;
     } finally {
       clearTimeout(timer);
     }
-    save.run(key, output, outputHash(output), Date.now() / 1000);
+    const summaryHash = hash([{ role: "user", content: output }]);
+    db_man(
+      "INSERT OR IGNORE INTO compressed(key, output, output_hash, created_at) VALUES (?,?,?,?)",
+      key,
+      output,
+      summaryHash,
+      Date.now() / 1000,
+    ).run();
     stats.blocks++;
     return output;
   }
-  return null;
+
+  // Raise downstream when fallback fails - mention user msg verbatim!
+  const userItem = msgs_block.find((m) => m.role === "user");
+  const userMsg =
+    typeof userItem?.content === "string"
+      ? userItem.content
+      : Array.isArray(userItem?.content)
+        ? userItem.content.map((p: any) => p?.text ?? text(p)).join("\n")
+        : text(userItem?.content ?? msgs_block);
+
+  throw new HttpError(502, `Summarization failed for turn: "${userMsg}"`);
 }
+
 export async function compressBody(
   original: Item,
   changes: Item[] = [],
@@ -399,30 +466,31 @@ export async function compressBody(
     const completed = Math.max(0, groups.length - S.keepTurns);
     await Promise.all(
       groups.slice(0, completed).map(async (block, index) => {
-        if (rendered.get(hash(block))) {
+        if (
+          db_man(
+            "SELECT 1 FROM compressed WHERE output_hash=? LIMIT 1",
+            hash(block),
+          ).get()
+        ) {
           stats.hits++;
           return;
         }
-        const key = `${hash(block)}-${config.model}-${config.maxTokens}`;
-        const wasCached = !!cached.get(key);
-        const output = await summarize(
-          block,
-          transcript(block),
-          (output) => hash([summaryItem(output)]),
-          config,
-        );
-        if (output) {
-          groups[index] = [summaryItem(output)];
-          changes.push({
-            kind: "block",
-            source_hash: hash(block),
-            before: structuredClone(block),
-            after: groups[index],
-            cached: wasCached,
-            fallback: false,
-          });
-          changed = true;
-        }
+        const cacheKey = `${hash(block)}-${config.model}-${config.maxTokens}`;
+        const wasCached = !!db_man(
+          "SELECT output FROM compressed WHERE key=?",
+          cacheKey,
+        ).get();
+        const output = await ctx_man(block, config.model, config.maxTokens);
+        groups[index] = [summaryItem(output)];
+        changes.push({
+          kind: "block",
+          source_hash: hash(block),
+          before: structuredClone(block),
+          after: groups[index],
+          cached: wasCached,
+          fallback: false,
+        });
+        changed = true;
       }),
     );
   }
@@ -632,7 +700,11 @@ async function forwardProxy(
       target,
       request,
       trace.compressed,
-      (digest) => !!rendered.get(digest),
+      (digest) =>
+        !!db_man(
+          "SELECT 1 FROM compressed WHERE output_hash=? LIMIT 1",
+          digest,
+        ).get(),
     );
     if (plan) finishWarm = warmer.watch(plan, receivedAt);
   }
@@ -696,30 +768,6 @@ function providerProxy({
 }
 const codexProxy = ({ request }: { request: Request }) =>
   proxy(request, S.upstream, "/codex/responses");
-const timelineQuery = db.query<
-  {
-    time: number;
-    requests: number;
-    compacted: number;
-    errors: number;
-    before_tokens: number;
-    after_tokens: number;
-  },
-  [number]
->(`
-  SELECT
-    ((created_at / 300000) * 300000) AS time,
-    count(*) AS requests,
-    coalesce(sum(changed), 0) AS compacted,
-    coalesce(sum(status >= 400), 0) AS errors,
-    coalesce(sum(before_tokens), 0) AS before_tokens,
-    coalesce(sum(after_tokens), 0) AS after_tokens
-  FROM history
-  WHERE created_at >= ?
-  GROUP BY time
-  ORDER BY time ASC
-`);
-
 export const app = new Elysia()
   .onError(({ error, code }) => {
     if (error instanceof HttpError)
@@ -752,15 +800,26 @@ export const app = new Elysia()
       now,
       ...stats,
       warmer: warmer.stats,
-      history: db
-        .query(
-          `SELECT count(*) requests, coalesce(sum(changed),0) compacted,
+      history: db_man(
+        `SELECT count(*) requests, coalesce(sum(changed),0) compacted,
         coalesce(sum(status>=400),0) errors, coalesce(sum(before_tokens),0) before_tokens,
         coalesce(sum(after_tokens),0) after_tokens, coalesce(sum(duration_ms),0) duration_ms FROM history`,
-        )
-        .get(),
-      cache: db.query("SELECT count(*) AS n FROM compressed").get(),
-      timeline: timelineQuery.all(now - 86_400_000),
+      ).get(),
+      cache: db_man("SELECT count(*) AS n FROM compressed").get(),
+      timeline: db_man(
+        `SELECT
+          ((created_at / 300000) * 300000) AS time,
+          count(*) AS requests,
+          coalesce(sum(changed), 0) AS compacted,
+          coalesce(sum(status >= 400), 0) AS errors,
+          coalesce(sum(before_tokens), 0) AS before_tokens,
+          coalesce(sum(after_tokens), 0) AS after_tokens
+        FROM history
+        WHERE created_at >= ?
+        GROUP BY time
+        ORDER BY time ASC`,
+        now - 86_400_000,
+      ).all(),
     });
   })
   .post(
@@ -803,9 +862,10 @@ export const app = new Elysia()
         throw new HttpError(400, "invalid JSON");
       }
       const updated = { ...currentSettings(), ...validateSettings(value) };
-      db.query(
+      db_man(
         "INSERT INTO dashboard_settings(id,value) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value",
-      ).run(json(updated));
+        json(updated),
+      ).run();
       Object.assign(S, updated);
       return response({ settings: currentSettings(), defaults });
     },
@@ -816,9 +876,10 @@ export const app = new Elysia()
     const id = Number(params.id);
     if (!Number.isSafeInteger(id) || id < 1)
       throw new HttpError(400, "invalid history id");
-    const row = db
-      .query("SELECT * FROM history WHERE id=?")
-      .get(id) as Item | null;
+    const row = db_man(
+      "SELECT * FROM history WHERE id=?",
+      id,
+    ).get() as Item | null;
     if (!row) throw new HttpError(404, "history not found");
     return response({
       ...row,

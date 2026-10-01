@@ -519,9 +519,10 @@ test("failed condensation leaves cache empty; retry can recover", async () => {
   mode = "fail";
   const before = calls;
   const log = spyOn(console, "error").mockImplementation(() => {});
-  let failed;
   try {
-    failed = await compressBody(body);
+    await expect(compressBody(body)).rejects.toThrow(
+      'Summarization failed for turn: "outage Q',
+    );
     expect(calls - before).toBe(3);
     expect(log).toHaveBeenCalledTimes(1);
     expect(log.mock.calls[0][0]).toContain(
@@ -532,8 +533,6 @@ test("failed condensation leaves cache empty; retry can recover", async () => {
     log.mockRestore();
     mode = "ok";
   }
-  expect(failed.changed).toBe(true);
-  expect(tokens(failed.body)).toBeLessThanOrEqual(600);
   const count = (db.query("SELECT count(*) n FROM compressed").get() as any).n;
   mode = "ok";
   const recovered = await compressBody(body);
@@ -635,7 +634,9 @@ test("hung response bodies get three real 10-second deadlines and one critical l
   mode = "hang";
   const start = Date.now();
   try {
-    const result = await compressBody(body);
+    await expect(compressBody(body)).rejects.toThrow(
+      'Summarization failed for turn: "timeout-unique H',
+    );
     const elapsed = Date.now() - start;
     expect(calls - before).toBe(3);
     expect(elapsed).toBeGreaterThanOrEqual(29_500);
@@ -648,9 +649,6 @@ test("hung response bodies get three real 10-second deadlines and one critical l
     expect(log.mock.calls[0][0]).toContain("CRITICAL:");
     expect((db.query("SELECT count(*) n FROM compressed").get() as any).n).toBe(
       count,
-    );
-    expect(result.body.messages).toEqual(
-      body.messages.slice(0, 1).concat(body.messages.slice(3)),
     );
   } finally {
     mode = "ok";
