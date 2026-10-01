@@ -854,6 +854,7 @@ test("explicit Elysia routes reject unrelated paths and methods", async () => {
     "GET /api/history",
     "GET /api/history/:id",
     "GET /dashboard",
+    "GET /infographic",
     "GET /dashboard/assets/:file",
     "GET /r/:provider/*",
     "POST /r/:provider/*",
