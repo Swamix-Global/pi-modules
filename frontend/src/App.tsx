@@ -48,6 +48,7 @@ interface TimelinePoint {
 }
 
 interface Stats {
+  now?: number;
   requests: number;
   blocks: number;
   hits: number;
@@ -244,7 +245,14 @@ function formatDuration(ms: number): string {
 
 function formatTime(epochMs: number): string {
   if (!Number.isFinite(epochMs)) return "—";
-  return new Date(epochMs).toLocaleString();
+  return new Date(epochMs).toLocaleString(undefined, {
+    year: "numeric",
+    month: "numeric",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+  });
 }
 
 function pretty(value: unknown): string {
@@ -449,9 +457,12 @@ function Metric({
   );
 }
 
-function compile24hTimeline(timeline: TimelinePoint[] = []): TimelinePoint[] {
+function compile24hTimeline(
+  timeline: TimelinePoint[] = [],
+  serverNow?: number,
+): TimelinePoint[] {
   const BUCKET = 300_000;
-  const now = Date.now();
+  const now = serverNow ?? Date.now();
   const end = Math.floor(now / BUCKET) * BUCKET;
   const start = end - 287 * BUCKET;
   const map = new Map<number, TimelinePoint>();
@@ -484,14 +495,26 @@ function formatAxisNumber(val: number): string {
 function formatBucketTime(ms: number): string {
   const d1 = new Date(ms);
   const d2 = new Date(ms + 300_000);
-  const pad = (n: number) => String(n).padStart(2, "0");
-  return `${pad(d1.getHours())}:${pad(d1.getMinutes())}–${pad(d2.getHours())}:${pad(d2.getMinutes())}`;
+  const dateStr = d1.toLocaleDateString(undefined, {
+    month: "numeric",
+    day: "numeric",
+  });
+  const t1 = d1.toLocaleTimeString(undefined, {
+    hour: "numeric",
+    minute: "2-digit",
+  });
+  const t2 = d2.toLocaleTimeString(undefined, {
+    hour: "numeric",
+    minute: "2-digit",
+  });
+  return `${dateStr} ${t1} – ${t2}`;
 }
 
 function formatHour(ms: number): string {
-  const d = new Date(ms);
-  const pad = (n: number) => String(n).padStart(2, "0");
-  return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  return new Date(ms).toLocaleTimeString(undefined, {
+    hour: "numeric",
+    minute: "2-digit",
+  });
 }
 
 function buildSvgArea(
@@ -1028,7 +1051,7 @@ function Overview() {
   }, []);
 
   const history = stats?.history;
-  const timelineSeries = compile24hTimeline(stats?.timeline);
+  const timelineSeries = compile24hTimeline(stats?.timeline, stats?.now);
 
   return (
     <>

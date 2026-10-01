@@ -746,8 +746,10 @@ export const app = new Elysia()
       managementRequest(request);
   })
   .get("/health", () => response({ status: "ok" }))
-  .get("/stats", () =>
-    response({
+  .get("/stats", () => {
+    const now = Date.now();
+    return response({
+      now,
       ...stats,
       warmer: warmer.stats,
       history: db
@@ -758,9 +760,9 @@ export const app = new Elysia()
         )
         .get(),
       cache: db.query("SELECT count(*) AS n FROM compressed").get(),
-      timeline: timelineQuery.all(Date.now() - 86_400_000),
-    }),
-  )
+      timeline: timelineQuery.all(now - 86_400_000),
+    });
+  })
   .post(
     "/compress",
     ({ request }) =>
