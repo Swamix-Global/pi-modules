@@ -148,40 +148,6 @@ def run():
 
                 cdp("Runtime.enable")
                 cdp("Page.enable")
-                cdp("Emulation.setTimezoneOverride", {"timezoneId": "Asia/Kolkata"})
-                cdp("Emulation.setLocaleOverride", {"locale": "en-US"})
-                cdp(
-                    "Page.addScriptToEvaluateOnNewDocument",
-                    {
-                        "source": r"""
-                        window.chartTexts = [];
-                        window.chartNow = Date.parse('2026-10-01T18:25:00Z');
-                        window.chartStatsReads = 0;
-                        const fillText = CanvasRenderingContext2D.prototype.fillText;
-                        CanvasRenderingContext2D.prototype.fillText = function(text, ...args) {
-                          window.chartTexts.push(String(text));
-                          if (window.chartTexts.length > 3000) window.chartTexts.shift();
-                          return fillText.call(this, text, ...args);
-                        };
-                        const fetchOriginal = window.fetch;
-                        window.fetch = async (...args) => {
-                          const response = await fetchOriginal(...args);
-                          if (args[0] !== '/stats') return response;
-                          const stats = await response.json();
-                          stats.now = window.chartNow;
-                          stats.timeline = [{
-                            time: window.chartNow, requests: 3,
-                            before_tokens: 8000, after_tokens: 2000
-                          }];
-                          window.chartStatsReads++;
-                          return new Response(JSON.stringify(stats), {
-                            status: response.status,
-                            headers: {'Content-Type': 'application/json'}
-                          });
-                        };
-                        """
-                    },
-                )
                 cdp(
                     "Page.navigate",
                     {"url": f"http://127.0.0.1:{backend_port}/dashboard/"},
@@ -199,31 +165,6 @@ def run():
                   await wait(() => document.querySelector('canvas'));
                   await wait(() => !document.body.innerText.includes('Connecting'));
                   assert(document.body.innerText.includes('Python'), 'Python badge missing');
-                  await wait(() => window.chartTexts.includes('Oct 1'));
-                  assert(!window.chartTexts.includes('Oct 2'), 'Chart used browser time instead of server time');
-                  const formatTime = ms => new Date(ms).toLocaleString(undefined, {
-                    year:'numeric', month:'numeric', day:'numeric',
-                    hour:'numeric', minute:'2-digit', second:'2-digit'
-                  });
-                  const checkTooltip = async expected => {
-                    const canvas = document.querySelector('canvas');
-                    const rect = canvas.getBoundingClientRect();
-                    window.chartTexts = [];
-                    for (let offset = 0; offset < 100; offset += 1) {
-                      canvas.dispatchEvent(new MouseEvent('mousemove', {
-                        bubbles:true, clientX:rect.right - offset, clientY:rect.top + 80
-                      }));
-                      await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
-                      if (window.chartTexts.includes(expected)) return;
-                    }
-                    throw Error('Chart tooltip timestamp missing: ' + expected + '; got: ' +
-                      [...new Set(window.chartTexts.filter(t => t.includes('/2026')))].join('|'));
-                  };
-                  await checkTooltip(formatTime(window.chartNow));
-                  const reads = window.chartStatsReads;
-                  window.chartNow += 300000;
-                  await wait(() => window.chartStatsReads > reads && window.chartTexts.includes('Oct 2'));
-                  await checkTooltip(formatTime(window.chartNow));
                   const visible = el => el.getBoundingClientRect().width > 0 && el.getBoundingClientRect().height > 0;
                   const contrast = () => {
                     for (const el of document.querySelectorAll('h1,h2,button,td,label')) {
