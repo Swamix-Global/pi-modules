@@ -209,14 +209,15 @@ def run():
                     const canvas = document.querySelector('canvas');
                     const rect = canvas.getBoundingClientRect();
                     window.chartTexts = [];
-                    for (let offset = 20; offset < 180; offset += 5) {
+                    for (let offset = 0; offset < 100; offset += 1) {
                       canvas.dispatchEvent(new MouseEvent('mousemove', {
                         bubbles:true, clientX:rect.right - offset, clientY:rect.top + 80
                       }));
                       await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
                       if (window.chartTexts.includes(expected)) return;
                     }
-                    throw Error('Chart tooltip timestamp missing: ' + expected + '; got: ' + window.chartTexts.join('|'));
+                    throw Error('Chart tooltip timestamp missing: ' + expected + '; got: ' +
+                      [...new Set(window.chartTexts.filter(t => t.includes('/2026')))].join('|'));
                   };
                   await checkTooltip(formatTime(window.chartNow));
                   const reads = window.chartStatsReads;
