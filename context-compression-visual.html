@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Context compression · Current behavior</title>
+<style>
+:root { color-scheme: dark; --bg:#0c1220; --panel:#151f31; --text:#edf3ff; --muted:#b2bfd5; --line:#33445e; --blue:#86baff; --green:#7ee4bd; --amber:#ffd184; --red:#ff9b9b; }
+* { box-sizing:border-box; }
+body { margin:0; background:var(--bg); color:var(--text); font:16px/1.6 system-ui,sans-serif; }
+main { max-width:1180px; margin:auto; padding:36px 24px 60px; }
+h1 { font-size:clamp(28px,4vw,46px); letter-spacing:-1px; line-height:1.15; margin:10px 0 16px; }
+h2 { font-size:23px; margin:0 0 16px; } h3 { font-size:17px; margin:0 0 8px; }
+p { margin:8px 0; } a { color:var(--blue); } .muted, small { color:var(--muted); }
+.eyebrow { color:var(--green); font-size:13px; letter-spacing:2px; text-transform:uppercase; }
+.section { margin-top:28px; } .panel { background:var(--panel); border:1px solid var(--line); border-radius:16px; padding:24px; }
+.grid { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; }
+.metric { padding:18px; background:var(--panel); border:1px solid var(--line); border-radius:12px; }
+.metric strong { display:block; font-size:27px; line-height:1.3; } .metric span { font-size:13px; color:var(--muted); }
+.flow { display:grid; grid-template-columns:repeat(5,1fr); gap:10px; } .step { padding:16px; border:1px solid var(--line); border-radius:12px; } .step b { display:block; color:var(--blue); margin-bottom:6px; } .step p { font-size:14px; }
+.tabs { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:22px; } button { font:inherit; cursor:pointer; color:var(--text); background:var(--bg); border:1px solid var(--line); border-radius:8px; padding:9px 13px; } button[aria-pressed="true"] { background:var(--blue); color:#0c1220; border-color:var(--blue); font-weight:700; } button:focus-visible { outline:3px solid var(--amber); outline-offset:3px; }
+.scenario { display:grid; grid-template-columns:1.6fr 1fr; gap:28px; } .lane { margin:18px 0 24px; } .lane-label { display:flex; justify-content:space-between; margin-bottom:8px; }
+.track { height:52px; display:flex; gap:3px; background:var(--bg); border-radius:8px; overflow:hidden; } .block { display:flex; align-items:center; justify-content:center; min-width:0; font-size:12px; font-weight:700; color:#0c1220; overflow:hidden; white-space:nowrap; } .fixed { background:var(--blue); } .old { background:#c4cfe1; } .summary { background:var(--green); } .protected { background:var(--amber); }
+.legend { display:flex; flex-wrap:wrap; gap:15px; font-size:13px; color:var(--muted); } .dot { display:inline-block; width:10px; height:10px; border-radius:3px; margin-right:5px; }
+.outcome { border-left:3px solid var(--green); padding-left:18px; } .outcome.warning { border-color:var(--amber); } .outcome.failure { border-color:var(--red); } .tag { color:var(--green); font-weight:700; } .warning .tag { color:var(--amber); } .failure .tag { color:var(--red); }
+.alert { border:1px solid #896637; background:#292316; padding:18px 22px; border-radius:12px; } .alert strong { color:var(--amber); } code { font:13px/1.6 ui-monospace,monospace; overflow-wrap:anywhere; }
+.two { display:grid; grid-template-columns:1fr 1fr; gap:16px; } table { width:100%; border-collapse:collapse; font-size:14px; } th,td { text-align:left; padding:11px 8px; border-bottom:1px solid var(--line); } th { color:var(--muted); font-weight:500; } .table-wrap { overflow:auto; }
+footer { margin-top:30px; color:var(--muted); font-size:13px; }
+@media(max-width:850px) { .grid { grid-template-columns:repeat(2,1fr); } .flow { grid-template-columns:1fr; } .scenario,.two { grid-template-columns:1fr; } }
+@media(prefers-reduced-motion:no-preference) { .block { transition:width .25s ease; } }
+</style>
+</head>
+<body>
+<main>
+<header>
+<div class="eyebrow">ctx-engine / implementation + service snapshot</div>
+<h1>What survives the context squeeze?</h1>
+<p class="muted">Older turns become reusable notes. Recent turns stay intact. The threshold is soft — but the current implementation has a deletion branch worth knowing about.</p>
+<p><strong style="color:var(--green)">● Healthy on 127.0.0.1:4141</strong> · Snapshot <time id="snapshot"></time> · <a href="http://127.0.0.1:4141/dashboard/" target="_blank" rel="noopener">Open live dashboard ↗</a></p>
+<small>This file is a captured status report, not a live monitor. Scenario token sizes are illustrative; settings and counters below were read from the running service.</small>
+</header>
+<section class="section grid" aria-label="Active settings">
+<div class="metric"><strong>64,000</strong><span>soft token threshold</span></div>
+<div class="metric"><strong>2 turns</strong><span>newest groups protected</span></div>
+<div class="metric"><strong style="font-size:23px">DeepSeek Flash</strong><span>active condenser · low reasoning</span></div>
+<div class="metric"><strong>~400 words</strong><span>summary target · 4,096 output-token cap</span></div>
+</section>
+<section class="section panel">
+<h2>The actual request path</h2>
+<div class="flow">
+<div class="step"><b>01 · Route</b><p>OpenAI-compatible <code>messages</code> or <code>input</code>. Antigravity bypasses this proxy.</p></div>
+<div class="step"><b>02 · Estimate</b><p>Serialized text characters ÷ 3.5, rounded up. Image payloads are excluded; this is not a model tokenizer.</p></div>
+<div class="step"><b>03 · Group</b><p>Leading system/developer messages form a fixed prefix. Each user turn includes its replies and tool activity.</p></div>
+<div class="step"><b>04 · Condense</b><p>Only above 64k: all older eligible groups launch in parallel. Cache hits avoid model calls.</p></div>
+<div class="step"><b>05 · Forward</b><p>Reassemble prefix + notes + newest 2 turns. Check the budget again; see overflow behavior below.</p></div>
+</div>
+</section>
+<section class="section panel">
+<h2>Explore seven scenarios</h2>
+<div class="tabs" id="tabs" aria-label="Compression scenarios"></div>
+<div class="scenario" id="scenario" aria-live="polite">
+<div>
+<h3 id="scenario-title"></h3>
+<p id="scenario-subtitle" class="muted"></p>
+<div class="lane"><div class="lane-label"><span>Incoming context</span><strong id="before-total"></strong></div><div class="track" id="before" aria-label="Incoming context composition"></div></div>
+<div class="lane"><div class="lane-label"><span id="after-label">Forwarded context</span><strong id="after-total"></strong></div><div class="track" id="after" aria-label="Forwarded context composition"></div></div>
+<div class="legend"><span><i class="dot fixed"></i>Fixed fields / prefix</span><span><i class="dot old"></i>Old original turns</span><span><i class="dot summary"></i>Summary notes</span><span><i class="dot protected"></i>Protected newest turns</span></div>
+<p class="muted"><small>Each row uses the same scale within a scenario. Blank space shows reduction; 64k is a decision threshold, not a hard context limit.</small></p>
+</div>
+<div class="outcome" id="outcome"><div class="tag" id="result"></div><p id="description"></p><p id="detail" class="muted"></p><small id="source"></small></div>
+</div>
+</section>
+<section class="section alert">
+<strong>Current code ≠ documented no-drop rule</strong>
+<p><code>main.ts:498–511</code> removes oldest unprotected groups while the result is still over budget. These deletions are recorded as <code>kind: "drop", fallback: true</code>, but still conflict with the project’s “never drop blocks” instruction. Protected turns and fixed fields can still exceed the threshold and are forwarded with a warning. This report describes the code; it does not change it.</p>
+</section>
+<section class="section two">
+<div class="panel"><h2>Two different caches</h2><h3>SQLite summary cache</h3><p>Persists condenser output under:</p><p><code>hash(block) + "-" + model + "-" + maxTokens</code></p><p class="muted">Same original block, model and output cap → same note. A recognized summary is not summarized again. The cache key does not include the word target or prompt, so changing those alone does not invalidate old entries.</p><h3 style="margin-top:20px">OpenAI upstream prompt cache</h3><p class="muted">Separate from summary reuse. The warmer retains an eligible rendered summary prefix and makes a keepalive after 4½ minutes; threads expire after 15 minutes without real activity. Only eligible OpenAI requests with thread identity participate.</p></div>
+<div class="panel"><h2>Observed status</h2><div class="grid" style="grid-template-columns:1fr 1fr"><div class="metric"><strong>191</strong><span>persisted summary entries</span></div><div class="metric"><strong>427</strong><span>persisted request records</span></div><div class="metric"><strong>216</strong><span>changed records, not all summaries</span></div><div class="metric"><strong>32</strong><span>historical HTTP error records</span></div></div><p class="muted" style="margin-top:18px">Since process start: 63 requests · 1 new summary · 485 cache hits · 0 condenser exhaustions. Hits count blocks, not requests.</p><p class="muted">Warmer: 0 tracked threads · 3 attempts · 2 successes · 1 error. A healthy proxy does not prove that either condenser provider is available right now; no paid provider probe was run.</p></div>
+</section>
+<section class="section panel">
+<h2>Recent real traffic</h2>
+<p class="muted">The newest four records are below 64k but marked changed. Their small reductions are consistent with subscription-field normalization, not evidence of turn summarization.</p>
+<div class="table-wrap"><table><thead><tr><th>Record</th><th>Route / model</th><th>Estimated tokens before → after</th><th>HTTP</th></tr></thead><tbody>
+<tr><td>#427</td><td>OpenAI Responses · gpt-6.1-sol</td><td>23,581 → 23,573</td><td>200</td></tr>
+<tr><td>#426</td><td>OpenAI Responses · gpt-6.1-sol</td><td>17,092 → 17,084</td><td>200</td></tr>
+<tr><td>#425</td><td>OpenAI Responses · gpt-6.1-sol</td><td>15,711 → 15,704</td><td>200</td></tr>
+<tr><td>#424</td><td>OpenAI Responses · gpt-6.1-sol</td><td>7,174 → 7,166</td><td>200</td></tr>
+<tr><td>#423</td><td>OpenAI Responses · gpt-6.1-sol</td><td>554,119 → 148,467</td><td>200</td></tr>
+<tr><td>#422</td><td>DeepSeek Chat · deepseek-flash</td><td>28,578 → 28,578</td><td>200</td></tr>
+</tbody></table></div>
+<small>Record #423 was forwarded over the soft threshold; the metadata alone does not identify which groups were protected, summarized or dropped.</small>
+</section>
+<footer>Evidence: live /health, /api/settings, /stats and /api/history; local main.ts:374–520, 645–710; utils.ts:36–77; condenser.ts:6–99; warmer.ts:3–220. Local worktree has uncommitted changes; this is not a clean-release certification. No prompts, message bodies or credentials are included.</footer>
+</main>
+<script>
+const snapshot = 1790914187546;
+document.querySelector('#snapshot').textContent = new Date(snapshot).toLocaleString();
+const fixed = n => ({ name:'Fixed', kind:'fixed', n });
+const old = n => ({ name:'Old turns', kind:'old', n });
+const recent = n => ({ name:'Newest 2', kind:'protected', n });
+const note = n => ({ name:'Notes', kind:'summary', n });
+const scenarios = [
+ { tab:'Below threshold', title:'Small context: no condensation', subtitle:'24k is below the configured 64k soft threshold.', before:[fixed(4),old(12),recent(8)], after:[fixed(4),old(12),recent(8)], result:'PASS · no condenser call', description:'The original conversation is preserved. The budget branch is not entered, even if reusable summaries already exist.', detail:'An OpenAI OAuth request can still have unsupported subscription fields removed separately.', source:'main.ts:464–497; 645–692' },
+ { tab:'Fresh summaries', title:'Large context: condense every eligible old turn', subtitle:'100k incoming → 25k forwarded in this example.', before:[fixed(4),old(76),recent(20)], after:[fixed(4),note(1),recent(20)], result:'COMPACT · parallel model calls', description:'All completed groups except the newest 2 are summarized at once, not just enough groups to cross below 64k. Each block gets up to 3 attempts, 10 seconds per attempt.', detail:'Each summary replaces its whole original group with one user-role note. Evidence preservation is requested from the model; summaries are still lossy.', source:'main.ts:374–497; condenser.ts:6–99' },
+ { tab:'Cache reuse', title:'Same older blocks: reuse exact cached notes', subtitle:'The same example reduction, without fresh model calls for hits.', before:[fixed(4),old(76),recent(20)], after:[fixed(4),note(1),recent(20)], result:'CACHE HIT · SQLite reuse', description:'The original block hash, condenser model and output-token cap match an existing cache entry. Its saved output is reused.', detail:'Already-rendered summary groups are also recognized by output hash and skipped. SQLite summary reuse is not the upstream prompt cache.', source:'main.ts:379–385; 468–495' },
+ { tab:'Protected overflow', title:'Recent turns alone are too large', subtitle:'Only two groups exist; both are protected. Incoming context is 90k.', before:[fixed(10),recent(80)], after:[fixed(10),recent(80)], result:'WARN + FORWARD · still 90k', tone:'warning', description:'There are no unprotected turns to condense or drop. The fixed prefix and newest 2 turns remain intact even above the soft threshold.', detail:'A warning is logged, not a token-budget HTTP 413. The upstream provider still enforces its real context limit. A separate request-byte size limit exists.', source:'main.ts:464–520; readBody byte limit:538–557' },
+ { tab:'Still too large', title:'Summaries do not fit: oldest groups get dropped', subtitle:'100k → 70k after condensation → 64k after oldest-note deletion.', before:[fixed(4),old(38),recent(58)], after:[fixed(4),note(2),recent(58)], result:'DROP BRANCH · documented rule violation', tone:'warning', description:'Example: 8k of old summary notes + 4k fixed + 58k protected still total 70k. The loop removes oldest unprotected summary groups until the body fits or only protected groups remain.', detail:'The final example retains 2k of notes. This is deletion, not further summarization. Changes are recorded, but the no-drop invariant is not enforced here.', source:'main.ts:498–511' },
+ { tab:'Condenser failure', title:'A required block cannot be summarized', subtitle:'After all 3 attempts fail, the conversation is not forwarded.', before:[fixed(4),old(76),recent(20)], after:[], result:'HTTP 502 · fail fast', tone:'failure', description:'The downstream error is: Summarization failed for turn: "<verbatim user message>". No clipped excerpt is substituted for the failed block.', detail:'Parallel sibling blocks may finish and enter the cache, but the request fails. CRITICAL is logged for exhausted attempts.', source:'main.ts:389–434' },
+ { tab:'OAuth normalization', title:'Changed does not always mean compressed', subtitle:'A below-threshold OpenAI OAuth Responses request can still change.', before:[fixed(4),old(12),recent(8)], after:[fixed(4),old(12),recent(8)], result:'NORMALIZE · same conversation turns', description:'For /r/openai/responses with a non-sk- bearer token, the local proxy removes max_output_tokens, temperature, prompt_cache_retention and prompt_cache_options.', detail:'This can reduce the serialized token estimate by a few tokens and mark history as changed. The local check is narrower than the project instruction, which also names /codex/responses.', source:'main.ts:649–692' }
+];
+const sum = blocks => blocks.reduce((total, b) => total + b.n, 0);
+function draw(id, blocks, scale) {
+ const track = document.getElementById(id);
+ track.replaceChildren();
+ for (const block of blocks) {
+  const element = document.createElement('div');
+  element.className = 'block ' + block.kind;
+  element.style.width = (block.n / scale * 100) + '%';
+  element.textContent = block.name;
+  element.title = block.name + ': ' + block.n + 'k estimated tokens';
+  track.append(element);
+ }
+}
+function select(index) {
+ const s = scenarios[index];
+ document.querySelectorAll('#tabs button').forEach((button, i) => button.setAttribute('aria-pressed', String(i === index)));
+ for (const [id, text] of Object.entries({ 'scenario-title':s.title, 'scenario-subtitle':s.subtitle, result:s.result, description:s.description, detail:s.detail, source:s.source })) document.getElementById(id).textContent = text;
+ document.getElementById('outcome').className = 'outcome ' + (s.tone || '');
+ document.getElementById('before-total').textContent = sum(s.before) + 'k';
+ document.getElementById('after-total').textContent = s.after.length ? sum(s.after) + 'k' : 'Not forwarded';
+ document.getElementById('after-label').textContent = s.after.length ? 'Forwarded context' : 'No forwarded request';
+ const scale = Math.max(sum(s.before), sum(s.after));
+ draw('before', s.before, scale);
+ draw('after', s.after, scale);
+}
+scenarios.forEach((scenario, index) => {
+ const button = document.createElement('button');
+ button.type = 'button';
+ button.textContent = scenario.tab;
+ button.addEventListener('click', () => select(index));
+ document.getElementById('tabs').append(button);
+});
+select(0);
+</script>
+</body>
+</html>
