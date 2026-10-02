@@ -16,9 +16,10 @@ ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
 LOG = logging.getLogger("ctx-engine")
 DEFAULT_PROMPT = (
-    "Compress one completed turn into a concise factual note. Preserve the user request, "
-    "exact commands, files, identifiers, decisions, tool results and unresolved work. "
-    "Output only the note. Never add tags, wrappers or metadata."
+    "Summarize one completed assistant activity block into a concise factual note. "
+    "Preserve exact commands, files, identifiers, decisions, tool results, failures and "
+    "unresolved work. The user query stays verbatim in a separate user message. "
+    "Output only the assistant note. Never add tags, wrappers or metadata."
 )
 DEFAULTS = {
     "tokens": int(os.getenv("PI_CONTEXT_ROUTER_TOKENS", "32000")),
@@ -108,21 +109,66 @@ def text(value):
     return "" if value is None else str(value)
 
 
+def is_user_query(item):
+    parts = item.get("content")
+    result_only = (
+        isinstance(parts, list)
+        and bool(parts)
+        and all(isinstance(p, dict) and p.get("type") == "tool_result" for p in parts)
+    )
+    return item.get("role") == "user" and not result_only
+
+
+def concatenate_users(items, field):
+    """Join only adjacent real queries, retaining every content part and text byte."""
+    joined, changes = [], []
+    part_type = "input_text" if field == "input" else "text"
+    for item in items:
+        if joined and is_user_query(joined[-1]) and is_user_query(item):
+            previous = joined[-1]
+            left, right = previous.get("content"), item.get("content")
+            merged = copy.deepcopy(previous)
+            if isinstance(left, str) and isinstance(right, str):
+                merged["content"] = left + "\n" + right
+            else:
+                if not isinstance(left, (str, list)) or not isinstance(
+                    right, (str, list)
+                ):
+                    raise RouterError(400, "User content must be text or content parts")
+                left_parts = (
+                    left
+                    if isinstance(left, list)
+                    else [{"type": part_type, "text": left}]
+                )
+                right_parts = (
+                    right
+                    if isinstance(right, list)
+                    else [{"type": part_type, "text": right}]
+                )
+                merged["content"] = (
+                    left_parts + [{"type": part_type, "text": "\n"}] + right_parts
+                )
+            joined[-1] = merged
+            changes.append(
+                {
+                    "kind": "merge_users",
+                    "before": [previous, item],
+                    "after": [merged],
+                    "cached": False,
+                }
+            )
+        else:
+            joined.append(item)
+    return joined, changes
+
+
 def turns(items):
     prefix, groups = [], []
     for item in items:
         if not groups and item.get("role") in ("system", "developer"):
             prefix.append(item)
             continue
-        parts = item.get("content")
-        result_only = (
-            isinstance(parts, list)
-            and parts
-            and all(
-                isinstance(p, dict) and p.get("type") == "tool_result" for p in parts
-            )
-        )
-        if not groups or (item.get("role") == "user" and not result_only):
+        if not groups or is_user_query(item):
             groups.append([])
         groups[-1].append(item)
     return prefix, groups
@@ -208,7 +254,14 @@ process.stdout.write(JSON.stringify(result.content.filter(p=>p.type==='text').ma
 
 async def condenser(client, source, config):
     target = 100 + math.ceil(tokens(source) / 10)
-    system = f"{config['blockPrompt']}\n\nComplete the note at approximately {target} tokens; preserve evidence, failures, constraints and unfinished work over the length target."
+    system = (
+        f"{config['blockPrompt']}\n\n"
+        "Summarize only the assistant activity supplied below: replies, tool calls/results "
+        "and reasoning. The user query is preserved verbatim separately; do not recreate "
+        "or invent it. Output one assistant note.\n\n"
+        f"Complete the note at approximately {target} tokens; preserve evidence, failures, "
+        "constraints and unfinished work over the length target."
+    )
     if config["model"] == "gpt-6-luna":
         bun = os.getenv("PI_CONTEXT_ROUTER_BUN", str(Path.home() / ".bun/bin/bun"))
         process = await asyncio.create_subprocess_exec(
@@ -266,7 +319,7 @@ async def condenser(client, source, config):
     return output
 
 
-async def ctx_man(block, config, db, client):
+async def ctx_man(block, config, db, client, *, user_message):
     key = f"{digest(block)}-{config['model']}-{config['maxTokens']}"
     hit = db.cache_get(key)
     if hit is not None:
@@ -288,9 +341,8 @@ async def ctx_man(block, config, db, client):
                     digest(block),
                     type(error).__name__,
                 )
-                user = next((i for i in block if i.get("role") == "user"), {})
                 raise RouterError(
-                    502, f'Summarization failed for turn: "{text(user.get("content"))}"'
+                    502, f'Summarization failed for turn: "{user_message}"'
                 ) from None
     return db.cache_put(key, output, digest(output)), False
 
@@ -303,36 +355,46 @@ async def compress_body(original, config, db, client):
         if isinstance(original.get("input"), list)
         else None
     )
-    if field is None or tokens(original) <= config["tokens"]:
+    if field is None:
         return original, [], 0
     if any(not isinstance(i, dict) for i in original[field]):
         raise RouterError(400, "messages must contain objects")
     body = copy.deepcopy(original)
+    body[field], changes = concatenate_users(body[field], field)
+    if tokens(body) <= config["tokens"]:
+        return body if changes else original, changes, 0
     prefix, groups = turns(body[field])
     completed = max(0, len(groups) - config["keepTurns"])
-    # If fixed fields and protected turns already overflow, preserve everything.
-    protected = {**body, field: prefix + [i for g in groups[completed:] for i in g]}
+    # Queries are indivisible fixed context too: never summarize or clip them.
+    fixed = list(prefix)
+    for index, block in enumerate(groups):
+        if index >= completed or not is_user_query(block[0]) or has_image(block):
+            fixed.extend(block)
+        else:
+            fixed.append(block[0])
+    protected = {**body, field: fixed}
     if tokens(protected) > config["tokens"]:
         LOG.warning(
-            "Protected turns or fixed fields exceed %s tokens; forwarding intact",
+            "Verbatim queries, protected turns or fixed fields exceed %s tokens; forwarding intact",
             config["tokens"],
         )
-        return original, [], 0
+        return body if changes else original, changes, 0
 
-    async def replace(index, block):
-        if has_image(block):
+    async def replace(block):
+        if not is_user_query(block[0]) or len(block) == 1 or has_image(block):
             return block, None, 0
         if (
-            len(block) == 1
-            and block[0].get("role") == "user"
-            and db.is_summary(digest(text(block[0].get("content"))))
+            len(block) == 2
+            and block[1].get("role") == "assistant"
+            and db.is_summary(digest(text(block[1].get("content"))))
         ):
             return block, None, 1
-        output, cached = await ctx_man(block, config, db, client)
-        content = (
-            output if field == "messages" else [{"type": "input_text", "text": output}]
+        query, activity = block[0], block[1:]
+        output, cached = await ctx_man(
+            activity, config, db, client, user_message=text(query.get("content"))
         )
-        result = [{"role": "user", "content": content}]
+        # String content is valid for assistant input in both OpenAI wire formats.
+        result = [query, {"role": "assistant", "content": output}]
         return (
             result,
             {"kind": "block", "before": block, "after": result, "cached": cached},
@@ -340,14 +402,14 @@ async def compress_body(original, config, db, client):
         )
 
     results = await asyncio.gather(
-        *(replace(index, block) for index, block in enumerate(groups[:completed])),
+        *(replace(block) for block in groups[:completed]),
         return_exceptions=True,
     )
     # Wait for every launched task, then fail before forwarding any partial plan.
     for result in results:
         if isinstance(result, BaseException):
             raise result
-    changes, hits = [], 0
+    hits = 0
     for index, (block, change, cached) in enumerate(results):
         groups[index] = block
         hits += cached

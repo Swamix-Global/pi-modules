@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import httpx
+import zstandard
 from fastapi.testclient import TestClient
 
 from backend import main, utils
@@ -78,8 +79,13 @@ class CompressionTests(unittest.IsolatedAsyncioTestCase):
             body, changes, hits = await utils.compress_body(
                 self.body, self.config, self.db, None
             )
-            self.assertEqual(body["messages"][0], self.body["messages"][0])
+            self.assertEqual(body["messages"][:2], self.body["messages"][:2])
+            self.assertEqual(
+                body["messages"][2],
+                {"role": "assistant", "content": "A factual note with evidence"},
+            )
             self.assertEqual(body["messages"][-3:], self.body["messages"][-3:])
+            self.assertNotIn("original user query", call.call_args.args[1])
             self.assertEqual(changes[0]["before"][2]["tool_call_id"], "c1")
             self.assertIn("tool_call:", call.call_args.args[1])
             self.assertIn("tool_output:", call.call_args.args[1])
@@ -94,6 +100,193 @@ class CompressionTests(unittest.IsolatedAsyncioTestCase):
                 self.body, {**self.config, "maxTokens": 2048}, self.db, None
             )
             self.assertEqual(call.await_count, 2)
+
+    async def test_query_is_verbatim_including_whitespace_and_metadata(self):
+        query = {
+            "role": "user",
+            "name": "operator",
+            "content": '  Exact query:\n"quoted" 😀\n\tkeep this  ',
+        }
+        self.body["messages"][1] = query
+        before = utils.canonical(self.body)
+        with patch.object(
+            utils, "condenser", AsyncMock(return_value="one assistant note")
+        ) as call:
+            result, changes, _ = await utils.compress_body(
+                self.body, self.config, self.db, None
+            )
+        self.assertEqual(result["messages"][1], query)
+        self.assertEqual(
+            result["messages"][2],
+            {"role": "assistant", "content": "one assistant note"},
+        )
+        self.assertEqual(len(changes[0]["after"]), 2)
+        self.assertNotIn(query["content"], call.call_args.args[1])
+        self.assertEqual(utils.canonical(self.body), before)
+
+    async def test_cache_keys_cover_activity_only_and_ignore_old_turn_cache(self):
+        block = self.body["messages"][1:4]
+        legacy_key = (
+            f"{utils.digest(block)}-{self.config['model']}-{self.config['maxTokens']}"
+        )
+        self.db.cache_put(
+            legacy_key, "old summary containing the query", utils.digest("old note")
+        )
+        with patch.object(
+            utils, "condenser", AsyncMock(return_value="activity note")
+        ) as call:
+            first, _, _ = await utils.compress_body(
+                self.body, self.config, self.db, None
+            )
+            self.body["messages"][1]["content"] = "a different exact query"
+            second, changes, hits = await utils.compress_body(
+                self.body, self.config, self.db, None
+            )
+        self.assertEqual(call.await_count, 1)
+        self.assertEqual(first["messages"][1]["content"], "original user query")
+        self.assertEqual(second["messages"][1]["content"], "a different exact query")
+        self.assertEqual(second["messages"][2]["content"], "activity note")
+        self.assertTrue(changes[0]["cached"])
+        self.assertEqual(hits, 1)
+        key = f"{utils.digest(block[1:])}-{self.config['model']}-{self.config['maxTokens']}"
+        self.assertEqual(self.db.cache_get(key), "activity note")
+        self.assertEqual(
+            self.db.cache_get(legacy_key), "old summary containing the query"
+        )
+
+    async def test_existing_assistant_note_is_not_recondensed(self):
+        with patch.object(
+            utils, "condenser", AsyncMock(return_value="note " * 2000)
+        ) as call:
+            first, _, _ = await utils.compress_body(
+                self.body, self.config, self.db, None
+            )
+            second, changes, hits = await utils.compress_body(
+                first, self.config, self.db, None
+            )
+        self.assertEqual(call.await_count, 1)
+        self.assertEqual(second, first)
+        self.assertEqual(changes, [])
+        self.assertEqual(hits, 1)
+
+    async def test_verbatim_query_overflow_does_not_summarize_the_query(self):
+        self.body["messages"][1]["content"] = "large exact query " * 1000
+        with patch.object(utils, "condenser", AsyncMock()) as call:
+            result, changes, _ = await utils.compress_body(
+                self.body, self.config, self.db, None
+            )
+        self.assertEqual(result, self.body)
+        self.assertEqual(changes, [])
+        call.assert_not_awaited()
+
+    async def test_consecutive_queries_join_below_threshold_without_inference(self):
+        body = {
+            "messages": [
+                {"role": "system", "content": "fixed"},
+                {"role": "user", "content": "  first\n"},
+                {"role": "user", "content": 'second "quoted" 😀'},
+                {"role": "user", "content": "\tthird  "},
+                {"role": "assistant", "content": "answer"},
+            ]
+        }
+        original = utils.canonical(body)
+        with patch.object(utils, "condenser", AsyncMock()) as call:
+            result, changes, _ = await utils.compress_body(
+                body, self.config, self.db, None
+            )
+        self.assertEqual(
+            result["messages"],
+            [
+                body["messages"][0],
+                {"role": "user", "content": '  first\n\nsecond "quoted" 😀\n\tthird  '},
+                body["messages"][-1],
+            ],
+        )
+        self.assertEqual([c["kind"] for c in changes], ["merge_users", "merge_users"])
+        self.assertEqual(utils.canonical(body), original)
+        call.assert_not_awaited()
+
+    async def test_consecutive_responses_queries_keep_content_parts_and_images(self):
+        parts = [
+            {"type": "input_text", "text": "  first 😀  "},
+            {"type": "input_image", "image_url": "data:image/png;base64,abcd"},
+        ]
+        body = {
+            "input": [
+                {"role": "user", "content": parts},
+                {"role": "user", "content": "second\n"},
+                {"role": "assistant", "content": "answer"},
+            ]
+        }
+        result, changes, _ = await utils.compress_body(body, self.config, self.db, None)
+        self.assertEqual(
+            result["input"][0]["content"],
+            parts
+            + [
+                {"type": "input_text", "text": "\n"},
+                {"type": "input_text", "text": "second\n"},
+            ],
+        )
+        self.assertEqual(result["input"][1], body["input"][2])
+        self.assertEqual(len(changes), 1)
+
+    async def test_tool_result_user_items_are_activity_not_queries(self):
+        items = [
+            {"role": "user", "content": "query"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "c", "content": "evidence"}
+                ],
+            },
+            {"role": "user", "content": "next query"},
+        ]
+        joined, changes = utils.concatenate_users(items, "messages")
+        self.assertEqual(joined, items)
+        self.assertEqual(changes, [])
+        _, groups = utils.turns(joined)
+        self.assertEqual(groups, [items[:2], items[2:]])
+
+    async def test_consecutive_queries_use_one_turn_then_summarize_activity(self):
+        self.body["messages"].insert(
+            2, {"role": "user", "content": "follow-up exact query"}
+        )
+        with patch.object(
+            utils, "condenser", AsyncMock(return_value="single assistant note")
+        ) as call:
+            result, changes, _ = await utils.compress_body(
+                self.body, self.config, self.db, None
+            )
+        self.assertEqual(
+            result["messages"][1],
+            {"role": "user", "content": "original user query\nfollow-up exact query"},
+        )
+        self.assertEqual(
+            result["messages"][2],
+            {"role": "assistant", "content": "single assistant note"},
+        )
+        self.assertEqual([c["kind"] for c in changes], ["merge_users", "block"])
+        self.assertEqual(call.await_count, 1)
+        self.assertNotIn("original user query", call.call_args.args[1])
+        self.assertNotIn("follow-up exact query", call.call_args.args[1])
+
+    async def test_user_only_group_never_gets_an_invented_assistant(self):
+        body = {
+            "messages": [
+                {"role": "user", "content": "a" * 4000},
+                {"role": "user", "content": "b" * 4000},
+            ]
+        }
+        with patch.object(utils, "condenser", AsyncMock()) as call:
+            result, changes, _ = await utils.compress_body(
+                body, self.config, self.db, None
+            )
+        self.assertEqual(
+            result["messages"],
+            [{"role": "user", "content": "a" * 4000 + "\n" + "b" * 4000}],
+        )
+        self.assertEqual(changes[0]["kind"], "merge_users")
+        call.assert_not_awaited()
 
     async def test_failure_is_exact_502_and_not_cached(self):
         with patch.object(
@@ -139,7 +332,13 @@ class CompressionTests(unittest.IsolatedAsyncioTestCase):
             patch.object(utils, "ATTEMPT_TIMEOUT", 0.01),
             self.assertRaises(utils.RouterError),
         ):
-            await utils.ctx_man(self.body["messages"][1:4], self.config, self.db, None)
+            await utils.ctx_man(
+                self.body["messages"][2:4],
+                self.config,
+                self.db,
+                None,
+                user_message="original user query",
+            )
 
     async def test_overflow_never_drops_or_clips(self):
         body = {**self.body, "instructions": "fixed " * 3000}
@@ -156,7 +355,8 @@ class CompressionTests(unittest.IsolatedAsyncioTestCase):
             result, _, _ = await utils.compress_body(
                 self.body, self.config, self.db, None
             )
-            self.assertEqual(len(result["messages"]), 5)
+            self.assertEqual(len(result["messages"]), 6)
+            self.assertEqual(result["messages"][1], self.body["messages"][1])
             self.assertEqual(result["messages"][-3:], self.body["messages"][-3:])
 
     async def test_responses_and_opaque_reasoning(self):
@@ -180,15 +380,18 @@ class CompressionTests(unittest.IsolatedAsyncioTestCase):
                     "output": "data " * 3000,
                 },
                 {"role": "user", "content": "previous"},
+                {"role": "assistant", "content": "previous answer"},
                 {"role": "user", "content": "live"},
             ]
         }
         with patch.object(utils, "condenser", AsyncMock(return_value="note")) as call:
             result, _, _ = await utils.compress_body(body, self.config, self.db, None)
+            self.assertEqual(result["input"][0], body["input"][0])
             self.assertEqual(
-                result["input"][0]["content"], [{"type": "input_text", "text": "note"}]
+                result["input"][1], {"role": "assistant", "content": "note"}
             )
-            self.assertEqual(result["input"][-2:], body["input"][-2:])
+            self.assertEqual(result["input"][-3:], body["input"][-3:])
+            self.assertNotIn("user:\nquery", call.call_args.args[1])
             self.assertNotIn("DO NOT CONDENSE OPAQUE", call.call_args.args[1])
 
     async def test_parallel_fanout_and_image_preservation(self):
@@ -205,8 +408,12 @@ class CompressionTests(unittest.IsolatedAsyncioTestCase):
 
         body = {
             "messages": [
-                {"role": "user", "content": f"{i}: " + "x" * (5000 if i < 3 else 10)}
+                item
                 for i in range(5)
+                for item in (
+                    {"role": "user", "content": f"query {i}"},
+                    {"role": "assistant", "content": "x" * (5000 if i < 3 else 10)},
+                )
             ]
         }
         with patch.object(utils, "condenser", simultaneous):
@@ -271,6 +478,74 @@ class ProxyTests(unittest.TestCase):
         self.assertEqual(self.client.get("/r/deepseek/models?x=1").status_code, 200)
         self.assertEqual(self.received[-1].url.query, b"x=1")
         self.assertEqual(self.client.get("/health").json()["database"], "ok")
+
+    def test_proxy_keeps_queries_and_one_assistant_note_in_both_wire_formats(self):
+        main.app.state.db.save_settings({**utils.DEFAULTS, "tokens": 1024})
+        for field, route in (
+            ("messages", "/r/deepseek/chat/completions"),
+            ("input", "/r/openai/responses"),
+        ):
+            for encoding in ("identity", "gzip", "zstd"):
+                with self.subTest(field=field, encoding=encoding):
+                    body = {
+                        field: [
+                            {"role": "user", "content": "  exact first query\n"},
+                            {"role": "user", "content": "second exact query 😀  "},
+                            {
+                                "role": "assistant",
+                                "content": "assistant evidence " * 1000,
+                            },
+                            {"role": "user", "content": "previous"},
+                            {"role": "assistant", "content": "previous answer"},
+                            {"role": "user", "content": "live"},
+                        ]
+                    }
+                    raw = json.dumps(body).encode()
+                    if encoding == "gzip":
+                        raw = gzip.compress(raw)
+                    elif encoding == "zstd":
+                        raw = zstandard.ZstdCompressor().compress(raw)
+                    with patch.object(
+                        utils,
+                        "condenser",
+                        AsyncMock(return_value="one assistant summary"),
+                    ):
+                        response = self.client.post(
+                            route,
+                            content=raw,
+                            headers={
+                                "content-type": "application/json",
+                                "content-encoding": encoding,
+                            },
+                        )
+                    self.assertEqual(response.status_code, 200)
+                    received = self.received[-1].content
+                    if encoding == "gzip":
+                        received = gzip.decompress(received)
+                    elif encoding == "zstd":
+                        received = zstandard.ZstdDecompressor().decompress(received)
+                    forwarded = json.loads(received)
+                    self.assertEqual(
+                        forwarded[field][:2],
+                        [
+                            {
+                                "role": "user",
+                                "content": "  exact first query\n\nsecond exact query 😀  ",
+                            },
+                            {"role": "assistant", "content": "one assistant summary"},
+                        ],
+                    )
+                    self.assertEqual(forwarded[field][-3:], body[field][-3:])
+                    rid = self.client.get("/api/history?limit=1").json()["items"][0][
+                        "id"
+                    ]
+                    detail = self.client.get(f"/api/history/{rid}").json()
+                    self.assertEqual(detail["original"], body)
+                    self.assertEqual(detail["compressed"], forwarded)
+                    self.assertEqual(
+                        [change["kind"] for change in detail["changes"]],
+                        ["merge_users", "block"],
+                    )
 
     def test_oauth_normalization_for_both_routes_and_api_key(self):
         body = {
@@ -337,6 +612,7 @@ class ProxyTests(unittest.TestCase):
                 {"role": "user", "content": "query"},
                 {"role": "assistant", "content": "x" * 20000},
                 {"role": "user", "content": "prev"},
+                {"role": "assistant", "content": "previous answer"},
                 {"role": "user", "content": "live"},
             ]
         }

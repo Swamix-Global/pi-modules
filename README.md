@@ -75,13 +75,22 @@ Build before restarting after frontend changes. The service binds loopback only,
 
 ## Condensation
 
-Complete older turns condense in parallel; all tasks settle before forwarding. The newest configured turns and system/developer prefix remain intact. Image-containing turns stay intact. Both Chat Completions `messages` and Responses `input` are supported.
+Every condensed older turn has exactly this shape in both Chat Completions `messages` and Responses `input`:
+
+```text
+user:      original query, verbatim
+assistant: one summary of all subsequent assistant replies, reasoning and tool calls/results
+```
+
+The opening query is not sent to the condenser and is never rewritten or replaced by a summary. Its whitespace, Unicode, structured content and message metadata remain intact. Query-only turns are not summarized and never get an invented assistant response. Complete older assistant activity blocks condense in parallel; all tasks settle before forwarding. The newest configured turns and system/developer prefix remain intact. Image-containing turns stay intact.
+
+Consecutive real user messages concatenate into one query with a newline between them, even below the threshold; each original text and content part is preserved. User-role tool-result envelopes are not queries and remain inside the activity group. Protected-turn counting happens after concatenation. Every verbatim query is indivisible fixed context; if queries plus protected/fixed fields already overflow, skip condensation and retain the full content (apart from the explicit adjacent-user concatenation). The request history records concatenations as `merge_users` changes.
 
 DeepSeek Flash uses API credentials from `PI_CONTEXT_ROUTER_API_KEY` or Pi's existing `auth.json`. Luna 6 uses a one-shot Bun child invoking the **supported native Pi SDK** with `modelsPath: null`, direct upstream, and native OAuth refresh. No CLI agent loop, tool execution, or installed-core patches. Both condensers use low reasoning.
 
-Each uncached block has **three total attempts, 10 seconds each**. Empty/failed/timed-out output is never cached. Exhaustion returns HTTP 502 with `Summarization failed for turn: "<verbatim user message>"`. No clipped excerpts, silent dropping, fallback summaries, or idle warming. If protected/fixed context alone exceeds the soft threshold, forward the entire request unchanged with a warning. If real summaries still exceed it, keep every block and warn.
+Each uncached block has **three total attempts, 10 seconds each**. Empty/failed/timed-out output is never cached. Exhaustion returns HTTP 502 with `Summarization failed for turn: "<verbatim user message>"`. No clipped excerpts, silent dropping, fallback summaries, or idle warming. If verbatim queries plus protected/fixed context alone exceed the soft threshold, retain every block with a warning; only adjacent-user concatenation still applies. If real summaries still exceed it, keep every block and warn.
 
-Cache keys are exactly `<SHA256 canonical block>-<model>-<output cap>`. The sizing hint is `100 + ceil(estimated transcript tokens / 10)`; it is not a truncation rule. The first committed note is canonical when concurrent requests race. Existing rendered notes are recognized to avoid recondensing them. Settings are snapshotted once per incoming request.
+Cache keys are exactly `<SHA256 canonical assistant activity block>-<model>-<output cap>`: the opening query is excluded from both the cache source and condenser transcript. The new activity-only keys do not reuse the former user-plus-activity notes; old cache rows remain preserved. The sizing hint is `100 + ceil(estimated activity transcript tokens / 10)`; it is not a truncation rule. The first committed note is canonical when concurrent requests race. Existing rendered assistant notes are recognized to avoid recondensing them. Settings are snapshotted once per incoming request.
 
 ## SQLite and request logs
 
