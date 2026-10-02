@@ -156,6 +156,13 @@
     });
   }
 
+  function formatChartTick(ms) {
+    return [
+      new Date(ms).toLocaleDateString(undefined, { month: "short", day: "numeric" }),
+      formatHour(ms),
+    ];
+  }
+
   function pretty(value) {
     if (value === undefined || value === null) return "null";
     return JSON.stringify(value, null, 2);
@@ -292,7 +299,7 @@
   let form = $state({
     tokens: "32000",
     keepTurns: "2",
-    maxTokens: "256",
+    maxTokens: "8192",
     model: "deepseek-flash",
     blockPrompt: "",
   });
@@ -500,7 +507,7 @@
     form = {
       tokens: String(settings.tokens ?? 32000),
       keepTurns: String(settings.keepTurns ?? 2),
-      maxTokens: String(settings.maxTokens ?? 4096),
+      maxTokens: String(settings.maxTokens ?? 8192),
       model: settings.model === "gpt-6-luna" ? "gpt-6-luna" : "deepseek-flash",
       blockPrompt: settings.blockPrompt ?? "",
     };
@@ -552,7 +559,7 @@
     }
 
     const points = compile24hTimeline(stats?.timeline, stats?.now);
-    const labels = points.map((point) => formatHour(point.time));
+    const labels = points.map((point) => point.time);
     const requests = points.map((point) => point.requests ?? 0);
     const before = points.map((point) => point.before_tokens ?? 0);
     const after = points.map((point) => point.after_tokens ?? 0);
@@ -613,14 +620,24 @@
             },
             tooltip: {
               callbacks: {
-                title: (items) => (items.length ? formatTime(points[items[0].dataIndex].time) : ""),
+                title: (items) =>
+                  items.length
+                    ? formatTime(items[0].chart.data.labels[items[0].dataIndex])
+                    : "",
               },
             },
           },
           scales: {
             x: {
               grid: { color: grid },
-              ticks: { color: ticks, maxTicksLimit: 8, maxRotation: 0 },
+              ticks: {
+                color: ticks,
+                maxTicksLimit: 8,
+                maxRotation: 0,
+                callback: function (value) {
+                  return formatChartTick(this.getLabelForValue(value));
+                },
+              },
             },
             y: {
               position: "left",

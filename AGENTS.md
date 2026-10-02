@@ -12,7 +12,7 @@ Fresh loopback context-compression proxy: Python/FastAPI/httpx/sqlite3 in `backe
 ## Invariants
 
 - Soft token threshold default 32k; preserve protected turns and fixed fields. Forward intact with warnings when indivisible context exceeds it. No context-driven 413, clipping, silent block dropping, or excerpt fallback.
-- Completed turn blocks launch concurrently and all settle. Three total attempts × 10 seconds per uncached block. Exhaustion emits payload-free CRITICAL and returns HTTP 502 with exact verbatim user message: `Summarization failed for turn: "..."`.
+- Completed turn blocks launch concurrently and all settle. Three total attempts × 30 seconds per uncached block. Exhaustion emits payload-free CRITICAL and returns HTTP 502 with exact verbatim user message: `Summarization failed for turn: "..."`.
 - Each condensed turn is the original user query verbatim as a `user` message, followed by one `assistant` summary of only the subsequent replies, reasoning and tool calls/results. Never send the opening query to the condenser or replace it with a summary. Query-only turns do not invent an assistant reply.
 - Concatenate consecutive real user messages with one newline, preserving text/whitespace and structured content parts; do this even below threshold. User-role tool-result envelopes are activity, not queries. Protected turns count after concatenation.
 - Cache key strictly `<assistant activity block SHA256>-<model>-<output cap>`; concurrent misses return the first committed note. Old whole-turn cache keys are not reused for assistant-only notes. Recognize already-rendered assistant notes. Sizing hints never truncate output.

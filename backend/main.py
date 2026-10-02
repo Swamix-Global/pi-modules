@@ -56,7 +56,7 @@ class Settings(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     tokens: int = Field(default=DEFAULTS["tokens"], ge=1024, le=4000000)
     keepTurns: int = Field(default=DEFAULTS["keepTurns"], ge=1, le=100)
-    maxTokens: int = Field(default=DEFAULTS["maxTokens"], ge=128, le=32768)
+    maxTokens: int = Field(default=DEFAULTS["maxTokens"], ge=128, le=65536)
     model: str = DEFAULTS["model"]
     blockPrompt: str = Field(
         default=DEFAULTS["blockPrompt"], min_length=1, max_length=16000

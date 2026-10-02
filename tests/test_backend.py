@@ -320,6 +320,7 @@ class CompressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, "note")
         self.assertIn("approximately 200 tokens", received[0]["messages"][0]["content"])
         self.assertEqual(received[0]["reasoning_effort"], "low")
+        self.assertEqual(received[0]["thinking"], {"type": "disabled"})
         self.assertEqual(received[0]["max_tokens"], self.config["maxTokens"])
         self.assertEqual(utils.tokens("😀" * 3500), 1000)
 

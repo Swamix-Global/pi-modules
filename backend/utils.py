@@ -8,6 +8,7 @@ import logging
 import math
 import os
 import re
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -24,7 +25,7 @@ DEFAULT_PROMPT = (
 DEFAULTS = {
     "tokens": int(os.getenv("PI_CONTEXT_ROUTER_TOKENS", "32000")),
     "keepTurns": int(os.getenv("PI_CONTEXT_ROUTER_KEEP_TURNS", "2")),
-    "maxTokens": int(os.getenv("PI_CONTEXT_ROUTER_MAX_TOKENS", "4096")),
+    "maxTokens": int(os.getenv("PI_CONTEXT_ROUTER_MAX_TOKENS", "8192")),
     "model": os.getenv("PI_CONTEXT_ROUTER_CONDENSER_MODEL", "deepseek-flash"),
     "blockPrompt": os.getenv("PI_CONTEXT_ROUTER_BLOCK_PROMPT", DEFAULT_PROMPT),
 }
@@ -42,7 +43,7 @@ CONDENSER_URL = os.getenv(
     "PI_CONTEXT_ROUTER_CONDENSER_URL", "https://api.deepseek.com/chat/completions"
 )
 ATTEMPTS = 3
-ATTEMPT_TIMEOUT = 10
+ATTEMPT_TIMEOUT = int(os.getenv("PI_CONTEXT_ROUTER_ATTEMPT_TIMEOUT", "30"))
 
 
 class RouterError(Exception):
@@ -253,6 +254,7 @@ process.stdout.write(JSON.stringify(result.content.filter(p=>p.type==='text').ma
 
 
 async def condenser(client, source, config):
+    started = time.monotonic()
     target = 100 + math.ceil(tokens(source) / 10)
     system = (
         f"{config['blockPrompt']}\n\n"
@@ -290,6 +292,12 @@ async def condenser(client, source, config):
             if process.returncode is None:
                 process.kill()
                 await process.wait()
+        LOG.info(
+            "Condenser finished; model=%s duration_ms=%d output_tokens=%d",
+            config["model"],
+            round((time.monotonic() - started) * 1000),
+            tokens(answer) if isinstance(answer, str) else 0,
+        )
     else:
         key = os.getenv("PI_CONTEXT_ROUTER_API_KEY", "")
         if not key and AUTH_PATH.exists():
@@ -305,12 +313,22 @@ async def condenser(client, source, config):
                     {"role": "user", "content": source},
                 ],
                 "max_tokens": config["maxTokens"],
-                "thinking": {"type": "enabled"},
+                "thinking": {"type": "disabled"},
                 "reasoning_effort": "low",
             },
         )
         response.raise_for_status()
-        answer = response.json()["choices"][0]["message"]["content"]
+        data = response.json()
+        usage = data.get("usage", {})
+        answer = data["choices"][0]["message"]["content"]
+        LOG.info(
+            "Condenser finished; model=%s duration_ms=%d prompt_tokens=%s completion_tokens=%s output_tokens=%d",
+            config["model"],
+            round((time.monotonic() - started) * 1000),
+            usage.get("prompt_tokens"),
+            usage.get("completion_tokens"),
+            tokens(answer) if isinstance(answer, str) else 0,
+        )
     if not isinstance(answer, str):
         raise TypeError("Invalid condenser output")
     output = re.sub(r"<think>[\s\S]*?</think>", "", answer, flags=re.IGNORECASE).strip()
@@ -323,16 +341,54 @@ async def ctx_man(block, config, db, client, *, user_message):
     key = f"{digest(block)}-{config['model']}-{config['maxTokens']}"
     hit = db.cache_get(key)
     if hit is not None:
+        LOG.info(
+            "Turn block cache hit; model=%s block=%s tokens=%d",
+            config["model"],
+            digest(block)[:12],
+            tokens(hit),
+        )
         return hit, True
     source = transcript(block)
+    started = time.monotonic()
     for attempt in range(ATTEMPTS):
+        attempt_started = time.monotonic()
         try:
+            LOG.info(
+                "Condensing turn block; attempt=%d/%d model=%s block=%s input_tokens=%d timeout_s=%d",
+                attempt + 1,
+                ATTEMPTS,
+                config["model"],
+                digest(block)[:12],
+                tokens(source),
+                ATTEMPT_TIMEOUT,
+            )
             async with asyncio.timeout(ATTEMPT_TIMEOUT):
                 output = await condenser(client, source, config)
+            attempt_ms = round((time.monotonic() - attempt_started) * 1000)
+            LOG.info(
+                "Turn block condensed; attempt=%d/%d model=%s block=%s duration_ms=%d output_tokens=%d",
+                attempt + 1,
+                ATTEMPTS,
+                config["model"],
+                digest(block)[:12],
+                attempt_ms,
+                tokens(output),
+            )
             break
         except (asyncio.CancelledError, KeyboardInterrupt):
             raise
         except Exception as error:  # noqa: BLE001 -- Auth, transport, and output failures all count as attempts.
+            attempt_ms = round((time.monotonic() - attempt_started) * 1000)
+            LOG.warning(
+                "Turn block attempt failed; attempt=%d/%d model=%s block=%s duration_ms=%d failure=%s (%s)",
+                attempt + 1,
+                ATTEMPTS,
+                config["model"],
+                digest(block)[:12],
+                attempt_ms,
+                type(error).__name__,
+                str(error),
+            )
             if attempt == ATTEMPTS - 1:
                 LOG.critical(
                     "Condenser exhausted %s attempts; model=%s block=%s failure=%s",
@@ -373,12 +429,23 @@ async def compress_body(original, config, db, client):
         else:
             fixed.append(block[0])
     protected = {**body, field: fixed}
-    if tokens(protected) > config["tokens"]:
+    t_body = tokens(body)
+    t_prot = tokens(protected)
+    if t_prot > config["tokens"]:
         LOG.warning(
             "Verbatim queries, protected turns or fixed fields exceed %s tokens; forwarding intact",
             config["tokens"],
         )
         return body if changes else original, changes, 0
+
+    LOG.info(
+        "Compression plan: total_tokens=%d protected_tokens=%d threshold=%d completed_blocks=%d total_turns=%d",
+        t_body,
+        t_prot,
+        config["tokens"],
+        completed,
+        len(groups),
+    )
 
     async def replace(block):
         if not is_user_query(block[0]) or len(block) == 1 or has_image(block):
@@ -397,7 +464,14 @@ async def compress_body(original, config, db, client):
         result = [query, {"role": "assistant", "content": output}]
         return (
             result,
-            {"kind": "block", "before": block, "after": result, "cached": cached},
+            {
+                "kind": "block",
+                "before": block,
+                "after": result,
+                "cached": cached,
+                "before_tokens": tokens(block),
+                "after_tokens": tokens(result),
+            },
             int(cached),
         )
 
@@ -421,4 +495,11 @@ async def compress_body(original, config, db, client):
             "Condensed context remains above %s tokens; forwarding intact blocks without dropping",
             config["tokens"],
         )
+    LOG.info(
+        "Compression complete: tokens=%d->%d cache_hits=%d changes=%d",
+        t_body,
+        tokens(body),
+        hits,
+        len(changes),
+    )
     return body if changes else original, changes, hits
