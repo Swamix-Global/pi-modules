@@ -162,13 +162,6 @@ const NUMERIC_FIELDS: NumericField[] = [
     unit: "turns",
   },
   {
-    key: "words",
-    label: "Summary target length",
-    min: 1,
-    step: 1,
-    unit: "words",
-  },
-  {
     key: "maxTokens",
     label: "Maximum summary tokens",
     min: 1,
@@ -1910,6 +1903,11 @@ function SettingsPanel() {
         <p className="muted">Loading settings…</p>
       ) : (
         <>
+          <p className="muted">
+            Summary target per block: 100 + ceil(estimated input tokens / 10)
+            tokens. This is a sizing hint; the output-token limit remains safety
+            headroom. Existing cached notes are reused.
+          </p>
           <div className="settings-grid">
             <div className="field">
               <label htmlFor="setting-model">Summarizer model</label>

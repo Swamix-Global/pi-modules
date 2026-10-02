@@ -11,6 +11,7 @@ import {
   ATTEMPT_TIMEOUT_MS,
   MAX_ATTEMPTS,
   lengthInstruction,
+  summaryTargetTokens,
 } from "../condenser.ts";
 let calls = 0,
   mode = "ok",
@@ -385,7 +386,7 @@ test("blocks compress to plain content; cache and rendered hashes prevent repeat
   expect(prompt).toContain("\n---\nassistant:");
   expect(prompt).not.toContain("Target approximately");
   expect(systemPrompt).toBe(
-    `${initialSettings.settings.blockPrompt}\n\n${lengthInstruction(400)}`,
+    `${initialSettings.settings.blockPrompt}\n\n${lengthInstruction(summaryTargetTokens(prompt))}`,
   );
   expect(condenserPayload).toMatchObject({
     model: "deepseek-flash",

@@ -1,6 +1,19 @@
 import { test, expect, spyOn } from "bun:test";
 import { ModelRuntime } from "/usr/lib/node_modules/@earendil-works/pi-coding-agent/dist/index.js";
-import { condense, lengthInstruction } from "../condenser.ts";
+import {
+  condense,
+  lengthInstruction,
+  summaryTargetTokens,
+} from "../condenser.ts";
+
+test("summary target is 100 tokens plus one tenth of the estimated transcript", () => {
+  expect(summaryTargetTokens("x".repeat(3500))).toBe(200);
+  expect(summaryTargetTokens("x".repeat(35000))).toBe(1100);
+  expect(summaryTargetTokens("x".repeat(35))).toBe(101);
+  expect(summaryTargetTokens("😀".repeat(3500))).toBe(200);
+  expect(summaryTargetTokens("")).toBe(100);
+  expect(lengthInstruction(200)).toContain("approximately 200 tokens");
+});
 import { S } from "../settings.ts";
 
 test("Codex uses native Pi subscription auth, direct catalog model, no tools or internal retries", async () => {
@@ -54,7 +67,7 @@ test("Codex uses native Pi subscription auth, direct catalog model, no tools or 
     });
     expect(options[1]).toBe(model);
     expect(options[2]).toMatchObject({
-      systemPrompt: `Preserve evidence.\n\n${lengthInstruction(123)}`,
+      systemPrompt: `Preserve evidence.\n\n${lengthInstruction(summaryTargetTokens("Full turn text"))}`,
       messages: [{ role: "user", content: "Full turn text" }],
     });
     expect(options[2]).not.toHaveProperty("tools");

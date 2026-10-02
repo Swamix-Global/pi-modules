@@ -1,19 +1,21 @@
 import { readFileSync } from "node:fs";
 import { ModelRuntime } from "/usr/lib/node_modules/@earendil-works/pi-coding-agent/dist/index.js";
 import { S } from "./settings.ts";
-import { json } from "./utils.ts";
+import { json, tokens } from "./utils.ts";
 
 export const ATTEMPT_TIMEOUT_MS = 10_000;
 export const MAX_ATTEMPTS = 3;
-export const lengthInstruction = (words: number) =>
-  `Complete the note at approximately ${words} words; preserve important evidence, failures, constraints and unfinished work over the length target.`;
+export const summaryTargetTokens = (input: string) =>
+  100 + Math.ceil(tokens(input) / 10);
+export const lengthInstruction = (targetTokens: number) =>
+  `Complete the note at approximately ${targetTokens} tokens; preserve important evidence, failures, constraints and unfinished work over the length target.`;
 
 export async function condense(
   input: string,
   config: typeof S,
   signal: AbortSignal,
 ) {
-  const systemPrompt = `${config.blockPrompt}\n\n${lengthInstruction(config.words)}`;
+  const systemPrompt = `${config.blockPrompt}\n\n${lengthInstruction(summaryTargetTokens(input))}`;
   let answer: unknown;
   if (config.model === "gpt-6-luna") {
     // Use Pi's existing OAuth subscription and direct upstream, never the router.
