@@ -1,20 +1,24 @@
 [Unit]
-Description=Pi localhost context router (Bun)
+Description=Pi localhost context router (Python)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 WorkingDirectory=/home/ubuntu/src/ctx-engine
-ExecStart=/home/ubuntu/.bun/bin/bun run main.ts
+ExecStart=/home/ubuntu/src/ctx-engine/.venv/bin/python -m backend.main
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+UMask=0077
 Restart=on-failure
 RestartSec=1
+TimeoutStopSec=15
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=/home/ubuntu/.pi/agent
-RestrictAddressFamilies=AF_INET AF_INET6
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 
 [Install]
 WantedBy=default.target

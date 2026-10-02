@@ -1,0 +1,53 @@
+@import "tailwindcss";
+
+/* Class-based dark mode (Tailwind v4 defaults to prefers-color-scheme). */
+@custom-variant dark (&:where(.dark, .dark *));
+
+:root {
+  color-scheme: light;
+}
+
+html.dark {
+  color-scheme: dark;
+}
+
+html,
+body,
+#app {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family:
+    ui-sans-serif,
+    system-ui,
+    -apple-system,
+    "Segoe UI",
+    Roboto,
+    "Helvetica Neue",
+    Arial,
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Thin, unobtrusive scrollbars for the JSON panes and tables. */
+.scroll-area {
+  scrollbar-width: thin;
+  scrollbar-color: rgb(100 116 139 / 0.45) transparent;
+}
+
+.scroll-area::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.scroll-area::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.scroll-area::-webkit-scrollbar-thumb {
+  background: rgb(100 116 139 / 0.45);
+  border-radius: 9999px;
+}

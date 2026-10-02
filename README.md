@@ -1,74 +1,100 @@
 # ctx-engine
 
-Loopback context-compression proxy: Bun, Elysia, native `bun:sqlite`. Runtime: `main.ts`, `condenser.ts`, `utils.ts`, `settings.ts`. Uses the existing Pi installation at `/usr/lib/node_modules/@earendil-works/pi-coding-agent` for native Codex subscription authentication. React/Vite dashboard: `frontend/`.
+Loopback context-compression proxy for Pi at **http://127.0.0.1:4141**.
+Fresh Python backend + Svelte 5 SPA, not a restoration of the retired Python or Bun implementations.
 
-```sh
-bun install --frozen-lockfile
-bun install --cwd frontend --frozen-lockfile
-bun run build
-bun run check
-bun test tests
-bun start
+## Layout
+
+```text
+backend/
+  db.py             SQLite storage
+  utils.py          configuration, wire-format helpers, condenser
+  main.py           FastAPI proxy, streaming, dashboard API
+  requirements.txt
+frontend/
+  src/App.svelte    overview, request inspection, settings
+  src/app.css       Tailwind 4
+  src/main.js       Svelte entry, Font Awesome
+  vite.config.js
+  package.json      Svelte 5, Chart.js, Font Awesome, Tailwind
+ tests/test_backend.py
+pi-context-router.service
+.env
 ```
 
-Open **http://127.0.0.1:4141/dashboard/**.
+## Setup and run
 
-## Dashboard
-
-- **Overview:** compression/cache counters since restart and persisted lifetime request totals. Token counts are estimates; durations stop at compression completion or upstream response headers, not the end of streaming.
-- **History:** every proxied GET/POST and `/compress` request, including unchanged and failed requests. Search by route/model, filter changed/unchanged, and load older pages through the full retained history. No automatic pruning.
-- **Inspection:** each recorded change shown as a complete line diff, plus full original and forwarded bodies verbatim in collapsible blocks and JSON download. Wrapping is on by default. The active tab and inspected request live in the URL, so refresh restores both. Authorization headers are never recorded. Payloads can contain secrets, so history is sensitive local data.
-- **Settings:** context threshold (64k default, with 32k/64k/96k/128k presets), protected recent turns, summary size, block prompt and model selection: Codex Luna 6 or DeepSeek Flash (low reasoning). Save explicitly. Validated updates apply to new requests and persist in SQLite; in-flight compression keeps its settings snapshot. Reset fills the form with `.env` defaults; Save applies it. Credentials, routes and DeepSeek URL remain in `.env`.
-
-Recording starts with this dashboard deployment. Previously unrecorded payloads cannot be recovered. Old SQLite tables are preserved, but are not relabeled as new history. Interrupted requests are marked failed after restart.
-
-## Configuration and compression
-
-Run from the repository root. `.env` supplies startup configuration; missing settings fail startup. Dashboard overrides live in `dashboard_settings`, not in rewritten environment files. DeepSeek Flash uses the configured URL and API key or Pi's `auth.json`. Luna 6 uses Pi's newer `openai` ChatGPT-subscription credentials, with native token refresh and the direct `https://api.openai.com/v1` catalog upstream; condenser calls do not call the router recursively. Pi must already be signed in. Retired controls are removed from saved dashboard settings on startup.
-
-Turns are grouped before compression. Over budget, all eligible older blocks launch together via `Promise.all(groups.map(...))`, and downstream waits for every block. There is no worker pool, queue or in-flight deduplication. Each uncached block gets **three total attempts**, each bounded to **10 seconds**, including authentication and response-body reads. Exhaustion logs one `CRITICAL` message with model and message hash, never payloads or credentials. Failed blocks are not cached. The configured newest turns, including tool calls/results and images, remain intact; there is no standalone tool summarizer.
-
-Transcripts label `user:`, `assistant:`, `tool_call:`, `tool_output:`, `thinking:`. The cache key is exactly `messageHash-model-outputTokenLimit`; rendered-output hashes prevent summarizing a cached note again. No cache tags are injected. A per-block length instruction targets **100 + ceil(estimated transcript tokens / 10)** output tokens and is appended to the condenser's **system prompt**, not the user transcript. Input uses the existing estimate (Unicode characters / 3.5, rounded up): 3,500 characters → 1,000 estimated tokens → a 200-token summary target. Length is a sizing hint, never clipping; `maxTokens` remains provider safety headroom. The legacy `words` setting is retained for settings/API compatibility but no longer controls condensation and is not shown in the dashboard. Existing cached notes remain unchanged and reused under the same strict cache key; the new formula applies to uncached blocks. Sampling is left to the model defaults.
-
-There are no excerpts or character-clipping functions. Failed summaries leave the block intact. If the request still exceeds the context budget, oldest unprotected turns may be dropped. If protected turns or fixed fields alone exceed the budget, the request is forwarded unchanged: the configured budget is a soft compaction threshold, and the upstream model's context window is the only hard limit.
-
-## API
-
-- `GET /health`, `GET /stats`
-- `GET/POST /r/<provider>/...`: streaming proxy preserving credentials and gzip/zstd. Pi's newer `openai` provider uses base URL `http://127.0.0.1:4141/r/openai` in `~/.pi/agent/models.json`; `/r/openai/responses` forwards to `https://api.openai.com/v1/responses` after context compression. No HTTP redirect bypasses the router. For subscription bearer tokens only, the proxy omits `max_output_tokens`, `temperature`, `prompt_cache_retention` and `prompt_cache_options`, matching Pi's direct-OpenAI normalization that otherwise does not recognize loopback URLs. API-key (`sk-`) requests retain these fields.
-- `GET/POST /codex/responses`: legacy Codex compatibility route, retained for existing sessions.
-- `POST /compress`: returns a compressed Chat Completions or Responses body without forwarding.
-- `GET/PUT /api/settings`: effective settings, `.env` defaults, validated partial updates.
-- `GET /api/history?limit=50&before=<id>&changed=all|yes|no&search=<route/model>`: descending cursor pagination.
-- `GET /api/history/<id>`: complete inspection record.
-
-Dashboard APIs reject cross-origin browser requests and non-loopback hosts. This is a local service, not a public multi-tenant deployment. Accounts, provider probes, billing and the old master-session CLI remain removed.
-
-## Development and checks
+Requires Python 3.13+, Node 20.19+ (or 22.12+), npm; `uv` is used for the virtual environment.
+The optional Luna condenser also requires the host's Bun and installed Pi SDK; the HTTP backend itself is Python.
 
 ```sh
-bun run --cwd frontend dev
-bun run format
-bun run check
-bun test tests
-CHROME_BIN=/path/to/chrome bun run test:ui
-bun run tests/condenser.live.ts # optional: real inference with existing credentials, isolated in-memory DB
-bun run tests/openai-route.live.ts # optional: native OpenAI subscription request through the deployed router
+uv venv .venv --python python3
+uv pip install --python .venv/bin/python -r backend/requirements.txt
+cd frontend && npm ci && npm run build && cd ..
+.venv/bin/python -m backend.main
 ```
 
-The browser check uses an isolated in-memory database and mock condenser. Build first; it checks metrics, pagination (including bursts larger than one page), per-change diffs, verbatim bodies, URL state across reload, download, settings saves and mobile layout. `CHROME_BIN` must point to installed Chrome/Chromium. Persistence tests reopen the database in a new process, including removal of retired settings. The live check fails unless both models produce real notes and reuse their cache. For the newer OpenAI connection, use `/login openai` and choose ChatGPT subscription if authentication fails. Run `/reload` after changing `models.json`, then select `openai/gpt-6-luna`; existing `openai-codex` sessions keep the legacy route. Model catalog presence or mocked tests alone do not establish subscription access.
+SPA: **http://127.0.0.1:4141/dashboard/**. Day/night theme, activity chart, auto-refreshing request history, full before/after JSON inspection with copy/download, and persistent settings.
+Vite development: `cd frontend && npm run dev`; the dev server proxies API calls to :4141.
 
-## Local deployment
-
-User service `pi-context-router.service` runs Bun from this repository. Build the dashboard before restarting:
+### Checks
 
 ```sh
-bun run build
+.venv/bin/python -m unittest discover -s tests -v
+cd frontend && npm run check && npm run build
+```
+
+Tests are offline with mocked inference and upstreams: no provider credentials or charges. They cover storage persistence, interruption recovery, strict cache keys, protected turns and tool linkage, Responses format, parallel fanout, timeouts, fail-fast failure messages, body encodings, streaming, subscription normalization, history pagination, and database failure status.
+Rendered UI regression check (a Chromium headless shell is available on this host):
+
+```sh
+.venv/bin/python tests/test_ui.py
+```
+
+### Deploy
+
+```sh
 install -m 644 pi-context-router.service ~/.config/systemd/user/pi-context-router.service
 systemctl --user daemon-reload
-systemctl --user enable pi-context-router.service
 systemctl --user restart pi-context-router.service
 curl -fsS http://127.0.0.1:4141/health
+journalctl --user -u pi-context-router.service -n 20 --no-pager
 ```
 
-Enabled at user-session startup, restarting on failure. Home/system are read-only; only `~/.pi/agent` is writable for SQLite. Existing Pi local provider URLs do not change. Dashboard assets are served by the same Bun service, with no separate frontend process.
+Build before restarting after frontend changes. The service binds loopback only, uses a restrictive umask, and can write only under `~/.pi/agent`.
+
+## Configuration and proxy
+
+`.env` supplies defaults; process environment takes precedence. Persisted dashboard settings override the defaults on restart. Default soft threshold: **32,000 estimated tokens**; keep **two recent turns**, output safety cap **4096 tokens**. Estimates are Unicode characters / 3.5, excluding image data; they are not provider billing counts.
+
+- `/r/<provider>/<path>` joins the path and query onto the provider URL in `PI_CONTEXT_ROUTER_ROUTES`. Incoming authorization goes only to that selected upstream, never into SQLite or logs. Unknown providers return 404. Google/Antigravity is not routed: its proprietary wire format is not OpenAI-compatible.
+- `/codex/responses` remains supported for older Pi sessions. Pi's `models.json` does not need to change.
+- Non-`sk-` subscription bearers on `/r/openai/responses` and `/codex/responses` strip `max_output_tokens`, `temperature`, `prompt_cache_retention`, and `prompt_cache_options`. API-key requests keep them.
+- Upstream bodies are streamed raw, including SSE and compressed responses. gzip/zstd requests are decoded only for inspection/compression and re-encoded only when changed. Empty-body endpoints bypass JSON parsing. Context overflow never returns 413; excessive transport byte sizes are a separate 400 safety limit.
+- Dashboard APIs require same-origin browser access. This is a sensitive, loopback-only local tool, not a publicly authenticated service.
+
+## Condensation
+
+Complete older turns condense in parallel; all tasks settle before forwarding. The newest configured turns and system/developer prefix remain intact. Image-containing turns stay intact. Both Chat Completions `messages` and Responses `input` are supported.
+
+DeepSeek Flash uses API credentials from `PI_CONTEXT_ROUTER_API_KEY` or Pi's existing `auth.json`. Luna 6 uses a one-shot Bun child invoking the **supported native Pi SDK** with `modelsPath: null`, direct upstream, and native OAuth refresh. No CLI agent loop, tool execution, or installed-core patches. Both condensers use low reasoning.
+
+Each uncached block has **three total attempts, 10 seconds each**. Empty/failed/timed-out output is never cached. Exhaustion returns HTTP 502 with `Summarization failed for turn: "<verbatim user message>"`. No clipped excerpts, silent dropping, fallback summaries, or idle warming. If protected/fixed context alone exceeds the soft threshold, forward the entire request unchanged with a warning. If real summaries still exceed it, keep every block and warn.
+
+Cache keys are exactly `<SHA256 canonical block>-<model>-<output cap>`. The sizing hint is `100 + ceil(estimated transcript tokens / 10)`; it is not a truncation rule. The first committed note is canonical when concurrent requests race. Existing rendered notes are recognized to avoid recondensing them. Settings are snapshotted once per incoming request.
+
+## SQLite and request logs
+
+Fresh database: `~/.pi/agent/ctx-engine-v2.db` (override `PI_CONTEXT_ROUTER_DB`). Three application tables, plus SQLite's sequence table:
+
+| Table | Purpose |
+| --- | --- |
+| `settings` | key → JSON value |
+| `cache` | strict key, output, output hash, creation timestamp |
+| `requests` | request metadata and full original/forwarded JSON plus changes |
+
+WAL, 5-second busy timeout, 0600 main database. No migrations or legacy table reuse. No automatic deletion/pruning of payloads. Request rows begin before inference, preserve originals before slow operations, then finalize with status/duration/error. Streams finalize at completion; a restart marks unfinished rows 503 rather than leaving them permanently in-flight. Every proxied request also emits a payload-free journal line. SQLite failures are 503, never bad credentials. `/health` runs a fresh SQLite quick check.
+
+The pre-rewrite source and a consistent SQLite backup are stored under `~/.pi/agent/backups/ctx-engine-20261002-103354/`. The original `~/.pi/agent/ctx-engine.db` is preserved but not opened by this implementation. It passed full integrity checks; the obsolete `requests` table had stopped receiving writes when the previous backend changed. New history starts at this deployment; it does not fabricate missing historical payloads.
+
+Full stored payloads and downloaded inspection JSON may contain sensitive prompt data. Credentials in HTTP headers are never persisted. Protect or remove backups manually when no longer needed.
