@@ -148,6 +148,12 @@ def run():
 
                 cdp("Runtime.enable")
                 cdp("Page.enable")
+                cdp("Emulation.setTimezoneOverride", {"timezoneId": "Asia/Kolkata"})
+                cdp("Emulation.setLocaleOverride", {"locale": "en-US"})
+                cdp(
+                    "Page.addScriptToEvaluateOnNewDocument",
+                    {"source": (ROOT / "tests/chart_dates.js").read_text()},
+                )
                 cdp(
                     "Page.navigate",
                     {"url": f"http://127.0.0.1:{backend_port}/dashboard/"},
@@ -165,6 +171,7 @@ def run():
                   await wait(() => document.querySelector('canvas'));
                   await wait(() => !document.body.innerText.includes('Connecting'));
                   assert(document.body.innerText.includes('Python'), 'Python badge missing');
+                  const chartDatesResult = await chartDates.check();
                   const visible = el => el.getBoundingClientRect().width > 0 && el.getBoundingClientRect().height > 0;
                   const contrast = () => {
                     for (const el of document.querySelectorAll('h1,h2,button,td,label')) {
@@ -209,7 +216,7 @@ def run():
                   [...document.querySelectorAll('button')].find(b=>b.textContent.includes('Apply settings')).click();
                   await wait(() => document.body.innerText.includes('Settings saved.'));
                   contrast();
-                  return {theme:document.documentElement.className, settings:'saved',history:'rendered',chart:'rendered'};
+                  return {theme:document.documentElement.className, settings:'saved',history:'rendered',chart:chartDatesResult};
                 })()
                 """
                 script = script.replace("TOKEN_CASES", json.dumps(token_cases))
