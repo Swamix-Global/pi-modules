@@ -78,6 +78,20 @@ def run():
                 ],
             },
         )
+        token_cases = {rid: "8.0 k → 2.0 k (-75.0%)"}
+        for before, after, expected in (
+            (12345, 4567, "12.3 k → 4.6 k (-63.0%)"),
+            (1500, 1500, "1.5 k → 1.5 k (0.0%)"),
+            (1000, 1500, "1.0 k → 1.5 k (+50.0%)"),
+            (0, 0, "0.0 k → 0.0 k (0.0%)"),
+            (0, 500, "0.0 k → 0.5 k (—)"),
+            (100000, 99999, "100.0 k → 100.0 k (0.0%)"),
+        ):
+            case_id = db.start_request("POST /r/test/chat/completions")
+            fixture = db.detail(rid)
+            fixture.update(before_tokens=before, after_tokens=after)
+            db.finish_request(case_id, fixture)
+            token_cases[case_id] = expected
         backend_port, chrome_port = free_port(), free_port()
         env = {
             **os.environ,
@@ -171,11 +185,22 @@ def run():
                   document.querySelector('#tab-requests').click();
                   await wait(() => document.querySelector('button[aria-label="Expand request 1"]'));
                   assert(location.search.includes('tab=requests'), 'Tab URL missing');
+                  const headers = [...document.querySelectorAll('#panel-requests th')].map(h => h.textContent.trim());
+                  assert(JSON.stringify(headers) === JSON.stringify(['Status','Model','Created','Duration','Tokens','Cached','Detail']), 'Unexpected log columns: ' + headers);
+                  for (const [id, expected] of Object.entries(TOKEN_CASES)) {
+                    const button = document.querySelector(`button[aria-label="Expand request ${id}"]`);
+                    const row = button.closest('tr');
+                    assert(row.cells.length === 7, 'Wrong column count');
+                    assert(row.cells[4].textContent.trim() === expected, 'Wrong token flow: ' + row.cells[4].textContent);
+                  }
                   document.querySelector('button[aria-label="Expand request 1"]').click();
                   await wait(() => document.body.innerText.includes('UI regression evidence'));
                   assert(document.querySelector('button[aria-label="Copy Original JSON"]'), 'Copy button missing');
                   assert(document.querySelector('button[aria-label="Download Forwarded JSON"]'), 'Download missing');
                   assert(location.search.includes('request=1'), 'Detail URL missing');
+                  const detailCard = document.querySelector('#panel-requests h2').parentElement.parentElement;
+                  assert([...detailCard.querySelectorAll('p')].some(p => p.textContent.trim() === '8.0 k → 2.0 k (-75.0%)'), 'Detail token flow missing');
+                  assert(![...detailCard.querySelectorAll('p')].some(p => p.textContent.trim() === 'Route'), 'Route remains in details');
                   document.querySelector('#tab-settings').click();
                   await new Promise(r => requestAnimationFrame(r));
                   await wait(() => document.querySelector('input[aria-label="Context token budget"]') && !document.body.innerText.includes('Loading settings'));
@@ -187,6 +212,7 @@ def run():
                   return {theme:document.documentElement.className, settings:'saved',history:'rendered',chart:'rendered'};
                 })()
                 """
+                script = script.replace("TOKEN_CASES", json.dumps(token_cases))
                 result = cdp(
                     "Runtime.evaluate",
                     {"expression": script, "awaitPromise": True, "returnByValue": True},
@@ -195,16 +221,17 @@ def run():
                 assert not console_errors, console_errors
                 print("UI desktop:", result["result"].get("value"))
                 # An external request must appear without clicking Reload.
-                db.start_request("GET /r/test/live-refresh-regression")
+                live_id = db.start_request("GET /r/test/live-refresh-regression")
                 live_check = r"""(async () => {
                   document.querySelector('#tab-requests').click();
                   const deadline = performance.now() + 8000;
-                  while (!document.body.innerText.includes('live-refresh-regression')) {
+                  while (!document.querySelector('button[aria-label="Expand request LIVE_ID"]')) {
                     if (performance.now() > deadline) throw Error('Request history did not auto-refresh');
                     await new Promise(r => setTimeout(r, 50));
                   }
                   return true;
                 })()"""
+                live_check = live_check.replace("LIVE_ID", str(live_id))
                 result = cdp(
                     "Runtime.evaluate",
                     {

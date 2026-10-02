@@ -120,6 +120,15 @@
     return Number.isFinite(value) ? value.toLocaleString() : "—";
   }
 
+  function formatTokenFlow(before, after) {
+    if (!Number.isFinite(before) || !Number.isFinite(after) || before < 0 || after < 0)
+      return "—";
+    const change = before > 0 ? ((after - before) / before) * 100 : after === 0 ? 0 : null;
+    const rounded = change === null ? null : Math.round(change * 10) / 10;
+    const percent = rounded === null ? "—" : `${rounded > 0 ? "+" : ""}${rounded.toFixed(1)}%`;
+    return `${(before / 1000).toFixed(1)} k → ${(after / 1000).toFixed(1)} k (${percent})`;
+  }
+
   function formatDuration(ms) {
     if (!Number.isFinite(ms) || ms < 0) return "—";
     if (ms < 1000) return `${Math.round(ms)} ms`;
@@ -907,7 +916,7 @@
               type="search"
               bind:value={search}
               oninput={onSearchInput}
-              placeholder="Search route or model…"
+              placeholder="Search requests…"
               aria-label="Search requests"
               class="w-full rounded-md border border-slate-300 bg-white py-2 pl-9 pr-3 text-sm text-slate-800 outline-none transition placeholder:text-slate-400 focus:border-cyan-500 focus:ring-2 focus:ring-cyan-500/20 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
             />
@@ -956,18 +965,16 @@
           class="overflow-hidden rounded-lg border border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900"
         >
           <div class="scroll-area overflow-x-auto">
-            <table class="w-full min-w-[820px] text-left text-sm">
+            <table class="w-full min-w-[720px] text-left text-sm">
               <thead
                 class="border-b border-slate-200 text-xs uppercase tracking-wide text-slate-500 dark:border-slate-800 dark:text-slate-400"
               >
                 <tr>
                   <th scope="col" class="px-3 py-2 font-medium">Status</th>
                   <th scope="col" class="px-3 py-2 font-medium">Model</th>
-                  <th scope="col" class="px-3 py-2 font-medium">Route</th>
-                  <th scope="col" class="px-3 py-2 font-medium">Created (local)</th>
+                  <th scope="col" class="px-3 py-2 font-medium">Created</th>
                   <th scope="col" class="px-3 py-2 font-medium">Duration</th>
-                  <th scope="col" class="px-3 py-2 text-right font-medium">Input</th>
-                  <th scope="col" class="px-3 py-2 text-right font-medium">Output</th>
+                  <th scope="col" class="px-3 py-2 text-right font-medium">Tokens</th>
                   <th scope="col" class="px-3 py-2 font-medium">Cached</th>
                   <th scope="col" class="px-3 py-2 font-medium">
                     <span class="sr-only">Detail</span>
@@ -977,7 +984,7 @@
               <tbody>
                 {#if history.length === 0 && !historyLoading}
                   <tr>
-                    <td colspan="9" class="px-3 py-10 text-center text-slate-500 dark:text-slate-400">
+                    <td colspan="7" class="px-3 py-10 text-center text-slate-500 dark:text-slate-400">
                       <i class="fa-solid fa-inbox mb-2 block text-2xl" aria-hidden="true"></i>
                       No requests match this view yet.
                     </td>
@@ -1000,11 +1007,9 @@
                       </span>
                     </td>
                     <td class="px-3 py-2 font-mono text-xs">{item.model || "—"}</td>
-                    <td class="px-3 py-2 font-mono text-xs">{item.route || "—"}</td>
                     <td class="px-3 py-2 whitespace-nowrap text-xs">{formatTime(item.created_at)}</td>
                     <td class="px-3 py-2 whitespace-nowrap text-xs">{formatDuration(item.duration_ms)}</td>
-                    <td class="px-3 py-2 text-right tabular-nums">{formatNumber(item.before_tokens)}</td>
-                    <td class="px-3 py-2 text-right tabular-nums">{formatNumber(item.after_tokens)}</td>
+                    <td class="px-3 py-2 whitespace-nowrap text-right tabular-nums">{formatTokenFlow(item.before_tokens, item.after_tokens)}</td>
                     <td class="px-3 py-2">
                       {#if item.cache_hits > 0}
                         <span
@@ -1105,20 +1110,12 @@
                   <p class="font-mono">{detail.model || "—"}</p>
                 </div>
                 <div>
-                  <p class="text-slate-500 dark:text-slate-400">Route</p>
-                  <p class="font-mono">{detail.route || "—"}</p>
-                </div>
-                <div>
                   <p class="text-slate-500 dark:text-slate-400">Duration</p>
                   <p>{formatDuration(detail.duration_ms)}</p>
                 </div>
-                <div>
-                  <p class="text-slate-500 dark:text-slate-400">Input tokens</p>
-                  <p class="tabular-nums">{formatNumber(detail.before_tokens)}</p>
-                </div>
-                <div>
-                  <p class="text-slate-500 dark:text-slate-400">Output tokens</p>
-                  <p class="tabular-nums">{formatNumber(detail.after_tokens)}</p>
+                <div class="col-span-2">
+                  <p class="text-slate-500 dark:text-slate-400">Tokens</p>
+                  <p class="tabular-nums">{formatTokenFlow(detail.before_tokens, detail.after_tokens)}</p>
                 </div>
                 <div>
                   <p class="text-slate-500 dark:text-slate-400">Changed</p>
