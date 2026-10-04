@@ -18,7 +18,7 @@ Fresh loopback context-compression proxy: Python/FastAPI/httpx/sqlite3 in `backe
 - Cache key strictly `<assistant activity block SHA256>-<model>-<output cap>`; concurrent misses return the first committed note. Old whole-turn cache keys are not reused for assistant-only notes. Recognize already-rendered assistant notes. Sizing hints never truncate output.
 - Tool calls/results stay together; image-containing blocks remain intact; encrypted reasoning is not rendered to the condenser. All verbatim queries are indivisible fixed context; if those plus protected/fixed fields exceed the soft budget, skip condensation rather than truncate queries (adjacent-user concatenation still applies).
 - Subscription-authenticated `/r/openai/responses` and `/codex/responses` strip `max_output_tokens`, `temperature`, `prompt_cache_retention`, and `prompt_cache_options`; `sk-` payloads retain them.
-- Only OpenAI-compatible wire formats route here; never route Antigravity's proprietary Protobuf API.
+- Antigravity requests can route through `/r/antigravity` as a secure pass-through: the proxy server securely forwards requests upstream to Google Cloud over HTTPS without mutating proprietary non-OpenAI wire formats.
 - Persist attempts and full received/forwarded JSON, not credentials; no automatic pruning. Log each proxy decision in the journal. Database failures return 503. Health measures SQLite fresh; restarts finalize unfinished rows.
 - SPA timestamps use system locale; chart anchors to server `now`; tabs/request selection persist in URL. Themes must remain high-contrast.
 

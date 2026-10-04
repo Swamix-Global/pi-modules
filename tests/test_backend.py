@@ -681,6 +681,30 @@ class ProxyTests(unittest.TestCase):
                 503,
             )
 
+    def test_antigravity_passthrough_route(self):
+        payload = {
+            "project": "test-proj",
+            "model": "gemini-2.5-pro",
+            "request": {
+                "contents": [
+                    {"role": "user", "parts": [{"text": "explain quantum computing"}]}
+                ]
+            },
+        }
+        response = self.client.post(
+            "/r/antigravity/v1internal:streamGenerateContent?alt=sse",
+            json=payload,
+            headers={"Authorization": "Bearer ya29.test-oauth-token"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            str(self.received[-1].url),
+            "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse",
+        )
+        forwarded = json.loads(self.received[-1].content)
+        self.assertEqual(forwarded, payload)
+        self.assertIn("ya29.test-oauth-token", self.received[-1].headers["authorization"])
+
 
 if __name__ == "__main__":
     unittest.main()

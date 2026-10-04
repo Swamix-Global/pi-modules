@@ -32,7 +32,7 @@ DEFAULTS = {
 ROUTES = json.loads(
     os.getenv(
         "PI_CONTEXT_ROUTER_ROUTES",
-        '{"openai":"https://api.openai.com/v1","deepseek":"https://api.deepseek.com"}',
+        '{"openai":"https://api.openai.com/v1","deepseek":"https://api.deepseek.com","antigravity":"https://daily-cloudcode-pa.googleapis.com"}',
     )
 )
 UPSTREAM = os.getenv("PI_CONTEXT_ROUTER_UPSTREAM", "https://chatgpt.com/backend-api")

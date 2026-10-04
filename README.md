@@ -67,7 +67,7 @@ Build before restarting after frontend changes. The service binds loopback only,
 
 `.env` supplies defaults; process environment takes precedence. Persisted dashboard settings override the defaults on restart. Default soft threshold: **32,000 estimated tokens**; keep **two recent turns**, output safety cap **8192 tokens**. Estimates are Unicode characters / 3.5, excluding image data; they are not provider billing counts.
 
-- `/r/<provider>/<path>` joins the path and query onto the provider URL in `PI_CONTEXT_ROUTER_ROUTES`. Incoming authorization goes only to that selected upstream, never into SQLite or logs. Unknown providers return 404. Google/Antigravity is not routed: its proprietary wire format is not OpenAI-compatible.
+- `/r/<provider>/<path>` joins the path and query onto the provider URL in `PI_CONTEXT_ROUTER_ROUTES`. Incoming authorization goes only to that selected upstream, never into SQLite or logs. Unknown providers return 404. Antigravity routes through `/r/antigravity` as a secure pass-through: the proxy securely forwards upstream over HTTPS, preserving non-OpenAI wire formats intact.
 - `/codex/responses` remains supported for older Pi sessions. Pi's `models.json` does not need to change.
 - Non-`sk-` subscription bearers on `/r/openai/responses` and `/codex/responses` strip `max_output_tokens`, `temperature`, `prompt_cache_retention`, and `prompt_cache_options`. API-key requests keep them.
 - Upstream bodies are streamed raw, including SSE and compressed responses. gzip/zstd requests are decoded only for inspection/compression and re-encoded only when changed. Empty-body endpoints bypass JSON parsing. Context overflow never returns 413; excessive transport byte sizes are a separate 400 safety limit.
