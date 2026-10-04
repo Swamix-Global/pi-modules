@@ -169,15 +169,115 @@ class CompressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(changes, [])
         self.assertEqual(hits, 1)
 
-    async def test_verbatim_query_overflow_does_not_summarize_the_query(self):
-        self.body["messages"][1]["content"] = "large exact query " * 1000
-        with patch.object(utils, "condenser", AsyncMock()) as call:
+    async def test_verbatim_query_overflow_still_condenses_only_activity(self):
+        query = "large exact query " * 1000
+        self.body["messages"][1]["content"] = query
+        with patch.object(
+            utils, "condenser", AsyncMock(return_value="activity note")
+        ) as call:
             result, changes, _ = await utils.compress_body(
                 self.body, self.config, self.db, None
             )
-        self.assertEqual(result, self.body)
-        self.assertEqual(changes, [])
-        call.assert_not_awaited()
+        self.assertEqual(result["messages"][1], self.body["messages"][1])
+        self.assertEqual(result["messages"][2]["content"], "activity note")
+        self.assertEqual(result["messages"][-3:], self.body["messages"][-3:])
+        self.assertEqual(len(changes), 1)
+        self.assertLess(utils.tokens(result), utils.tokens(self.body))
+        call.assert_awaited_once()
+        self.assertNotIn(query, call.call_args.args[1])
+
+    async def test_protected_overflow_still_condenses_completed_activity(self):
+        for field in ("messages", "input"):
+            with self.subTest(field=field):
+                query = {"role": "user", "content": "  newest exact query 😀  "}
+                if field == "input":
+                    activity = [
+                        {
+                            "type": "function_call",
+                            "call_id": "live",
+                            "name": "read",
+                            "arguments": "{}",
+                        },
+                        {
+                            "type": "function_call_output",
+                            "call_id": "live",
+                            "output": "live evidence " * 1000,
+                        },
+                    ]
+                else:
+                    activity = [
+                        {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "id": "live",
+                                    "type": "function",
+                                    "function": {"name": "read", "arguments": "{}"},
+                                }
+                            ],
+                        },
+                        {
+                            "role": "tool",
+                            "tool_call_id": "live",
+                            "content": "live evidence " * 1000,
+                        },
+                    ]
+                body = {
+                    field: [
+                        {"role": "system", "content": "fixed rules"},
+                        {"role": "user", "content": "older exact query"},
+                        {
+                            "role": "assistant",
+                            "content": f"{field} old evidence " * 2000,
+                        },
+                        query,
+                        *activity,
+                    ]
+                }
+                before = utils.canonical(body)
+                with patch.object(
+                    utils, "condenser", AsyncMock(return_value="older activity note")
+                ) as call:
+                    result, changes, _ = await utils.compress_body(
+                        body, {**self.config, "keepTurns": 1}, self.db, None
+                    )
+                self.assertEqual(result[field][-3:], [query, *activity])
+                self.assertEqual(result[field][:2], body[field][:2])
+                self.assertEqual(
+                    result[field][2],
+                    {"role": "assistant", "content": "older activity note"},
+                )
+                self.assertEqual(len(changes), 1)
+                self.assertLess(utils.tokens(result), utils.tokens(body))
+                self.assertGreater(utils.tokens(result), self.config["tokens"])
+                self.assertEqual(utils.canonical(body), before)
+                call.assert_awaited_once()
+                self.assertNotIn("live evidence", call.call_args.args[1])
+
+    async def test_indivisible_image_overflow_does_not_disable_other_blocks(self):
+        image_block = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "image query " * 1000},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,abcd"},
+                    },
+                ],
+            },
+            {"role": "assistant", "content": "image activity"},
+        ]
+        self.body["messages"][1:1] = image_block
+        with patch.object(
+            utils, "condenser", AsyncMock(return_value="older activity note")
+        ) as call:
+            result, _, _ = await utils.compress_body(
+                self.body, self.config, self.db, None
+            )
+        self.assertEqual(result["messages"][1:3], image_block)
+        self.assertLess(utils.tokens(result), utils.tokens(self.body))
+        call.assert_awaited_once()
 
     async def test_consecutive_queries_join_below_threshold_without_inference(self):
         body = {
@@ -343,22 +443,35 @@ class CompressionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_overflow_never_drops_or_clips(self):
         body = {**self.body, "instructions": "fixed " * 3000}
-        with patch.object(utils, "condenser", AsyncMock()) as call:
+        with patch.object(
+            utils, "condenser", AsyncMock(return_value="activity note")
+        ) as call:
             result, changes, _ = await utils.compress_body(
                 body, self.config, self.db, None
             )
-            self.assertEqual(result, body)
-            self.assertEqual(changes, [])
-            call.assert_not_awaited()
-        with patch.object(
-            utils, "condenser", AsyncMock(return_value="large note " * 3000)
-        ):
-            result, _, _ = await utils.compress_body(
+            self.assertEqual(result["instructions"], body["instructions"])
+            self.assertEqual(result["messages"][:2], body["messages"][:2])
+            self.assertEqual(result["messages"][-3:], body["messages"][-3:])
+            self.assertLess(utils.tokens(result), utils.tokens(body))
+            self.assertEqual(len(changes), 1)
+            call.assert_awaited_once()
+
+    async def test_nonreducing_summary_keeps_original_block_and_reuses_cache(self):
+        note = "large note " * 3000
+        with patch.object(utils, "condenser", AsyncMock(return_value=note)) as call:
+            first, changes, _ = await utils.compress_body(
                 self.body, self.config, self.db, None
             )
-            self.assertEqual(len(result["messages"]), 6)
-            self.assertEqual(result["messages"][1], self.body["messages"][1])
-            self.assertEqual(result["messages"][-3:], self.body["messages"][-3:])
+            second, changes2, hits = await utils.compress_body(
+                self.body, self.config, self.db, None
+            )
+        self.assertEqual(first, self.body)
+        self.assertEqual(second, self.body)
+        self.assertEqual(changes, [])
+        self.assertEqual(changes2, [])
+        self.assertEqual(hits, 1)
+        call.assert_awaited_once()
+        self.assertEqual(self.db.rows("SELECT output FROM cache")[0]["output"], note)
 
     async def test_responses_and_opaque_reasoning(self):
         body = {
@@ -548,6 +661,45 @@ class ProxyTests(unittest.TestCase):
                         ["merge_users", "block"],
                     )
 
+    def test_proxy_condenses_older_activity_when_protected_floor_overflows(self):
+        main.app.state.db.save_settings(
+            {**utils.DEFAULTS, "tokens": 1024, "keepTurns": 1}
+        )
+        for field, route in (
+            ("messages", "/r/deepseek/chat/completions"),
+            ("input", "/r/openai/responses"),
+        ):
+            with self.subTest(field=field):
+                body = {
+                    field: [
+                        {"role": "user", "content": "  exact older query 😀  "},
+                        {
+                            "role": "assistant",
+                            "content": f"{field} old evidence " * 2000,
+                        },
+                        {"role": "user", "content": "newest exact query"},
+                        {"role": "assistant", "content": "protected evidence " * 1000},
+                    ]
+                }
+                with patch.object(
+                    utils, "condenser", AsyncMock(return_value="older activity note")
+                ) as call:
+                    response = self.client.post(route, json=body)
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.headers["x-context-router"], "compacted")
+                forwarded = json.loads(self.received[-1].content)
+                self.assertEqual(forwarded[field][0], body[field][0])
+                self.assertEqual(forwarded[field][-2:], body[field][-2:])
+                self.assertEqual(forwarded[field][1]["content"], "older activity note")
+                self.assertLess(utils.tokens(forwarded), utils.tokens(body))
+                call.assert_awaited_once()
+                latest = self.client.get("/api/history?limit=1").json()["items"][0]
+                self.assertLess(latest["after_tokens"], latest["before_tokens"])
+                detail = self.client.get(f"/api/history/{latest['id']}").json()
+                self.assertEqual(detail["original"], body)
+                self.assertEqual(detail["compressed"], forwarded)
+                self.assertEqual([c["kind"] for c in detail["changes"]], ["block"])
+
     def test_oauth_normalization_for_both_routes_and_api_key(self):
         body = {
             "model": "m",
@@ -615,6 +767,7 @@ class ProxyTests(unittest.TestCase):
                 {"role": "user", "content": "prev"},
                 {"role": "assistant", "content": "previous answer"},
                 {"role": "user", "content": "live"},
+                {"role": "assistant", "content": "protected evidence " * 1000},
             ]
         }
         main.app.state.db.save_settings({**utils.DEFAULTS, "tokens": 1024})
@@ -703,7 +856,9 @@ class ProxyTests(unittest.TestCase):
         )
         forwarded = json.loads(self.received[-1].content)
         self.assertEqual(forwarded, payload)
-        self.assertIn("ya29.test-oauth-token", self.received[-1].headers["authorization"])
+        self.assertIn(
+            "ya29.test-oauth-token", self.received[-1].headers["authorization"]
+        )
 
 
 if __name__ == "__main__":

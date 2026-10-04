@@ -349,7 +349,6 @@ async def ctx_man(block, config, db, client, *, user_message):
         )
         return hit, True
     source = transcript(block)
-    started = time.monotonic()
     for attempt in range(ATTEMPTS):
         attempt_started = time.monotonic()
         try:
@@ -433,10 +432,10 @@ async def compress_body(original, config, db, client):
     t_prot = tokens(protected)
     if t_prot > config["tokens"]:
         LOG.warning(
-            "Verbatim queries, protected turns or fixed fields exceed %s tokens; forwarding intact",
+            "Verbatim queries, protected turns or fixed fields exceed %s tokens; "
+            "preserving them and condensing eligible older activity",
             config["tokens"],
         )
-        return body if changes else original, changes, 0
 
     LOG.info(
         "Compression plan: total_tokens=%d protected_tokens=%d threshold=%d completed_blocks=%d total_turns=%d",
@@ -462,6 +461,18 @@ async def compress_body(original, config, db, client):
         )
         # String content is valid for assistant input in both OpenAI wire formats.
         result = [query, {"role": "assistant", "content": output}]
+        before_tokens, after_tokens = tokens(block), tokens(result)
+        # The threshold is a soft target, not permission to clip fixed context.
+        # A verbose note must not make a request larger; preserve the original
+        # block instead, while retaining the canonical cached note for reuse.
+        if after_tokens >= before_tokens:
+            LOG.info(
+                "Keeping non-reducing activity block; tokens=%d->%d cached=%s",
+                before_tokens,
+                after_tokens,
+                cached,
+            )
+            return block, None, int(cached)
         return (
             result,
             {
@@ -469,8 +480,8 @@ async def compress_body(original, config, db, client):
                 "before": block,
                 "after": result,
                 "cached": cached,
-                "before_tokens": tokens(block),
-                "after_tokens": tokens(result),
+                "before_tokens": before_tokens,
+                "after_tokens": after_tokens,
             },
             int(cached),
         )
