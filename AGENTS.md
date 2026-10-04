@@ -32,4 +32,4 @@ systemctl --user restart pi-context-router.service
 curl -fsS http://127.0.0.1:4141/health
 ```
 
-Run backend tests for any Python changes. Build and restart after frontend changes. See `README.md` for installation, backup location, architecture and deployment; do not duplicate process guides. Follow global agent rules and `~/.pi/agent/AGENTS-RSI.md` for stack changes. Keep existing unrelated user files intact; checkpoint meaningful progress in Git.
+Run backend tests for any Python changes. Build and restart after frontend changes. See `README.md` for installation, backup location, architecture and deployment; do not duplicate process guides. Follow global agent rules and `~/.pi/agent/AGENTS-RSI.md` for stack changes. Keep existing unrelated user files intact; commit changes every time files are modified, and show the diff between commits.
