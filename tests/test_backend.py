@@ -16,6 +16,7 @@ import zstandard
 from fastapi.testclient import TestClient
 
 from backend import main, utils
+from backend import db as db_module
 from backend.db import Database
 
 
@@ -902,6 +903,194 @@ class ProxyTests(unittest.TestCase):
         self.assertIn(
             "ya29.test-oauth-token", self.received[-1].headers["authorization"]
         )
+
+
+class DeltaAndZstdOptimizationTests(unittest.TestCase):
+    def test_zstd_binary_blobs_and_no_raw_payloads(self):
+        with tempfile.TemporaryDirectory() as folder:
+            db = Database(Path(folder) / "zstd.db")
+            body = {
+                "model": "deepseek-flash",
+                "messages": [
+                    {"role": "user", "content": "hello world"},
+                    {"role": "assistant", "content": "greetings"},
+                ],
+            }
+            rid = db.start_request("POST /r/deepseek/chat/completions")
+            trace = {
+                "model": "deepseek-flash",
+                "status": 200,
+                "changed": False,
+                "before_tokens": 15,
+                "after_tokens": 15,
+                "duration_ms": 100,
+                "cache_hits": 0,
+                "error": None,
+                "original": body,
+                "compressed": body,
+                "changes": [],
+            }
+            db.finish_request(rid, trace)
+
+            # Check raw storage in SQLite
+            with db.connect() as conn:
+                row = conn.execute(
+                    "SELECT original, compressed, typeof(original), typeof(compressed) FROM requests WHERE id=?",
+                    (rid,),
+                ).fetchone()
+
+            # original MUST be a binary blob starting with Zstandard magic bytes, NOT raw text
+            self.assertEqual(row[2], "blob")
+            self.assertTrue(row[0].startswith(db_module.ZSTD_MAGIC))
+            # compressed MUST be NULL because changed == False (no duplicate storage)
+            self.assertEqual(row[3], "null")
+            self.assertIsNone(row[1])
+
+            # detail() must transparently decompress and reconstruct identical payloads
+            detail = db.detail(rid)
+            self.assertEqual(detail["original"], body)
+            self.assertEqual(detail["compressed"], body)
+            self.assertFalse(detail["delta"]["changed"])
+            self.assertEqual(detail["delta"]["summary"], "identical")
+
+    def test_delta_calculation_and_condensed_storage(self):
+        with tempfile.TemporaryDirectory() as folder:
+            db = Database(Path(folder) / "delta.db")
+            original_body = {
+                "model": "deepseek-flash",
+                "messages": [
+                    {"role": "user", "content": "turn 1 query"},
+                    {"role": "assistant", "content": "turn 1 response"},
+                    {"role": "user", "content": "turn 2 query"},
+                ],
+                "max_output_tokens": 100,
+            }
+            compressed_body = {
+                "model": "deepseek-flash",
+                "messages": [
+                    {"role": "user", "content": "turn 1 query"},
+                    {"role": "assistant", "content": "summary note"},
+                    {"role": "user", "content": "turn 2 query"},
+                ],
+            }
+            changes = [
+                {
+                    "kind": "subscription",
+                    "before": {"max_output_tokens": 100},
+                    "after": None,
+                },
+                {"kind": "block", "before": 20, "after": 5},
+            ]
+            rid = db.start_request("POST /r/deepseek/chat/completions")
+            trace = {
+                "model": "deepseek-flash",
+                "status": 200,
+                "changed": True,
+                "before_tokens": 50,
+                "after_tokens": 25,
+                "duration_ms": 150,
+                "cache_hits": 1,
+                "error": None,
+                "original": original_body,
+                "compressed": compressed_body,
+                "changes": changes,
+            }
+            db.finish_request(rid, trace)
+
+            detail = db.detail(rid)
+            self.assertEqual(detail["original"], original_body)
+            self.assertEqual(detail["compressed"], compressed_body)
+            self.assertTrue(detail["delta"]["changed"])
+            self.assertEqual(detail["delta"]["removed_keys"], ["max_output_tokens"])
+            self.assertEqual(detail["delta"]["condensed_blocks"], 1)
+
+    def test_in_memory_zstd_compression_for_data_older_than_one_day(self):
+        store = db_module.InMemoryZstdStore(max_items=100)
+        now_ms = int(time.time() * 1000)
+        recent_ts = now_ms - 3600000  # 1 hour ago (< 1 day)
+        old_ts = now_ms - 2 * db_module.ONE_DAY_MS  # 2 days ago (> 1 day)
+
+        recent_data = {"key": "recent_value", "tokens": 123}
+        old_data = {"key": "old_value", "tokens": 456}
+
+        store.put("recent_item", recent_data, created_at_ms=recent_ts)
+        store.put("old_item", old_data, created_at_ms=old_ts)
+
+        # Recent item MUST NOT be compressed in memory
+        self.assertFalse(store.is_compressed("recent_item"))
+        # Old item MUST be compressed with Zstandard in memory
+        self.assertTrue(store.is_compressed("old_item"))
+
+        # Both MUST retrieve exact original data transparently
+        self.assertEqual(store.get("recent_item"), recent_data)
+        self.assertEqual(store.get("old_item"), old_data)
+
+        # Aging simulation: item ages past 1 day
+        store.put("aging_item", {"temp": "data"}, created_at_ms=recent_ts)
+        self.assertFalse(store.is_compressed("aging_item"))
+        # Artificially set timestamp to 2 days ago
+        store._store["aging_item"] = (
+            now_ms - 2 * db_module.ONE_DAY_MS,
+            False,
+            store._store["aging_item"][2],
+        )
+        compressed_count = store.compress_old_entries()
+        self.assertEqual(compressed_count, 1)
+        self.assertTrue(store.is_compressed("aging_item"))
+        self.assertEqual(store.get("aging_item"), {"temp": "data"})
+
+    def test_compact_old_database_rows(self):
+        with tempfile.TemporaryDirectory() as folder:
+            db = Database(Path(folder) / "compact.db")
+            now = int(time.time() * 1000)
+            old_time = now - 2 * db_module.ONE_DAY_MS
+
+            # Insert legacy uncompressed raw text rows older than 1 day
+            with db.connect() as conn:
+                conn.execute(
+                    """INSERT INTO requests(created_at,route,status,changed,before_tokens,
+                    after_tokens,duration_ms,cache_hits,original,compressed) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        old_time,
+                        "/test",
+                        200,
+                        0,
+                        100,
+                        100,
+                        50,
+                        0,
+                        json.dumps({"msg": "legacy_raw"}),
+                        json.dumps({"msg": "legacy_raw"}),
+                    ),
+                )
+                conn.execute(
+                    """INSERT INTO requests(created_at,route,status,changed,before_tokens,
+                    after_tokens,duration_ms,cache_hits,original,compressed) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        now - 1000,
+                        "/test_recent",
+                        200,
+                        0,
+                        50,
+                        50,
+                        20,
+                        0,
+                        json.dumps({"msg": "recent_raw"}),
+                        json.dumps({"msg": "recent_raw"}),
+                    ),
+                )
+
+            res = db.compact_old_data(max_age_days=1)
+            self.assertEqual(res["db_rows"], 1)
+
+            with db.connect() as conn:
+                old_row = conn.execute(
+                    "SELECT typeof(original), typeof(compressed) FROM requests WHERE created_at=?",
+                    (old_time,),
+                ).fetchone()
+                # Legacy text converted to zstd blob, redundant compressed nulled
+                self.assertEqual(old_row[0], "blob")
+                self.assertEqual(old_row[1], "null")
 
 
 if __name__ == "__main__":

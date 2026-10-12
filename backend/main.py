@@ -71,6 +71,17 @@ class Settings(BaseModel):
         return self.model_dump()
 
 
+async def _background_maintenance(app):
+    while True:
+        try:
+            await asyncio.sleep(3600)
+            await asyncio.to_thread(app.state.db.compact_old_data, 1)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            LOG.warning("Background maintenance failed: %s", e)
+
+
 @asynccontextmanager
 async def lifespan(app):
     app.state.db = Database(DB_PATH)
@@ -81,8 +92,11 @@ async def lifespan(app):
         follow_redirects=False,
         trust_env=False,
     )
+    maintenance_task = asyncio.create_task(_background_maintenance(app))
     LOG.info("Python context engine ready; database=%s", DB_PATH)
     yield
+    maintenance_task.cancel()
+    await asyncio.gather(maintenance_task, return_exceptions=True)
     await app.state.client.aclose()
 
 
