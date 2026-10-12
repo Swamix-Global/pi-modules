@@ -121,8 +121,9 @@ async def database_error(request, error):
 
 
 @app.get("/health")
-async def health(request: Request):
-    integrity = await asyncio.to_thread(request.app.state.db.health)
+async def health(request: Request, deep: bool = False):
+    check = request.app.state.db.quick_check if deep else request.app.state.db.health
+    integrity = await asyncio.to_thread(check)
     return JSONResponse(
         {
             "status": "ok" if integrity == "ok" else "error",
@@ -133,8 +134,10 @@ async def health(request: Request):
 
 
 @app.get("/stats")
-async def stats(request: Request):
-    return request.app.state.db.stats()
+async def stats(request: Request, range: str = "24h"):
+    if range not in ("24h", "7d", "30d"):
+        raise RouterError(400, "Invalid stats range")
+    return request.app.state.db.stats(range)
 
 
 @app.get("/api/settings")

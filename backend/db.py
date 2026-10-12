@@ -35,6 +35,9 @@ class Database:
                     changes TEXT NOT NULL DEFAULT '[]'
                 );
                 CREATE INDEX IF NOT EXISTS requests_time ON requests(created_at);
+                CREATE INDEX IF NOT EXISTS requests_metrics ON requests(
+                    created_at,status,changed,before_tokens,after_tokens,duration_ms,cache_hits
+                );
             """)
             # A process restart cannot leave old attempts pretending to be live.
             db.execute(
@@ -61,6 +64,11 @@ class Database:
             return db.execute(sql, args).lastrowid
 
     def health(self):
+        with self.connect() as db:
+            db.execute("PRAGMA schema_version").fetchone()
+            return "ok"
+
+    def quick_check(self):
         with self.connect() as db:
             return db.execute("PRAGMA quick_check(1)").fetchone()[0]
 
@@ -147,22 +155,48 @@ class Database:
             row[key] = json.loads(row[key]) if row[key] is not None else None
         return row
 
-    def stats(self):
+    def stats(self, range="24h"):
         now = int(time.time() * 1000)
+        horizons = {"24h": 86400000, "7d": 604800000, "30d": 2592000000}
+        if range not in horizons:
+            raise ValueError("Invalid stats range")
+
+        def aggregate(since=None):
+            where, args = ("WHERE created_at>=?", (since,)) if since is not None else ("", ())
+            return self.rows(
+                f"""SELECT count(*) count,coalesce(sum(status>=400),0) errors,
+                coalesce(sum(changed),0) compacted,coalesce(sum(before_tokens),0) "in",
+                coalesce(sum(after_tokens),0) "out",coalesce(sum(duration_ms),0) duration_ms,
+                coalesce(max(created_at)-min(created_at),0) span_ms
+                FROM requests INDEXED BY requests_metrics {where}""",
+                args,
+            )[0]
+
         history = self.rows("""SELECT count(*) requests,coalesce(sum(changed),0) compacted,
             coalesce(sum(status>=400),0) errors,coalesce(sum(before_tokens),0) before_tokens,
-            coalesce(sum(after_tokens),0) after_tokens,coalesce(sum(duration_ms),0) duration_ms FROM requests""")[
-            0
-        ]
+            coalesce(sum(after_tokens),0) after_tokens,coalesce(sum(duration_ms),0) duration_ms
+            FROM requests INDEXED BY requests_metrics""")[0]
+        windows = {
+            key: aggregate(now - span) for key, span in
+            (("minute", 60000), ("hour", 3600000), ("day", 86400000))
+        }
+        windows["all"] = aggregate()
+        bucket, horizon = {
+            "24h": (300000, 86400000),
+            "7d": (3600000, 604800000),
+            "30d": (86400000, 2592000000),
+        }[range]
         timeline = self.rows(
-            """SELECT (created_at/300000)*300000 time,count(*) requests,
+            f"""SELECT (created_at/{bucket})*{bucket} time,count(*) requests,
             sum(changed) compacted,sum(status>=400) errors,sum(before_tokens) before_tokens,
-            sum(after_tokens) after_tokens FROM requests WHERE created_at>=? GROUP BY time ORDER BY time""",
-            (now - 86400000,),
+            sum(after_tokens) after_tokens FROM requests INDEXED BY requests_metrics
+            WHERE created_at>=? GROUP BY time ORDER BY time""",
+            (now - horizon,),
         )
         return {
             "now": now,
             "history": history,
             "cache": {"n": self.rows("SELECT count(*) n FROM cache")[0]["n"]},
             "timeline": timeline,
+            "windows": windows,
         }

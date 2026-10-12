@@ -6,6 +6,7 @@ import json
 import os
 import sqlite3
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -41,6 +42,37 @@ class StorageTests(unittest.TestCase):
                 names - {"sqlite_sequence"}, {"requests", "cache", "settings"}
             )
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_metrics_windows_are_covering_and_health_is_cheap(self):
+        with tempfile.TemporaryDirectory() as folder:
+            db = Database(Path(folder) / "metrics.db")
+            now = int(time.time() * 1000)
+            with db.connect() as conn:
+                conn.executemany(
+                    """INSERT INTO requests(created_at,route,status,changed,before_tokens,
+                    after_tokens,duration_ms,cache_hits,original,compressed) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                    [
+                        (now - 10000, "/a", 200, 1, 100, 60, 250, 1, "payload", "note"),
+                        (now - 120000, "/b", 500, 0, 20, 20, 50, 0, "payload", "payload"),
+                        (now - 2 * 86400000, "/c", 200, 0, 10, 8, 10, 0, "payload", "note"),
+                    ],
+                )
+            self.assertEqual(db.health(), "ok")
+            self.assertEqual(db.quick_check(), "ok")
+            stats = db.stats("24h")
+            self.assertEqual(stats["windows"]["minute"]["count"], 1)
+            self.assertEqual(stats["windows"]["hour"]["errors"], 1)
+            self.assertEqual(stats["windows"]["day"]["in"], 120)
+            self.assertEqual(stats["windows"]["all"]["count"], 3)
+            self.assertEqual(stats["windows"]["all"]["span_ms"], 2 * 86400000 - 10000)
+            self.assertEqual(len(db.stats("7d")["timeline"]), 2)
+            self.assertEqual(len(db.stats("30d")["timeline"]), 2)
+            with db.connect() as conn:
+                plan = conn.execute(
+                    "EXPLAIN QUERY PLAN SELECT count(*),sum(before_tokens) FROM requests INDEXED BY requests_metrics WHERE created_at>=?",
+                    (now - 86400000,),
+                ).fetchall()
+            self.assertTrue(any("USING COVERING INDEX requests_metrics" in row["detail"] for row in plan), plan)
 
 
 class CompressionTests(unittest.IsolatedAsyncioTestCase):
@@ -816,6 +848,17 @@ class ProxyTests(unittest.TestCase):
         self.assertEqual(self.client.get("/api/history?limit=0").status_code, 400)
         self.assertEqual(self.client.get("/dashboard/").status_code, 200)
         self.assertEqual(self.client.get("/api/history/999").status_code, 404)
+
+    def test_health_deep_and_stats_ranges(self):
+        with patch.object(main.app.state.db, "quick_check", return_value="ok") as check:
+            self.assertEqual(self.client.get("/health").json()["database"], "ok")
+            check.assert_not_called()
+            self.assertEqual(
+                self.client.get("/health?deep=true").json()["database"], "ok"
+            )
+            check.assert_called_once_with()
+        self.assertIn("windows", self.client.get("/stats?range=7d").json())
+        self.assertEqual(self.client.get("/stats?range=invalid").status_code, 400)
 
     def test_database_outage_is_503_not_bad_credentials(self):
         with patch.object(
