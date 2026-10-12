@@ -66,8 +66,23 @@
   ];
 
   const REFRESH_MS = 5000;
-  const BUCKET_MS = 300000;
-  const BUCKETS_PER_DAY = 288;
+  // Chart buckets per range must match backend/db.py stats() timeline buckets.
+  const CHART_RANGES = {
+    "24h": { label: "Last 24 hours", bucketMs: 300000, buckets: 288 },
+    "7d": { label: "Last 7 days", bucketMs: 3600000, buckets: 168 },
+    "30d": { label: "Last 30 days", bucketMs: 86400000, buckets: 30 },
+  };
+  const RANGE_OPTIONS = [
+    { id: "24h", label: "24h" },
+    { id: "7d", label: "7d" },
+    { id: "30d", label: "30d" },
+  ];
+  const WINDOWS = [
+    { id: "minute", label: "1 min" },
+    { id: "hour", label: "1 hour" },
+    { id: "day", label: "1 day" },
+    { id: "all", label: "All time" },
+  ];
 
   /* ------------------------------------------------------------------ */
   /* Helpers                                                             */
@@ -118,6 +133,15 @@
 
   function formatNumber(value) {
     return Number.isFinite(value) ? value.toLocaleString() : "—";
+  }
+
+  function formatRate(value) {
+    if (value === null || !Number.isFinite(value)) return "—";
+    if (value === 0) return "0";
+    if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
+    if (value >= 10_000) return `${Math.round(value / 1000)}k`;
+    if (value >= 1_000) return `${(value / 1000).toFixed(1)}k`;
+    return value < 100 ? value.toFixed(1) : `${Math.round(value)}`;
   }
 
   function formatTokenFlow(before, after) {
@@ -184,16 +208,27 @@
     );
   }
 
-  function compile24hTimeline(timeline, serverNow) {
+  function chartConfig(range) {
+    if (range === "7d") return CHART_RANGES["7d"];
+    if (range === "30d") return CHART_RANGES["30d"];
+    return CHART_RANGES["24h"];
+  }
+
+  function isChartRange(value) {
+    return value === "24h" || value === "7d" || value === "30d";
+  }
+
+  function compileTimeline(timeline, serverNow, range) {
+    const { bucketMs, buckets } = chartConfig(range);
     const now = Number.isFinite(serverNow) ? serverNow : Date.now();
-    const end = Math.floor(now / BUCKET_MS) * BUCKET_MS;
-    const start = end - (BUCKETS_PER_DAY - 1) * BUCKET_MS;
+    const end = Math.floor(now / bucketMs) * bucketMs;
+    const start = end - (buckets - 1) * bucketMs;
     const map = new Map();
     for (const point of Array.isArray(timeline) ? timeline : []) {
       map.set(point.time, point);
     }
     const series = [];
-    for (let t = start; t <= end; t += BUCKET_MS) {
+    for (let t = start; t <= end; t += bucketMs) {
       series.push(
         map.get(t) ?? {
           time: t,
@@ -264,11 +299,13 @@
 
   // Overview / stats
   let stats = $state(null);
+  let chartRange = $state(initialRange());
   let health = $state(null);
   let statsError = $state("");
   let disconnected = $state(false);
   let lastUpdated = $state(null);
   let refreshingStats = $state(false);
+  let statsReloadPending = false;
 
   // Requests / history
   let history = $state([]);
@@ -319,6 +356,11 @@
       : "overview";
   }
 
+  function initialRange() {
+    const value = new URLSearchParams(window.location.search).get("range");
+    return isChartRange(value) ? value : "24h";
+  }
+
   function initialRequest() {
     const value = Number(
       new URLSearchParams(window.location.search).get("request"),
@@ -347,12 +389,16 @@
   /* ------------------------------------------------------------------ */
 
   async function refreshStats() {
-    if (refreshingStats) return;
+    if (refreshingStats) {
+      statsReloadPending = true;
+      return;
+    }
     refreshingStats = true;
+    const statsUrl = chartRange === "24h" ? "/stats" : `/stats?range=${chartRange}`;
     try {
       const [healthResponse, statsResponse] = await Promise.all([
         fetch("/health", { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(10000) }),
-        fetch("/stats", { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(10000) }),
+        fetch(statsUrl, { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(10000) }),
       ]);
       if (!healthResponse.ok)
         throw new Error(`health ${healthResponse.status} ${healthResponse.statusText}`);
@@ -368,12 +414,24 @@
       disconnected = true;
     } finally {
       refreshingStats = false;
+      if (statsReloadPending) {
+        statsReloadPending = false;
+        refreshStats();
+      }
     }
+  }
+
+  function selectChartRange(next) {
+    if (!isChartRange(next) || next === chartRange) return;
+    chartRange = next;
+    setUrlParam("range", next === "24h" ? null : next);
+    refreshStats();
   }
 
   onMount(() => {
     refreshStats();
     const timer = setInterval(() => {
+      if (document.visibilityState === "hidden") return;
       refreshStats();
       if (tab === "requests" && beforeCursor == null) loadHistory();
     }, REFRESH_MS);
@@ -558,7 +616,7 @@
       return;
     }
 
-    const points = compile24hTimeline(stats?.timeline, stats?.now);
+    const points = compileTimeline(stats?.timeline, stats?.now, chartRange);
     const labels = points.map((point) => point.time);
     const requests = points.map((point) => point.requests ?? 0);
     const before = points.map((point) => point.before_tokens ?? 0);
@@ -686,37 +744,55 @@
   /* Derived values                                                      */
   /* ------------------------------------------------------------------ */
 
-  let overviewCards = $derived([
-    {
-      label: "Requests",
-      value: formatNumber(stats?.history?.requests),
-      icon: "fa-solid fa-paper-plane",
-      tone: "text-cyan-600 dark:text-cyan-400",
-    },
-    {
-      label: "Errors",
-      value: formatNumber(stats?.history?.errors),
-      icon: "fa-solid fa-triangle-exclamation",
-      tone: "text-rose-600 dark:text-rose-400",
-    },
-    {
-      label: "Tokens saved",
-      value: formatNumber(
-        Math.max(
-          0,
-          (stats?.history?.before_tokens ?? 0) - (stats?.history?.after_tokens ?? 0),
+  let overviewMatrix = $derived.by(() => {
+    const windows = stats?.windows;
+    if (!windows) return [];
+    const cell = (read) =>
+      WINDOWS.map((column) => {
+        const entry = windows[column.id];
+        return entry ? read(entry) : "—";
+      });
+    const rate = (field, unitMs) =>
+      cell((entry) => {
+        // Backend span_ms measures observed coverage; a single event spans 0 ms,
+        // so fall back to the nominal unit duration to keep the rate finite.
+        const span = entry.span_ms > 0 ? entry.span_ms : unitMs;
+        const total =
+          field === "tokens"
+            ? (entry.in ?? 0) + (entry.out ?? 0)
+            : (entry[field] ?? 0);
+        return formatRate(total / (span / unitMs));
+      });
+    return [
+      { label: "Requests", cells: cell((entry) => formatNumber(entry.count)) },
+      { label: "Req/min", cells: rate("count", 60000) },
+      { label: "Req/h", cells: rate("count", 3600000) },
+      { label: "Req/day", cells: rate("count", 86400000) },
+      {
+        label: "Tokens in",
+        cells: cell((entry) => formatNumber(entry.in)),
+        group: true,
+      },
+      { label: "Tokens out", cells: cell((entry) => formatNumber(entry.out)) },
+      { label: "Tok/min", cells: rate("tokens", 60000) },
+      { label: "Tok/h", cells: rate("tokens", 3600000) },
+      { label: "Tok/day", cells: rate("tokens", 86400000) },
+      {
+        label: "Saved",
+        cells: cell((entry) =>
+          formatNumber(Math.max(0, (entry.in ?? 0) - (entry.out ?? 0))),
         ),
-      ),
-      icon: "fa-solid fa-arrow-trend-down",
-      tone: "text-emerald-600 dark:text-emerald-400",
-    },
-    {
-      label: "Cached blocks",
-      value: formatNumber(stats?.cache?.n),
-      icon: "fa-solid fa-database",
-      tone: "text-violet-600 dark:text-violet-400",
-    },
-  ]);
+        group: true,
+      },
+      { label: "Errors", cells: cell((entry) => formatNumber(entry.errors)) },
+      {
+        label: "Avg time",
+        cells: cell((entry) =>
+          entry.count > 0 ? formatDuration(entry.duration_ms / entry.count) : "—",
+        ),
+      },
+    ];
+  });
 
   let hasTraffic = $derived((stats?.history?.requests ?? 0) > 0);
   let cacheHits = $derived(stats?.cache?.n ?? 0);
@@ -843,30 +919,73 @@
         hidden={tab !== "overview"}
       >
         {#if stats}
-          <div class="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
-            {#each overviewCards as card (card.label)}
-              <div
-                class="rounded-lg border border-slate-200 bg-white px-4 py-3 dark:border-slate-800 dark:bg-slate-900"
+          <div
+            class="scroll-area overflow-x-auto rounded-lg border border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900"
+          >
+            <table
+              class="w-full min-w-[560px] text-left text-xs"
+              aria-label="Request and token metrics by time window"
+            >
+              <thead
+                class="border-b border-slate-200 text-slate-500 dark:border-slate-800 dark:text-slate-400"
               >
-                <div class="flex items-center justify-between">
-                  <p class="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">
-                    {card.label}
-                  </p>
-                  <i class="{card.icon} {card.tone}" aria-hidden="true"></i>
-                </div>
-                <p class="mt-2 text-2xl font-semibold tabular-nums">{card.value}</p>
-              </div>
-            {/each}
+                <tr>
+                  <th scope="col" class="px-3 py-2 font-medium">Metric</th>
+                  {#each WINDOWS as column (column.id)}
+                    <th scope="col" class="px-3 py-2 text-right font-medium">{column.label}</th>
+                  {/each}
+                </tr>
+              </thead>
+              <tbody class="tabular-nums">
+                {#each overviewMatrix as row (row.label)}
+                  <tr
+                    class="border-b border-slate-100 last:border-0 dark:border-slate-800/60 {row.group
+                      ? 'border-t border-slate-200 dark:border-slate-700'
+                      : ''}"
+                  >
+                    <th
+                      scope="row"
+                      class="whitespace-nowrap px-3 py-1.5 font-medium text-slate-600 dark:text-slate-300"
+                    >
+                      {row.label}
+                    </th>
+                    {#each row.cells as value}
+                      <td class="whitespace-nowrap px-3 py-1.5 text-right">{value}</td>
+                    {/each}
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
           </div>
 
           <div
             class="mt-4 rounded-lg border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900"
           >
             <div class="mb-3 flex flex-wrap items-center justify-between gap-2">
-              <h2 class="flex items-center gap-2 text-sm font-semibold">
-                <i class="fa-solid fa-chart-line text-cyan-500" aria-hidden="true"></i>
-                Last 24 hours
-              </h2>
+              <div class="flex flex-wrap items-center gap-3">
+                <h2 class="flex items-center gap-2 text-sm font-semibold">
+                  <i class="fa-solid fa-chart-line text-cyan-500" aria-hidden="true"></i>
+                  {chartConfig(chartRange).label}
+                </h2>
+                <div
+                  class="flex items-center gap-1 rounded-md border border-slate-200 p-0.5 dark:border-slate-800"
+                  role="group"
+                  aria-label="Chart range"
+                >
+                  {#each RANGE_OPTIONS as option (option.id)}
+                    <button
+                      type="button"
+                      class="rounded px-2 py-1 text-xs font-medium transition {chartRange === option.id
+                        ? 'bg-cyan-500/15 text-cyan-700 dark:text-cyan-300'
+                        : 'text-slate-500 hover:bg-slate-100 hover:text-slate-700 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-200'}"
+                      aria-pressed={chartRange === option.id}
+                      onclick={() => selectChartRange(option.id)}
+                    >
+                      {option.label}
+                    </button>
+                  {/each}
+                </div>
+              </div>
               <p class="text-xs text-slate-500 dark:text-slate-400">
                 {#if Number.isFinite(lastUpdated)}
                   Updated {formatTime(lastUpdated)}
@@ -878,7 +997,7 @@
 
             {#if hasTraffic}
               <div class="relative h-72">
-                <canvas bind:this={chartEl} aria-label="24 hour request and token timeline"></canvas>
+                <canvas bind:this={chartEl} aria-label="{chartConfig(chartRange).label} request and token timeline"></canvas>
               </div>
             {:else}
               <div
