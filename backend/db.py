@@ -190,6 +190,11 @@ class Database:
                 CREATE INDEX IF NOT EXISTS requests_metrics ON requests(
                     created_at,status,changed,before_tokens,after_tokens,duration_ms,cache_hits
                 );
+                CREATE INDEX IF NOT EXISTS requests_status ON requests(status);
+                CREATE INDEX IF NOT EXISTS requests_changed_id ON requests(changed, id DESC);
+                CREATE INDEX IF NOT EXISTS requests_history_cov ON requests(
+                    id DESC, model, route, changed, created_at, status, before_tokens, after_tokens, duration_ms, cache_hits, error
+                );
             """)
             # A process restart cannot leave old attempts pretending to be live.
             db.execute(
@@ -312,16 +317,40 @@ class Database:
         self._mem_store.put(f"req:{request_id}", detail_obj, created_at_ms=now_ms)
 
     def history(self, limit=50, before=None, changed="all", search=""):
-        where = "(?='all' OR changed=?) AND (instr(lower(route),lower(?))>0 OR instr(lower(model),lower(?))>0)"
-        params = (changed, int(changed == "yes"), search, search)
+        clauses = []
+        params = []
+        count_params = []
+
+        if changed in ("yes", "no"):
+            clauses.append("changed=?")
+            val = 1 if changed == "yes" else 0
+            params.append(val)
+            count_params.append(val)
+
+        if search and search.strip():
+            clauses.append(
+                "(instr(lower(route),lower(?))>0 OR instr(lower(model),lower(?))>0)"
+            )
+            s = search.strip()
+            params.extend([s, s])
+            count_params.extend([s, s])
+
+        count_where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+        if before is not None:
+            clauses.append("id < ?")
+            params.append(before)
+
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         columns = "id,created_at,route,model,status,changed,before_tokens,after_tokens,duration_ms,error,cache_hits"
         rows = self.rows(
-            f"SELECT {columns} FROM requests WHERE {where} AND (? IS NULL OR id<?) ORDER BY id DESC LIMIT ?",
-            params + (before, before, limit + 1),
+            f"SELECT {columns} FROM requests {where} ORDER BY id DESC LIMIT ?",
+            tuple(params) + (limit + 1,),
         )
-        total = self.rows(f"SELECT count(*) n FROM requests WHERE {where}", params)[0][
-            "n"
-        ]
+        total = self.rows(
+            f"SELECT count(*) n FROM requests {count_where}",
+            tuple(count_params),
+        )[0]["n"]
         return {
             "items": rows[:limit],
             "total": total,
