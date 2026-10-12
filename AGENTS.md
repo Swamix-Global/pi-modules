@@ -19,7 +19,7 @@ Fresh loopback context-compression proxy: Python/FastAPI/httpx/sqlite3 in `backe
 - Tool calls/results stay together; image-containing blocks remain intact; encrypted reasoning is not rendered to the condenser. All verbatim queries are indivisible fixed context; preserve them even above the soft budget, while still condensing other eligible older activity. Accept a note only if its replacement block reduces estimated tokens; otherwise retain the entire original block, without clipping the note, and reuse its canonical cache entry on later attempts.
 - Subscription-authenticated `/r/openai/responses` and `/codex/responses` strip `max_output_tokens`, `temperature`, `prompt_cache_retention`, and `prompt_cache_options`; `sk-` payloads retain them.
 - Antigravity requests can route through `/r/antigravity` as a secure pass-through: the proxy server securely forwards requests upstream to Google Cloud over HTTPS without mutating proprietary non-OpenAI wire formats.
-- Persist attempts and full received/forwarded JSON, not credentials; no automatic pruning. Log each proxy decision in the journal. Database failures return 503. Health measures SQLite fresh; restarts finalize unfinished rows.
+- Persist attempts and full received/forwarded JSON, not credentials; no automatic pruning. Log each proxy decision in the journal. Database failures return 503. Health probes SQLite cheaply; /health?deep=1 runs the full integrity check. Restarting marks unfinished rows 503.
 - SPA timestamps use system locale; chart anchors to server `now`; tabs/request selection persist in URL. Themes must remain high-contrast.
 
 ## Canonical checks/deploy
