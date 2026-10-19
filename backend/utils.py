@@ -26,7 +26,7 @@ DEFAULTS = {
     "tokens": int(os.getenv("PI_CONTEXT_ROUTER_TOKENS", "32000")),
     "keepTurns": int(os.getenv("PI_CONTEXT_ROUTER_KEEP_TURNS", "2")),
     "maxTokens": int(os.getenv("PI_CONTEXT_ROUTER_MAX_TOKENS", "8192")),
-    "model": os.getenv("PI_CONTEXT_ROUTER_CONDENSER_MODEL", "deepseek-flash"),
+    "model": os.getenv("PI_CONTEXT_ROUTER_CONDENSER_MODEL", "minicpm5"),
     "blockPrompt": os.getenv("PI_CONTEXT_ROUTER_BLOCK_PROMPT", DEFAULT_PROMPT),
 }
 ROUTES = json.loads(
@@ -39,11 +39,42 @@ UPSTREAM = os.getenv("PI_CONTEXT_ROUTER_UPSTREAM", "https://chatgpt.com/backend-
 AUTH_PATH = Path(
     os.getenv("PI_CONTEXT_ROUTER_AUTH", "~/.pi/agent/auth.json")
 ).expanduser()
-CONDENSER_URL = os.getenv(
-    "PI_CONTEXT_ROUTER_CONDENSER_URL", "https://api.deepseek.com/chat/completions"
+LOCAL_URL = os.getenv(
+    "PI_CONTEXT_ROUTER_LOCAL_URL", "http://127.0.0.1:30000/v1/chat/completions"
 )
+ZAI_URL = os.getenv(
+    "PI_CONTEXT_ROUTER_ZAI_URL", "https://api.z.ai/api/coding/paas/v4/chat/completions"
+)
+CONDENSER_MODELS = {
+    "minicpm5": {
+        "url": LOCAL_URL,
+        "model": os.getenv("PI_CONTEXT_ROUTER_MINICPM_MODEL", "minicpm5-2b-fp8"),
+    },
+    "zai": {
+        "url": ZAI_URL,
+        "model": os.getenv("PI_CONTEXT_ROUTER_ZAI_MODEL", "glm-5.3-flash"),
+    },
+}
+
+
+def zai_key():
+    key = os.getenv("ZAI_API_KEY") or os.getenv("Z_AI_API_KEY")
+    if key:
+        return key
+    if AUTH_PATH.exists():
+        auth = json.loads(AUTH_PATH.read_text()).get("zai-coding-cn", {})
+        key = auth.get("key", auth.get("apiKey", ""))
+        if key:
+            return key
+    raise RuntimeError("No Z.ai key: set ZAI_API_KEY or add auth.json:zai-coding-cn")
 ATTEMPTS = 3
 ATTEMPT_TIMEOUT = int(os.getenv("PI_CONTEXT_ROUTER_ATTEMPT_TIMEOUT", "30"))
+COOLDOWN = int(os.getenv("PI_CONTEXT_ROUTER_CONDENSER_COOLDOWN", "120"))
+_SKIP_UNTIL = {}  # condenser model -> monotonic deadline while it is out
+
+
+def condenser_skipped(config):
+    return time.monotonic() < _SKIP_UNTIL.get(config["model"], 0.0)
 
 
 class RouterError(Exception):
@@ -236,21 +267,8 @@ def transcript(block):
     return "\n---\n".join(sections) + "\n---------------------------"
 
 
-# Python owns the server; the supported Pi SDK handles subscription refresh in
-# this one-shot child. Payload travels over stdin, never process arguments.
-LUNA_BRIDGE = r"""
-import { ModelRuntime } from '/usr/lib/node_modules/@earendil-works/pi-coding-agent/dist/index.js';
-const input = JSON.parse(await Bun.stdin.text());
-const runtime = await ModelRuntime.create({authPath:input.auth,modelsPath:null,refreshOnCreate:false});
-const model = runtime.getModel('openai',input.model);
-if (!model) throw new Error('Condenser model unavailable');
-const result = await runtime.completeSimple(model, {
-  systemPrompt:input.system,
-  messages:[{role:'user',content:input.text,timestamp:Date.now()}]
-}, {maxTokens:input.maxTokens,reasoning:'low',transport:'sse',maxRetries:0});
-if (!['stop','length'].includes(result.stopReason)) throw new Error('Condenser failed');
-process.stdout.write(JSON.stringify(result.content.filter(p=>p.type==='text').map(p=>p.text).join('\n')));
-"""
+# Python owns the server; condensation targets are the local MiniCPM and Z.ai
+# GLM. Both speak the OpenAI chat-completions wire format.
 
 
 async def condenser(client, source, config):
@@ -264,64 +282,27 @@ async def condenser(client, source, config):
         f"Complete the note at approximately {target} tokens; preserve evidence, failures, "
         "constraints and unfinished work over the length target."
     )
-    if config["model"] == "gpt-6-luna":
-        bun = os.getenv("PI_CONTEXT_ROUTER_BUN", str(Path.home() / ".bun/bin/bun"))
-        process = await asyncio.create_subprocess_exec(
-            bun,
-            "-e",
-            LUNA_BRIDGE,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        try:
-            payload = canonical(
-                {
-                    "auth": str(AUTH_PATH),
-                    "model": config["model"],
-                    "system": system,
-                    "text": source,
-                    "maxTokens": config["maxTokens"],
-                }
-            )
-            stdout, _ = await process.communicate(payload.encode())
-            if process.returncode:
-                raise RuntimeError("Subscription condenser failed")
-            answer = json.loads(stdout)
-        finally:
-            if process.returncode is None:
-                process.kill()
-                await process.wait()
-        LOG.info(
-            "Condenser finished; model=%s duration_ms=%d output_tokens=%d",
-            config["model"],
-            round((time.monotonic() - started) * 1000),
-            tokens(answer) if isinstance(answer, str) else 0,
-        )
+    spec = CONDENSER_MODELS[config["model"]]
+    headers = {}
+    payload = {
+        "model": spec["model"],
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": source},
+        ],
+        "max_tokens": config["maxTokens"],
+    }
+    if config["model"] == "zai":
+        headers["Authorization"] = f"Bearer {zai_key()}"
+        payload["thinking"] = {"type": "disabled"}
     else:
-        key = os.getenv("PI_CONTEXT_ROUTER_API_KEY", "")
-        if not key and AUTH_PATH.exists():
-            auth = json.loads(AUTH_PATH.read_text()).get("deepseek", {})
-            key = auth.get("key", auth.get("apiKey", ""))
-        response = await client.post(
-            CONDENSER_URL,
-            headers={"Authorization": f"Bearer {key}"},
-            json={
-                "model": config["model"],
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": source},
-                ],
-                "max_tokens": config["maxTokens"],
-                "thinking": {"type": "disabled"},
-                "reasoning_effort": "low",
-            },
-        )
-        response.raise_for_status()
-        data = response.json()
-        usage = data.get("usage", {})
-        answer = data["choices"][0]["message"]["content"]
-        LOG.info(
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
+    response = await client.post(spec["url"], headers=headers, json=payload)
+    response.raise_for_status()
+    data = response.json()
+    usage = data.get("usage", {})
+    answer = data["choices"][0]["message"]["content"]
+    LOG.info(
             "Condenser finished; model=%s duration_ms=%d prompt_tokens=%s completion_tokens=%s output_tokens=%d",
             config["model"],
             round((time.monotonic() - started) * 1000),
@@ -337,7 +318,8 @@ async def condenser(client, source, config):
     return output
 
 
-async def ctx_man(block, config, db, client, *, user_message):
+async def ctx_man(block, config, db, client):
+    """Return a cached or condensed note, or None when the condenser is out."""
     key = f"{digest(block)}-{config['model']}-{config['maxTokens']}"
     hit = db.cache_get(key)
     if hit is not None:
@@ -348,6 +330,14 @@ async def ctx_man(block, config, db, client, *, user_message):
             tokens(hit),
         )
         return hit, True
+    if condenser_skipped(config):
+        LOG.warning(
+            "Condenser cooling down; forwarding block verbatim; model=%s block=%s tokens=%d",
+            config["model"],
+            digest(block)[:12],
+            tokens(block),
+        )
+        return None, False
     source = transcript(block)
     for attempt in range(ATTEMPTS):
         attempt_started = time.monotonic()
@@ -389,16 +379,17 @@ async def ctx_man(block, config, db, client, *, user_message):
                 str(error),
             )
             if attempt == ATTEMPTS - 1:
+                _SKIP_UNTIL[config["model"]] = time.monotonic() + COOLDOWN
                 LOG.critical(
-                    "Condenser exhausted %s attempts; model=%s block=%s failure=%s",
+                    "Condenser exhausted %s attempts; model=%s block=%s failure=%s; "
+                    "forwarding block verbatim for %ss",
                     ATTEMPTS,
                     config["model"],
                     digest(block),
                     type(error).__name__,
+                    COOLDOWN,
                 )
-                raise RouterError(
-                    502, f'Summarization failed for turn: "{user_message}"'
-                ) from None
+                return None, False
     return db.cache_put(key, output, digest(output)), False
 
 
@@ -456,9 +447,9 @@ async def compress_body(original, config, db, client):
         ):
             return block, None, 1
         query, activity = block[0], block[1:]
-        output, cached = await ctx_man(
-            activity, config, db, client, user_message=text(query.get("content"))
-        )
+        output, cached = await ctx_man(activity, config, db, client)
+        if output is None:
+            return block, None, 0
         # String content is valid for assistant input in both OpenAI wire formats.
         result = [query, {"role": "assistant", "content": output}]
         before_tokens, after_tokens = tokens(block), tokens(result)

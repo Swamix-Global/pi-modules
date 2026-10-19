@@ -64,7 +64,7 @@ class Settings(BaseModel):
 
     def validated(self):
         if (
-            self.model not in ("deepseek-flash", "gpt-6-luna")
+            self.model not in ("minicpm5", "zai")
             or not self.blockPrompt.strip()
         ):
             raise RouterError(400, "Invalid condenser settings")

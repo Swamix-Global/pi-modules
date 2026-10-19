@@ -3,7 +3,6 @@
 import asyncio
 import gzip
 import json
-import os
 import sqlite3
 import tempfile
 import time
@@ -78,6 +77,7 @@ class StorageTests(unittest.TestCase):
 
 class CompressionTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        utils._SKIP_UNTIL.clear()
         self.folder = tempfile.TemporaryDirectory()
         self.db = Database(Path(self.folder.name) / "test.db")
         self.config = {**utils.DEFAULTS, "tokens": 1024}
@@ -421,21 +421,27 @@ class CompressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(changes[0]["kind"], "merge_users")
         call.assert_not_awaited()
 
-    async def test_failure_is_exact_502_and_not_cached(self):
+    async def test_failure_forwards_block_verbatim_without_caching(self):
         with patch.object(
             utils, "condenser", AsyncMock(side_effect=RuntimeError("offline"))
         ) as call:
-            with self.assertRaises(utils.RouterError) as caught:
-                await utils.compress_body(self.body, self.config, self.db, None)
-            self.assertEqual(caught.exception.status, 502)
-            self.assertEqual(
-                caught.exception.message,
-                'Summarization failed for turn: "original user query"',
+            result, changes, hits = await utils.compress_body(
+                self.body, self.config, self.db, None
             )
+            self.assertEqual(result, self.body)
+            self.assertEqual(changes, [])
+            self.assertEqual(hits, 0)
             self.assertEqual(call.await_count, 3)
             self.assertEqual(self.db.rows("SELECT count(*) n FROM cache")[0]["n"], 0)
+            # The outage skips the condenser instead of retrying it per turn.
+            again, changes, _ = await utils.compress_body(
+                self.body, self.config, self.db, None
+            )
+        self.assertEqual(again, self.body)
+        self.assertEqual(changes, [])
+        self.assertEqual(call.await_count, 3)
 
-    async def test_summary_hint_and_low_reasoning(self):
+    async def test_summary_hint_and_local_wire_format(self):
         received = []
 
         def fake(request):
@@ -447,13 +453,11 @@ class CompressionTests(unittest.IsolatedAsyncioTestCase):
                 },
             )
 
-        with patch.dict(os.environ, {"PI_CONTEXT_ROUTER_API_KEY": "test"}):
-            async with httpx.AsyncClient(transport=httpx.MockTransport(fake)) as client:
-                result = await utils.condenser(client, "x" * 3500, self.config)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(fake)) as client:
+            result = await utils.condenser(client, "x" * 3500, self.config)
         self.assertEqual(result, "note")
         self.assertIn("approximately 200 tokens", received[0]["messages"][0]["content"])
-        self.assertEqual(received[0]["reasoning_effort"], "low")
-        self.assertEqual(received[0]["thinking"], {"type": "disabled"})
+        self.assertEqual(received[0]["chat_template_kwargs"], {"enable_thinking": False})
         self.assertEqual(received[0]["max_tokens"], self.config["maxTokens"])
         self.assertEqual(utils.tokens("😀" * 3500), 1000)
 
@@ -464,14 +468,12 @@ class CompressionTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(utils, "condenser", slow),
             patch.object(utils, "ATTEMPT_TIMEOUT", 0.01),
-            self.assertRaises(utils.RouterError),
         ):
-            await utils.ctx_man(
-                self.body["messages"][2:4],
-                self.config,
-                self.db,
-                None,
-                user_message="original user query",
+            self.assertEqual(
+                await utils.ctx_man(
+                    self.body["messages"][2:4], self.config, self.db, None
+                ),
+                (None, False),
             )
 
     async def test_overflow_never_drops_or_clips(self):
@@ -580,6 +582,7 @@ class CompressionTests(unittest.IsolatedAsyncioTestCase):
 
 class ProxyTests(unittest.TestCase):
     def setUp(self):
+        utils._SKIP_UNTIL.clear()
         self.folder = tempfile.TemporaryDirectory()
         self.path = Path(self.folder.name) / "test.db"
         self.patch_db = patch.object(main, "DB_PATH", str(self.path))
@@ -792,7 +795,7 @@ class ProxyTests(unittest.TestCase):
             400,
         )
 
-    def test_errors_are_persistent_and_do_not_reach_provider(self):
+    def test_condenser_failure_forwards_original_and_succeeds(self):
         body = {
             "messages": [
                 {"role": "user", "content": "query"},
@@ -806,17 +809,15 @@ class ProxyTests(unittest.TestCase):
         main.app.state.db.save_settings({**utils.DEFAULTS, "tokens": 1024})
         with patch.object(utils, "condenser", AsyncMock(side_effect=RuntimeError())):
             response = self.client.post("/r/deepseek/chat/completions", json=body)
-        self.assertEqual(response.status_code, 502)
-        self.assertEqual(
-            response.json()["error"], 'Summarization failed for turn: "query"'
-        )
-        self.assertEqual(len(self.received), 0)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["x-context-router"], "pass")
+        self.assertEqual(json.loads(self.received[-1].content), body)
         latest = self.client.get("/api/history").json()["items"][0]
-        self.assertEqual(latest["status"], 502)
+        self.assertEqual(latest["status"], 200)
         self.assertEqual(
             self.client.get(f"/api/history/{latest['id']}").json()["original"], body
         )
-        self.assertEqual(self.client.get("/stats").json()["history"]["errors"], 1)
+        self.assertEqual(self.client.get("/stats").json()["history"]["errors"], 0)
 
     def test_management_security_settings_and_pagination(self):
         self.assertEqual(

@@ -12,7 +12,7 @@ Fresh loopback context-compression proxy: Python/FastAPI/httpx/sqlite3 in `backe
 ## Invariants
 
 - Soft token threshold default 32k; preserve protected turns and fixed fields. Indivisible overflow does not disable condensation of eligible older activity; warn when the protected floor or final result exceeds the target. No context-driven 413, clipping, silent block dropping, or excerpt fallback.
-- Completed turn blocks launch concurrently and all settle. Three total attempts × 30 seconds per uncached block. Exhaustion emits payload-free CRITICAL and returns HTTP 502 with exact verbatim user message: `Summarization failed for turn: "..."`.
+- Completed turn blocks launch concurrently and all settle. Three total attempts × 30 seconds per uncached block. Exhaustion never fails the turn: emit a payload-free CRITICAL, forward that block verbatim, and cool the condenser down for `PI_CONTEXT_ROUTER_CONDENSER_COOLDOWN` seconds (default 120) so later blocks skip it rather than stall.
 - Each condensed turn is the original user query verbatim as a `user` message, followed by one `assistant` summary of only the subsequent replies, reasoning and tool calls/results. Never send the opening query to the condenser or replace it with a summary. Query-only turns do not invent an assistant reply.
 - Concatenate consecutive real user messages with one newline, preserving text/whitespace and structured content parts; do this even below threshold. User-role tool-result envelopes are activity, not queries. Protected turns count after concatenation.
 - Cache key strictly `<assistant activity block SHA256>-<model>-<output cap>`; concurrent misses return the first committed note. Old whole-turn cache keys are not reused for assistant-only notes. Recognize already-rendered assistant notes. Sizing hints never truncate output.
@@ -33,3 +33,11 @@ curl -fsS http://127.0.0.1:4141/health
 ```
 
 Run backend tests for any Python changes. Build and restart after frontend changes. See `README.md` for installation, backup location, architecture and deployment; do not duplicate process guides. Follow global agent rules and `~/.pi/agent/AGENTS-RSI.md` for stack changes. Keep existing unrelated user files intact; commit changes every time files are modified, and show the diff between commits.
+
+## Project Summarization (standard recipe)
+- Goal: per-file ~200-word structured description of every source file.
+- Output: one YAML doc mapping `filename` → `purpose` (2 sentences), `components` (5–6), `key_functions` (8–10, real symbol names), `data_flow` (3–4 steps), `interactions` (2–3).
+- Endpoint `http://127.0.0.1:30000/v1/chat/completions`, model per serving (e.g. `minicpm5-2b-fp8`), `enable_thinking: false`, `max_tokens 2048`.
+- Sampling: `temperature 0` deterministic; general profile `temperature 0.3, repetition_penalty 1.05`; never >= 1.1; top_p is noise.
+- Parallelism: ThreadPoolExecutor(48–128); server tuned to 128 streams (5576 tok/s aggregate).
+- Formatting enforced by code: lenient line-parse, rebuild the 5-key dict, `yaml.safe_dump`, round-trip validate. Write to `lang-test.txt`; report per-call e2e + wall total.
