@@ -28,8 +28,10 @@ CONDENSE_RETRIES = 2
 UPSTREAM_TIMEOUT = (10, 300)     # connect, read
 GZIP_MIN_BYTES = 32 << 10        # gzip request bodies to cloud hosts above this
 # uvicorn-backed locals cannot decode Content-Encoding; clouds decode at the edge
-GZIP_PROVIDERS = {"deepseek", "antigravity", "openrouter", "groq", "cerebras",
-                  "qwen-token-plan", "xiaomi-token-plan-sgp", "openai"}
+# Real cloud LLM APIs (DeepSeek, OpenRouter, Groq, etc.) reject Content-Encoding: gzip
+# on POST /chat/completions with 400 'Failed to parse JSON'. Request gzip is only used
+# when an inference host is explicitly listed in PI_ROUTER_GZIP_PROVIDERS.
+GZIP_PROVIDERS = set(filter(None, os.getenv("PI_ROUTER_GZIP_PROVIDERS", "").split(",")))
 MEDIA_TYPES = {"image", "image_url", "input_image", "file", "audio"}
 THINKING_TYPES = {"thinking", "redacted_thinking", "reasoning"}  # preserved verbatim, never counted
 MANAGED_AUTH = {"api-key", "authorization"}  # router injects its own bearer
@@ -50,6 +52,8 @@ ROUTES: dict[str, str] = json.loads(
         "antigravity": "https://daily-cloudcode-pa.googleapis.com",
         "lmstudio": "http://127.0.0.1:1234/v1",
         "openai": "https://api.openai.com/v1",
+        "zai-coding-cn": "https://api.z.ai/api/coding/paas/v4",
+        "zai": "https://api.z.ai/api/coding/paas/v4",
     }))
 )
 
@@ -301,6 +305,8 @@ def upstream_headers(provider: str, headers, auth: dict[str, str]) -> dict[str, 
     out = {k: v for k, v in headers.items() if k.lower() not in HOP_HEADERS}
     if not any(k.lower() == "content-type" for k in out):
         out["Content-Type"] = "application/json"
+    if not any(k.lower() == "accept-encoding" for k in out):
+        out["Accept-Encoding"] = "gzip, deflate"
     return ({**{k: v for k, v in out.items() if k.lower() not in MANAGED_AUTH},
              "Authorization": f"Bearer {auth[provider]}"} if provider in auth else out)
 

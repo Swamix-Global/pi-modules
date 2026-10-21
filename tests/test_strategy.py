@@ -216,8 +216,9 @@ def test_local_ai_caches_by_input_hash(monkeypatch, tmp_path):
 
 
 # --- SPEC: gzip transport ------------------------------------------------------------------
-def test_maybe_gzip_only_for_cloud_providers_and_large_bodies():
+def test_maybe_gzip_only_for_cloud_providers_and_large_bodies(monkeypatch):
     import gzip as gz
+    monkeypatch.setattr(u, "GZIP_PROVIDERS", {"deepseek"})
     big = b"x" * (u.GZIP_MIN_BYTES + 10)
     headers = {}
     body = u.maybe_gzip("deepseek", big, headers)
