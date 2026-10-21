@@ -5,8 +5,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/ubuntu/src/sgai-pi/ctx-engine
-ExecStart=/home/ubuntu/src/sgai-pi/ctx-engine/.venv/bin/python -m backend.main
+WorkingDirectory=/home/ubuntu/src/sgai-pi/modules/ctx-engine
+ExecStart=/home/ubuntu/src/sgai-pi/modules/ctx-engine/.venv/bin/python main.py
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
 UMask=0077

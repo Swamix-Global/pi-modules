@@ -5,3 +5,4 @@ dist/
 *.local
 .venv/
 .kilo/
+.pi/
