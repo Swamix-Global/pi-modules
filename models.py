@@ -30,6 +30,8 @@ class Stats(BaseModel):
     strategy_passes: int = 0
     condenses: int = 0
     dropped_blocks: int = 0
+    trims: int = 0            # requests whose drop frontier moved (each one rebuilds the cache)
+    rebuild_tokens: int = 0   # estimated tokens re-billed by those frontier moves
     usage_tokens: int = 0
     status: dict[str, int] = Field(default_factory=dict)
     last_condense: CondenseInfo | None = None

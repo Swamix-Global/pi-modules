@@ -334,14 +334,48 @@ def test_openai_wire_format_drops_oldest_blocks_keeps_current_turn(monkeypatch):
     assert shipped[-1] == messages[-1]
 
 
-def test_usage_anchored_drop_fires_when_estimate_understates(monkeypatch):
-    """Snapshot says 60k, estimate says 4k: repair still drops (anchor = real usage)."""
-    with_budget(monkeypatch, level="L2")
+def test_phantom_usage_claim_never_trims_an_under_budget_payload(monkeypatch):
+    """A stale client snapshot (60k claimed, ~1k real) must not move the drop frontier.
+
+    The snapshot counts the history before the router trimmed it, so it stays far above any
+    budget for the rest of a session. Trimming on it rewrites the prompt head on every
+    request and the host re-bills the whole tail - the cache-miss loop this guards.
+    """
+    with_budget(monkeypatch, level="L1")
     captured = capture_upstream(monkeypatch)
-    messages = openai_wire_thread(fill=300, blocks=3)  # tiny estimate, huge claimed usage
+    messages = openai_wire_thread(fill=200, blocks=2)  # ~200 est, far under the 400 budget
     r = client().post("/r/deepseek/chat/completions",
                       content=ship({"messages": messages}, usage=60_000))
     assert r.status_code == 200
     shipped = json.loads(captured["data"].decode().split("_pi_ctx::")[0])["messages"]
-    assert all(m.get("role") != "tool" for m in shipped), "all droppable blocks gone"
-    assert shipped[0]["role"] == "system" and shipped[-1] == messages[-1]
+    assert shipped == messages, "payload is under budget: forwarded byte-identically"
+    assert main.STATS.trims == 0
+
+
+def test_drop_frontier_is_pinned_across_requests(monkeypatch):
+    """One trim per budget band, not one per request: the head must stay fixed."""
+    with_budget(monkeypatch, budget=1_000, level="L1")
+    main.u.FRONTIER._pins.clear()
+    messages = openai_wire_thread(fill=3_000, blocks=4)
+
+    captured = capture_upstream(monkeypatch)
+    assert client().post("/r/deepseek/chat/completions",
+                         content=ship({"messages": messages})).status_code == 200
+    first = json.loads(captured["data"].decode().split("_pi_ctx::")[0])["messages"]
+    assert main.STATS.trims == 1, "the first over-budget request trims"
+    ids_first = [m.get("tool_call_id") for m in first if m.get("role") == "tool"]
+
+    grown = messages[:-1] + [
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "call_new", "type": "function",
+             "function": {"name": "bash", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "call_new", "content": "y" * 400},
+        messages[-1]]
+    assert client().post("/r/deepseek/chat/completions",
+                         content=ship({"messages": grown})).status_code == 200
+    second = json.loads(captured["data"].decode().split("_pi_ctx::")[0])["messages"]
+    ids_second = [m.get("tool_call_id") for m in second if m.get("role") == "tool"]
+    assert main.STATS.trims == 1, "growth inside the band must not move the frontier"
+    assert ids_second[:len(ids_first)] == ids_first, "cached head preserved across requests"
+    kept_calls = {c["id"] for m in second for c in m.get("tool_calls") or []}
+    assert set(ids_second) <= kept_calls, "no orphaned tool results"

@@ -54,19 +54,27 @@ def compact_payload(raw: bytes) -> tuple[bytes, CondenseInfo, int, bool]:
     if not isinstance(messages := body.get("messages"), list) or not messages:
         raise ValueError("no messages to minify")
     original, info = messages, CondenseInfo()
-    if usage > BUDGET and not all(m.get("role") == "system" for m in messages):
-        before = u.overhead_tokens(messages)
+    before = u.overhead_tokens(messages)
+    if before > BUDGET and not all(m.get("role") == "system" for m in messages):
         messages, info.dropped_blocks = u.drop_blocks_before_current_turn(messages, BUDGET, usage=usage)
         if info.dropped_blocks:
             info.trigger = "strategy"
-        if LEVEL == "L2" and usage - (before - u.overhead_tokens(messages)) > BUDGET:
+            # Moving the frontier cuts the head of the prompt, so the host can no longer
+            # serve the tail from cache and re-bills it: one trim, one cache rebuild.
+            STATS.trims += 1
+            STATS.rebuild_tokens += u.overhead_tokens(messages)
+        if LEVEL == "L2" and u.overhead_tokens(messages) > BUDGET:
             entries, sigs = u.condensed_prefix_build(messages, PREV_ENTRY_SIGS)
             if entries:
                 messages, patch = _fold(messages, entries, sigs)
                 info = info.model_copy(update=patch) if patch else info
-    if u.overhead_tokens(messages) > BUDGET:
-        messages = u.context_messages(messages, int(BUDGET * 1.3))
+    # Provider-reported usage is the only authoritative size signal. Acting on the char
+    # estimate while a snapshot exists trims messages the host had already cached, so the
+    # fallback trim is limited to snapshot-free clients that give us no usage at all.
+    if snap is None and u.overhead_tokens(messages) > BUDGET:
+        messages = u.context_messages(messages, int(BUDGET * u.CUT_FRACTION))
     if messages is not original:
+        messages = u.repair_tool_pairs(messages)  # a cut may have orphaned a tool result
         body["messages"] = messages
     elif snap is None:
         return raw, info, usage, bool(body.get("stream"))  # nothing to do: forward verbatim
