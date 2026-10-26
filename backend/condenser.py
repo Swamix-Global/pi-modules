@@ -17,10 +17,26 @@ from .config import (CACHE_DIR, CONDENSE_RETRIES, SG_LANG_BASE, SG_LANG_MODEL,
                      WORDS_PER_TOKEN)
 
 CONDENSE_PROMPT = (
-    "You compress a working-memory dump from a coding agent session. "
-    "Preserve: file paths, function and variable names, commands, errors, "
-    "decisions, open questions, task state. Drop: tool noise, retries, "
-    "superseded attempts. Output only the compressed notes, no preamble."
+    "You compress a coding-agent dump into notes for an agent that must continue the task.\n"
+    "Reply with exactly this template, one entry per line, and omit a label only when nothing real fits it:\n"
+    "TASK: one line stating the goal\n"
+    "STATE: what is done, running or blocked now — newest status only\n"
+    "FACTS: paths, symbols, commands, versions, numbers, file:line — copied verbatim\n"
+    "DECISIONS: 'choice because reason'\n"
+    "ERRORS: 'symptom -> cause -> fix -> status'\n"
+    "OPEN: unknowns and failed checks\n"
+    "NEXT: the single next action\n"
+    "Rules: copy identifiers and numbers exactly and never invent one — write unknown instead; merge "
+    "duplicates, retries and superseded attempts, keeping only the latest status; no logs, no code "
+    "fences, no preamble; under 200 words.\n"
+    "Example reply:\n"
+    "TASK: stop per-turn cache re-billing in the context router\n"
+    "STATE: budget 60k with cut fraction 0.4 is live; 2 trims in 11 requests, 0 frontier resets\n"
+    "FACTS: cache-stats.js:41 NOISE_FLOOR_TOKENS=1024; utils.py passes() cuts to budget*0.4\n"
+    "DECISIONS: added a hysteresis watermark because an exact-budget cut moved the frontier every request\n"
+    "ERRORS: router 503 at 18:41 -> transient -> curl retry ok\n"
+    "OPEN: whether 0 resets still holds after a compaction turn\n"
+    "NEXT: replay one compaction turn and compare cacheRead with the previous run"
 )
 
 
