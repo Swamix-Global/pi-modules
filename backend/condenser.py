@@ -59,30 +59,24 @@ def local_ai(system_prompt: str, user_message: str, max_tokens: int = 2048) -> s
 
 
 # --- entry rendering ----------------------------------------------------------------------
-def _format_calls(message: dict) -> str:
-    """Render OpenAI wire tool_calls as condenser lines."""
-    role = message.get("role", "?")
-    return "\n".join(f"[{role} toolCall {(fn := call.get('function') or {}).get('name', '?')}]" f" {fn.get('arguments', '')}" for call in message.get("tool_calls") or ())
-
-
-def _format_block(role: str, block: dict) -> str:
-    """Render one content block as a condenser line, unknown types truncated."""
-    kind = block.get("type", "?")
-    if kind == "text":
-        return f"[{role}] {block.get('text', '')}"
-    if kind == "toolCall":
-        args = json.dumps(block.get("arguments", {}), ensure_ascii=False)
-        return f"[{role} toolCall {block.get('name', '?')}] {args}"
-    if kind == "image":
-        return f"[{role} image omitted]"
-    return f"[{role} {kind}] {json.dumps(block, ensure_ascii=False)[:400]}"
-
-
 def _format_entry(message: dict) -> str:
-    """Flatten one message into condenser-readable text."""
-    role, content = message.get("role", "?"), message.get("content")
-    lines = [f"[{role}] {content}"] if isinstance(content, str) else [_format_block(role, block) for block in content or () if isinstance(block, dict)]
-    return "\n".join(filter(None, [_format_calls(message), *lines]))
+    """Render one wire message — string content, Pi blocks, or OpenAI tool_calls — as lines."""
+    role = message.get("role", "?")
+    parts = [f"[{role} toolCall {(fn := call.get('function') or {}).get('name', '?')}] {fn.get('arguments', '')}"
+             for call in message.get("tool_calls") or ()]
+    content = message.get("content")
+    blocks = [{"type": "text", "text": content}] if isinstance(content, str) else [b for b in content or () if isinstance(b, dict)]
+    for block in blocks:
+        kind, text = block.get("type", "?"), block.get("text", "")
+        if kind == "text":
+            parts.append(f"[{role}] {text}")
+        elif kind == "toolCall":
+            parts.append(f"[{role} toolCall {block.get('name', '?')}] {json.dumps(block.get('arguments', {}), ensure_ascii=False)}")
+        elif kind == "image":
+            parts.append(f"[{role} image omitted]")
+        else:
+            parts.append(f"[{role} {kind}] {json.dumps(block, ensure_ascii=False)[:400]}")
+    return "\n".join(filter(None, parts))
 
 
 def word_budget(target_tokens: int) -> int:
