@@ -13,9 +13,10 @@ import pytest
 from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import main  # noqa: E402
-import utils as u  # noqa: E402
-from models import Stats  # noqa: E402
+from backend import condenser, strategy as u, transport as t  # noqa: E402
+import backend.app as router  # noqa: E402
+from backend.app import app  # noqa: E402
+from backend.app import Stats  # noqa: E402
 
 
 # --- fakes -----------------------------------------------------------------------------
@@ -33,10 +34,11 @@ class FakeResp:
 
 
 def with_budget(monkeypatch, budget=400, level="L1"):
-    monkeypatch.setattr(main, "BUDGET", budget)
-    monkeypatch.setattr(main, "PREV_ENTRY_SIGS", [])
-    monkeypatch.setattr(main, "LEVEL", level)  # L1: drop-only; L2: drop + condense
-    monkeypatch.setattr(main, "STATS", Stats())  # isolate counters per test
+    monkeypatch.setattr(router, "BUDGET", budget)
+    monkeypatch.setattr(router, "_prev_sigs", [])
+    monkeypatch.setattr(router, "LEVEL", level)  # L1: drop-only; L2: drop + condense
+    monkeypatch.setattr(router, "STATS", Stats())  # isolate counters per test
+    u.FRONTIER._pins.clear()  # isolate the conversation frontier per test
 
 
 def capture_upstream(monkeypatch, payload=None, status=200, ctype="application/json"):
@@ -50,12 +52,12 @@ def capture_upstream(monkeypatch, payload=None, status=200, ctype="application/j
              "usage": {"prompt_tokens": 321}}).encode()
         return FakeResp(body, status, ctype)
 
-    monkeypatch.setattr(main.SESSION, "post", fake_post)
+    monkeypatch.setattr(router.SESSION, "post", fake_post)
     return captured
 
 
 def client():
-    return TestClient(main.app)
+    return TestClient(app)
 
 
 def ship(body: dict, usage: int = 50_000) -> bytes:
@@ -137,7 +139,7 @@ def test_deepseek_chain_drops_oldest_blocks_keeps_current_turn(monkeypatch):
 def test_deepseek_auth_injected_and_client_auth_stripped(monkeypatch):
     with_budget(monkeypatch, budget=10**9)  # stay under: no repair
     captured = capture_upstream(monkeypatch)
-    monkeypatch.setattr(u, "AUTH_PATH", Path(__file__).parent / "fake-auth.json")
+    monkeypatch.setattr(t, "AUTH_PATH", Path(__file__).parent / "fake-auth.json")
     (Path(__file__).parent / "fake-auth.json").write_text('{"deepseek": {"key": "sk-live-9"}}')
     try:
         r = client().post("/r/deepseek/chat/completions",
@@ -199,7 +201,7 @@ def giant_history(fill=20000):
 def test_history_overflow_condenses_via_sglang(monkeypatch):
     with_budget(monkeypatch, level="L2")
     captured = capture_upstream(monkeypatch)
-    monkeypatch.setattr(main.u, "condense",
+    monkeypatch.setattr(condenser, "condense",
                         lambda entries, target: ("NOTES: user asked to scan; bash ls output huge", 12.3))
     messages = giant_history()
     r = client().post("/r/deepseek/chat/completions", content=ship({"messages": messages}))
@@ -219,7 +221,7 @@ def test_condense_fail_open_ships_trimmed_but_valid(monkeypatch):
     def boom(entries, target):
         raise RuntimeError("sglang down")
 
-    monkeypatch.setattr(main.u, "condense", boom)
+    monkeypatch.setattr(condenser, "condense", boom)
     messages = giant_history()
     r = client().post("/r/deepseek/chat/completions", content=ship({"messages": messages}))
     assert r.status_code == 200, "fail-open still serves the request"
@@ -234,7 +236,7 @@ def test_tool_dump_still_drops_before_condense(monkeypatch):
     """L1 policy: a droppable tool block closes the gap without any LLM call."""
     with_budget(monkeypatch, level="L1")
     captured = capture_upstream(monkeypatch)
-    monkeypatch.setattr(main.u, "condense",
+    monkeypatch.setattr(condenser, "condense",
                         lambda entries, target: (_ for _ in ()).throw(AssertionError("condenser must not run")))
     messages = [{"role": "system", "content": "sys"}, {"role": "user", "content": "scan"},
                 {"role": "assistant", "content": [{"type": "toolCall", "id": "c", "name": "bash",
@@ -349,20 +351,20 @@ def test_phantom_usage_claim_never_trims_an_under_budget_payload(monkeypatch):
     assert r.status_code == 200
     shipped = json.loads(captured["data"].decode().split("_pi_ctx::")[0])["messages"]
     assert shipped == messages, "payload is under budget: forwarded byte-identically"
-    assert main.STATS.trims == 0
+    assert router.STATS.trims == 0
 
 
 def test_drop_frontier_is_pinned_across_requests(monkeypatch):
     """One trim per budget band, not one per request: the head must stay fixed."""
     with_budget(monkeypatch, budget=1_000, level="L1")
-    main.u.FRONTIER._pins.clear()
+    u.FRONTIER._pins.clear()
     messages = openai_wire_thread(fill=3_000, blocks=4)
 
     captured = capture_upstream(monkeypatch)
     assert client().post("/r/deepseek/chat/completions",
                          content=ship({"messages": messages})).status_code == 200
     first = json.loads(captured["data"].decode().split("_pi_ctx::")[0])["messages"]
-    assert main.STATS.trims == 1, "the first over-budget request trims"
+    assert router.STATS.trims == 1, "the first over-budget request trims"
     ids_first = [m.get("tool_call_id") for m in first if m.get("role") == "tool"]
 
     grown = messages[:-1] + [
@@ -375,7 +377,7 @@ def test_drop_frontier_is_pinned_across_requests(monkeypatch):
                          content=ship({"messages": grown})).status_code == 200
     second = json.loads(captured["data"].decode().split("_pi_ctx::")[0])["messages"]
     ids_second = [m.get("tool_call_id") for m in second if m.get("role") == "tool"]
-    assert main.STATS.trims == 1, "growth inside the band must not move the frontier"
+    assert router.STATS.trims == 1, "growth inside the band must not move the frontier"
     assert ids_second[:len(ids_first)] == ids_first, "cached head preserved across requests"
     kept_calls = {c["id"] for m in second for c in m.get("tool_calls") or []}
     assert set(ids_second) <= kept_calls, "no orphaned tool results"

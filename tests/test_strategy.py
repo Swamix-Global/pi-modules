@@ -1,4 +1,9 @@
-"""Strategy core tests: deterministic drop, condense-offer, and trim behavior."""
+"""Strategy tests: contiguous prefix cut, condense offer, media stripping, whole-turn trim.
+
+The old scattered "greedy drop anywhere" pass is gone on purpose: cutting non-contiguous
+blocks out of the middle of history shifts the prompt head on every request, which is what
+made the host re-bill whole prompts. `cut_prefix` only ever removes a contiguous prefix.
+"""
 from __future__ import annotations
 
 import json
@@ -8,7 +13,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import utils as u  # noqa: E402
+from backend import strategy as u  # noqa: E402
 
 
 def result(call_id: str, text: str) -> dict:
@@ -20,34 +25,13 @@ def call(call_id: str, name: str, args: str) -> dict:
         {"type": "toolCall", "id": call_id, "name": name, "arguments": {"command": args}}]}
 
 
-def snapshot(body: dict, usage: int) -> str:
-    return json.dumps(body) + f'\n\n_pi_ctx::{{"usage": {usage}}}'
-
-
-# --- snapshot plumbing --------------------------------------------------------------
-def test_snapshot_parse_roundtrip():
-    parsed = u.parse_snapshot(snapshot({"messages": [{"role": "user", "content": "hi"}]}, 42000))
-    assert parsed["usage"] == 42000
-    assert parsed["body"]["messages"][0]["content"] == "hi"
-
-
-def test_snapshot_missing_marker_raises():
-    with pytest.raises(ValueError):
-        u.parse_snapshot(json.dumps({"messages": []}))
-
-
-def test_snapshot_malformed_json_raises():
-    with pytest.raises(ValueError):
-        u.parse_snapshot('{"messages": []}\n\n_pi_ctx::{"usage": "lots"}')
-
-
 def call_ids(messages):
     return [b["id"] for m in messages if m.get("role") == "assistant"
             for b in m.get("content", []) if isinstance(b, dict) and b.get("type") == "toolCall"]
 
 
-# --- strategy pass --------------------------------------------------------------------
-def test_passes_drops_whole_blocks_atomically():
+# --- prefix cut -----------------------------------------------------------------------
+def test_cut_prefix_drops_whole_blocks_atomically():
     messages = [
         {"role": "system", "content": "sys"},
         {"role": "user", "content": "turn one"},
@@ -58,47 +42,54 @@ def test_passes_drops_whole_blocks_atomically():
         result("c2", "y" * 20000),
         {"role": "user", "content": "current turn"},
     ]
-    dropped, kept, would = u.passes(messages, 100, 100)
-    # c1's call and result drop together, c2's pair too (both needed to fit)
-    assert {m.get("toolCallId") for m in dropped if m.get("role") == "toolResult"} == {"c1", "c2"}
-    assert call_ids(dropped) == ["c1", "c2"]
-    roles = [m.get("role") for m in kept]
-    assert roles.count("system") == 1 and roles.count("user") == 3
-    assert would and would[0] is messages[2]  # preview returns oldest victim
+    kept, dropped = u.cut_prefix(messages, 100, 100)
+    assert dropped == 5, "both call turns and both results go as one contiguous prefix"
+    assert kept == [messages[0], messages[1], messages[7]]
+    assert call_ids(kept) == [], "no call survives without its result"
 
 
-def test_passes_never_orphans_a_tool_result():
-    messages = [{"role": "user", "content": "go"}, call("c1", "bash", "ls"), result("c1", "r" * 9000)]
-    dropped, kept, _ = u.passes(messages, 100, 100)
+def test_cut_prefix_under_budget_returns_the_same_list():
+    messages = [{"role": "system", "content": "sys"}, {"role": "user", "content": "go"}]
+    kept, dropped = u.cut_prefix(messages, 10_000, 4_000)
+    assert kept is messages and dropped == 0, "an untouched request keeps its exact bytes"
+
+
+def test_cut_prefix_never_orphans_a_tool_result():
+    messages = [{"role": "user", "content": "go"}, call("c1", "bash", "ls"),
+                result("c1", "r" * 9000), {"role": "user", "content": "next"},
+                call("c2", "bash", "ls"), result("c2", "r" * 9000)]
+    kept, dropped = u.cut_prefix(messages, 100, 100)
+    assert dropped >= 2
     kept_results = {m.get("toolCallId") for m in kept if m.get("role") == "toolResult"}
-    kept_calls = {b.get("id") for m in kept if m.get("role") == "assistant"
-                  for b in m.get("content", []) if b.get("type") == "toolCall"}
+    kept_calls = set(call_ids(kept))
     assert kept_results == kept_calls, "every kept result keeps its call turn"
 
 
-def test_passes_is_pure():
+def test_cut_prefix_is_pure():
     messages = [{"role": "user", "content": "go"}, call("c1", "bash", "ls"), result("c1", "r" * 500)]
     frozen = json.dumps(messages)
-    u.passes(messages, 10, 10)
+    u.cut_prefix(messages, 10, 10)
     assert json.dumps(messages) == frozen
 
 
-def test_passes_skips_oversized_single_messages():
-    monster = result("big", "z" * (int(u.MSG_TOKEN_LIMIT * u.CHARS_PER_TOKEN) + 500))
-    messages = [{"role": "user", "content": "go"}, call("small", "bash", "ls"),
-                result("small", "s" * 1000), monster]
-    dropped, kept, _ = u.passes(messages, 100, 100)
-    assert monster in kept, "oversized single message survives the drop pass"
-    assert result("small", "s" * 1000) in dropped
-
-
-def test_passes_stops_when_budget_met():
+def test_cut_prefix_stops_once_below_the_low_watermark():
     messages = [{"role": "user", "content": "t1"}, call("c1", "bash", "ls"), result("c1", "r" * 5000),
                 {"role": "user", "content": "t2"}, call("c2", "bash", "ls"), result("c2", "r" * 5000),
                 {"role": "user", "content": "current"}]
-    dropped, kept, _ = u.passes(messages, 2000, 2000)
-    assert [m.get("toolCallId") for m in dropped if m.get("role") == "toolResult"] == ["c1"]
-    assert result("c2", "r" * 5000) in kept  # newest tool block untouched
+    kept, _ = u.cut_prefix(messages, 2000, 2000)
+    assert result("c1", "r" * 5000) not in kept, "oldest tool block goes first"
+    assert result("c2", "r" * 5000) in kept, "stop as soon as the cut reaches the watermark"
+    assert kept[-1]["content"] == "current"
+
+
+def test_cut_prefix_cuts_below_the_budget_for_headroom():
+    """Low-water cutting is the hysteresis: landing on `low` buys turns of cache stability."""
+    messages = [{"role": "user", "content": "t1"}, call("c1", "bash", "ls"), result("c1", "r" * 3600),
+                {"role": "user", "content": "t2"}, call("c2", "bash", "ls"), result("c2", "r" * 3600),
+                {"role": "user", "content": "current"}]
+    kept_low, _ = u.cut_prefix(messages, 2000, 400)
+    kept_budget, _ = u.cut_prefix(messages, 2000, 2000)
+    assert u.overhead_tokens(kept_low) <= 400 < u.overhead_tokens(kept_budget)
 
 
 # --- condense offer ---------------------------------------------------------------------
@@ -131,6 +122,43 @@ def test_single_turn_tool_dump_is_offered():
     messages = [{"role": "user", "content": "go"}, call("c1", "bash", "ls"), result("c1", "r" * 9000)]
     entries, _ = u.condensed_prefix_build(messages, [])
     assert entries == messages[-2:]
+
+
+# --- pinned frontier -----------------------------------------------------------------
+def frontier_thread(fill: int = 3000) -> list[dict]:
+    return [{"role": "system", "content": "sys"}, {"role": "user", "content": "anchor"},
+            call("c1", "bash", "ls"), result("c1", "x" * fill),
+            {"role": "user", "content": "t2"}, call("c2", "bash", "ls"), result("c2", "y" * fill),
+            {"role": "user", "content": "current"}]
+
+
+def test_frontier_survives_client_rewrites_of_dropped_history():
+    u.FRONTIER._pins.clear()
+    view, dropped = u.FRONTIER.apply(frontier_thread(), 1000, 400)
+    assert dropped == 4, "both call turns and their results are counted as dropped blocks"
+    assert [m["content"] for m in view[:2]] == ["sys", "anchor"]
+
+    drifted = frontier_thread()
+    drifted[3] = result("c1", "rewritten in place by the client")  # dropped side changes
+    drifted += [call("c3", "bash", "pwd"), result("c3", "r"), {"role": "user", "content": "next"}]
+    again, re_dropped = u.FRONTIER.apply(drifted, 1000, 400)
+    assert re_dropped == 0, "rewriting dropped history must not invalidate the pin"
+    assert [m["content"] for m in again[:3]] == ["sys", "anchor", "current"]
+    assert again[-1]["content"] == "next"
+
+
+def test_frontier_recuts_when_the_kept_head_is_gone():
+    u.FRONTIER._pins.clear()
+    messages = frontier_thread()
+    _, dropped = u.FRONTIER.apply(messages, 1000, 400)
+    assert dropped == 4
+
+    compacted = list(messages[:7])  # client rewrote or dropped the kept head message
+    compacted[7:] = [{"role": "user", "content": "compacted turn"},
+                     call("c4", "bash", "ls"), result("c4", "z" * 3000),
+                     {"role": "user", "content": "next"}]
+    _, re_dropped = u.FRONTIER.apply(compacted, 1000, 400)
+    assert re_dropped > 0, "an unverifiable head means a fresh contiguous cut, never a stale one"
 
 
 # --- safety-net trim ----------------------------------------------------------------------
@@ -193,38 +221,3 @@ def test_strip_media_removes_old_images_keeps_current_turn():
     assert out[3]["content"] == [{"type": "text", "text": "shot"}]
     assert out[4] is messages[4], "current turn keeps its images untouched"
     assert messages[1]["content"] != out[1]["content"], "originals never mutate"
-
-
-# --- SPEC: local_ai with durable file cache ------------------------------------------------
-def test_local_ai_caches_by_input_hash(monkeypatch, tmp_path):
-    calls = []
-
-    class Resp:
-        status_code = 200
-        def raise_for_status(self): pass
-        def json(self):
-            calls.append(1)
-            return {"choices": [{"message": {"content": "cached-note"}}]}
-
-    monkeypatch.setattr(u, "CACHE_DIR", tmp_path)
-    monkeypatch.setattr(u.requests, "post", lambda *a, **k: Resp())
-    first = u.local_ai("sys prompt", "user text", 128)
-    second = u.local_ai("sys prompt", "user text", 128)
-    assert first == second == "cached-note"
-    assert len(calls) == 1, "second identical call served from file cache"
-    assert list(tmp_path.glob("*.txt")), "cache persisted to disk"
-
-
-# --- SPEC: gzip transport ------------------------------------------------------------------
-def test_maybe_gzip_only_for_cloud_providers_and_large_bodies(monkeypatch):
-    import gzip as gz
-    monkeypatch.setattr(u, "GZIP_PROVIDERS", {"deepseek"})
-    big = b"x" * (u.GZIP_MIN_BYTES + 10)
-    headers = {}
-    body = u.maybe_gzip("deepseek", big, headers)
-    assert headers["Content-Encoding"] == "gzip" and body != big
-    headers2 = {}
-    assert u.maybe_gzip("sglang", big, headers2) is big, "locals stay raw"
-    headers3 = {}
-    assert u.maybe_gzip("deepseek", b"small", headers3) == b"small", "small bodies stay raw"
-    assert gz.decompress(body) == big

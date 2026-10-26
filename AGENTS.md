@@ -1,43 +1,58 @@
 # Project Agent Instructions: ctx-engine
 
-Fresh loopback context-compression proxy: Python/FastAPI/httpx/sqlite3 in `backend/`, Svelte 5/Tailwind 4/Font Awesome/Chart.js SPA in `frontend/`.
+Loopback context minifier: Python/FastAPI/requests in `backend/`, one thin `main.py` entry point.
+No database, no dashboard API, no Svelte service — the v2 SQLite/dashboard stack is retired and
+`frontend/` is dead weight kept only for history.
 
-## Layout and interfaces
+## Layout
 
-- `backend/db.py`: SQLite only, three application tables (`settings`, `cache`, `requests`), WAL and 5-second busy timeout. Fresh DB `~/.pi/agent/ctx-engine-v2.db`; never silently reuse, overwrite, or drop the archived old database.
-- `backend/utils.py`: configuration, transcript/turn helpers, `ctx_man`, `compress_body`. DeepSeek Flash directly; Luna 6 through a one-shot supported Pi SDK child with native OAuth, never routed through the proxy.
-- `backend/main.py`: explicit FastAPI proxy/dashboard routes, raw upstream streaming, persistent request attempts, same-origin management APIs.
-- Frontend source is `frontend/src/`; no React, Elysia, Drizzle, or old Bun backend remains.
+- `backend/config.py`: every tunable. Environment only, read once at import; a restart is the only
+  way to change behaviour. Keep new knobs here, never as scattered `os.getenv` calls.
+- `backend/transport.py`: `_pi_ctx` snapshot split, auth injection, hop-header hygiene, opt-in
+  request gzip. Moves bytes and credentials only; never inspects conversation content.
+- `backend/strategy.py`: turn anatomy (`_blocks`, `_anchor`, `_turn_start`), media stripping,
+  tool-pair repair, the pinned `Frontier`/`cut_prefix` L1 pass, whole-turn `context_messages`.
+- `backend/condenser.py`: L2 folding through local SGLang granite, `local_ai` with durable file
+  cache keyed by input hash, wire-format rendering.
+- `backend/app.py`: FastAPI surface, `minify` pipeline, counters and pydantic shapes.
+- `main.py`: `from backend.app import app, serve`; systemd runs `python main.py`.
 
 ## Invariants
 
-- Soft token threshold default 32k; preserve protected turns and fixed fields. Indivisible overflow does not disable condensation of eligible older activity; warn when the protected floor or final result exceeds the target. No context-driven 413, clipping, silent block dropping, or excerpt fallback.
-- Completed turn blocks launch concurrently and all settle. Three total attempts × 30 seconds per uncached block. Exhaustion never fails the turn: emit a payload-free CRITICAL, forward that block verbatim, and cool the condenser down for `PI_CONTEXT_ROUTER_CONDENSER_COOLDOWN` seconds (default 120) so later blocks skip it rather than stall.
-- Each condensed turn is the original user query verbatim as a `user` message, followed by one `assistant` summary of only the subsequent replies, reasoning and tool calls/results. Never send the opening query to the condenser or replace it with a summary. Query-only turns do not invent an assistant reply.
-- Concatenate consecutive real user messages with one newline, preserving text/whitespace and structured content parts; do this even below threshold. User-role tool-result envelopes are activity, not queries. Protected turns count after concatenation.
-- Cache key strictly `<assistant activity block SHA256>-<model>-<output cap>`; concurrent misses return the first committed note. Old whole-turn cache keys are not reused for assistant-only notes. Recognize already-rendered assistant notes. Sizing hints never truncate output.
-- Tool calls/results stay together; image-containing blocks remain intact; encrypted reasoning is not rendered to the condenser. All verbatim queries are indivisible fixed context; preserve them even above the soft budget, while still condensing other eligible older activity. Accept a note only if its replacement block reduces estimated tokens; otherwise retain the entire original block, without clipping the note, and reuse its canonical cache entry on later attempts.
-- Subscription-authenticated `/r/openai/responses` and `/codex/responses` strip `max_output_tokens`, `temperature`, `prompt_cache_retention`, and `prompt_cache_options`; `sk-` payloads retain them.
-- Antigravity requests can route through `/r/antigravity` as a secure pass-through: the proxy server securely forwards requests upstream to Google Cloud over HTTPS without mutating proprietary non-OpenAI wire formats.
-- Persist attempts and full received/forwarded JSON, not credentials; no automatic pruning. Log each proxy decision in the journal. Database failures return 503. Health probes SQLite cheaply; /health?deep=1 runs the full integrity check. Restarting marks unfinished rows 503.
-- SPA timestamps use system locale; chart anchors to server `now`; tabs/request selection persist in URL. Themes must remain high-contrast.
+- **A request that needs no change is forwarded with its original bytes.** Re-serializing the JSON
+  rewrites the prompt prefix and invalidates the provider cache even when the text is identical.
+- **L1 cuts one contiguous prefix of whole tool blocks before the current turn**, down to
+  `budget × CUT_FRACTION`, and pins the resulting drop point per conversation. Never cut scattered
+  blocks out of the middle: that shifts the head on every request and re-bills the tail.
+- **The frontier moves only when the payload re-crosses the budget.** Hysteresis exists so the
+  frontier moves once per band, not once per request; `STATS.trims`/`rebuild_tokens` measure the
+  cost of every move, and `STATS.frontier_pins`/`frontier_resets` expose pin health.
+- **The client usage snapshot never drives trimming.** It counts history from before the router's
+  own cut, so it stays above the budget forever; it is telemetry and the trigger, not a measure of
+  what is being sent now.
+- **A pin is verified by its first kept message, never by the last dropped one.** Clients rewrite
+  old history in place (bounded tool results, truncation markers); validating the dropped side
+  reset the pin every request and re-cut the whole prefix, so the check follows the kept head.
+- **Tool calls and results travel together.** Any cut is block-aligned and `repair_tool_pairs`
+  runs after it, because providers reject an orphaned `tool` message.
+- **Media before the current turn is stripped**; media in the current turn is preserved untouched.
+- **The condenser is advisory.** Retries are bounded, notes are cached by input hash, and any
+  failure ships the turn untouched rather than failing the request.
+- **Managed providers get router-injected bearer auth** from `auth.json`; client `api-key` /
+  `authorization` values are dropped for those providers and kept for pass-through ones.
+- Request gzip stays opt-in (`PI_ROUTER_GZIP_PROVIDERS`): cloud chat APIs reject
+  `Content-Encoding` on POST, and local uvicorn hosts cannot decode it.
 
-## Canonical checks/deploy
+## Checks and deploy
 
 ```sh
-.venv/bin/python -m unittest discover -s tests -v
-cd frontend && npm run check && npm run build
-.venv/bin/python tests/test_ui.py
+.venv/bin/python -m pytest tests -q          # 40 tests
 systemctl --user restart pi-context-router.service
-curl -fsS http://127.0.0.1:4141/health
+curl -s 127.0.0.1:4141/health                # {"ok":true,...}
+curl -s 127.0.0.1:4141/stats                 # trims/rebuild_tokens should stay flat per band
 ```
 
-Run backend tests for any Python changes. Build and restart after frontend changes. See `README.md` for installation, backup location, architecture and deployment; do not duplicate process guides. Follow global agent rules and `~/.pi/agent/AGENTS-RSI.md` for stack changes. Keep existing unrelated user files intact; commit changes every time files are modified, and show the diff between commits.
-
-## Project Summarization (standard recipe)
-- Goal: per-file ~200-word structured description of every source file.
-- Output: one YAML doc mapping `filename` → `purpose` (2 sentences), `components` (5–6), `key_functions` (8–10, real symbol names), `data_flow` (3–4 steps), `interactions` (2–3).
-- Endpoint `http://127.0.0.1:30000/v1/chat/completions`, model per serving (e.g. `minicpm5-2b-fp8`), `enable_thinking: false`, `max_tokens 2048`.
-- Sampling: `temperature 0` deterministic; general profile `temperature 0.3, repetition_penalty 1.05`; never >= 1.1; top_p is noise.
-- Parallelism: ThreadPoolExecutor(48–128); server tuned to 128 streams (5576 tok/s aggregate).
-- Formatting enforced by code: lenient line-parse, rebuild the 5-key dict, `yaml.safe_dump`, round-trip validate. Write to `lang-test.txt`; report per-call e2e + wall total.
+After any change to `strategy.py` or `app.py`, confirm on live `/stats` that `trims` does not grow
+per request — growing `trims` with flat request count is the cache-churn regression. A growing
+`frontier_resets` means the client is rewriting the kept head itself; that is a client problem, but
+it will show up as extra trims here.
