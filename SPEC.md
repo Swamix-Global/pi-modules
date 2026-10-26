@@ -18,13 +18,20 @@ requests, uv, pydantic, fastapi, best dx friendly oss libraries known which can 
 - TOOL CALL PAIR: a tool call and its output is tool call pair.
 
 
-## Compression policy
+## Compression policy (CONTINUOUS)
 
-- L1 : 
-  - just drops tool call and tool results, until previous turn, current turn is preserved for better coherence. 
 
-- L2 : 
-  - Everything in Fast Mode + Assistant/Thinking messages are passed a compression stage.
+- just drops tool call and tool results, until previous turn, current turn is preserved for better coherence. 
+
+EXAMPLE:
+```
+user: (N-1 Turn)
+asst: ...
+think : ...
+tool : ...
+user : (this is current turn)
+...
+```
 
 
 ## Local AI (SGlang)

@@ -15,9 +15,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections import OrderedDict
 
-from .config import BUDGET, CHARS_PER_TOKEN, CUT_FRACTION, FRONTIER_CAP
+from .config import BUDGET, CHARS_PER_TOKEN
 
 MEDIA_TYPES = frozenset({"image", "image_url", "input_image", "file", "audio"})
 THINKING_TYPES = frozenset({"thinking", "redacted_thinking", "reasoning"})  # kept verbatim
@@ -73,38 +72,10 @@ def content_sig(message: dict) -> str:
     return hashlib.sha1(json.dumps(message.get("content"), sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:12]
 
 
-def message_sig(message: dict) -> str:
-    """Stable identity of one message, used to validate a pinned cut boundary."""
-    body = {"role": message.get("role"), "id": _call_id(message), "content": message.get("content"), "calls": [call.get("id") for call in message.get("tool_calls") or ()]}
-    return hashlib.sha1(json.dumps(body, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:12]
-
-
 # --- blocks and turns ---------------------------------------------------------------------
-def _blocks(messages: list[dict]) -> list[list[dict]]:
-    """Segment into atomic blocks: a call turn absorbs exactly the results it owns."""
-    blocks: list[list[dict]] = []
-    for i, message in enumerate(messages):
-        owner = blocks[-1] if blocks else None
-        if i and owner and owner[-1] is messages[i - 1] and _is_tool_result(message) and _call_id(message) in _call_ids(owner[0]):
-            owner.append(message)
-        else:
-            blocks.append([message])
-    return blocks
-
-
 def count_tool_blocks(messages: list[dict]) -> int:
     """Droppable blocks: assistant call turns plus tool results, either wire format."""
     return sum(1 for m in messages if _is_tool_result(m) or (m.get("role") == "assistant" and _has_tool_calls(m)))
-
-
-def _anchor(messages: list[dict]) -> int:
-    """Leading system messages plus the first user turn: the task header, never trimmed."""
-    i = 0
-    while i < len(messages) and messages[i].get("role") == "system":
-        i += 1
-    if i < len(messages) and messages[i].get("role") == "user":
-        i += 1
-    return i
 
 
 def _turn_start(messages: list[dict]) -> int:
@@ -160,120 +131,55 @@ def repair_tool_pairs(messages: list[dict]) -> list[dict]:
 
 
 # --- Fast Mode | L1 -----------------------------------------------------------------------
-def cut_prefix(messages: list[dict], budget: int, low: int, anchor: int | None = None, start: int | None = None) -> tuple[list[dict], int]:
-    """Drop a contiguous, block-aligned prefix of old turns until the payload fits `low`.
-
-    `anchor` is the protected head (system messages plus the first user turn); `start` is the
-    current drop frontier, which defaults to the anchor. `low` is measured on what would be
-    forwarded — the head plus everything from `start` on — so an already-dropped prefix is
-    never counted twice. `low` sits below `budget` on purpose: cutting exactly to the budget
-    leaves no headroom, so the next turn re-crosses it and moves the frontier again, paying a
-    cache rebuild per request instead of per budget band.
-    """
-    anchor = _anchor(messages) if anchor is None else anchor
-    start = max(anchor, start if start is not None else anchor)
-    head, view = messages[:anchor], messages[start:]
-    if overhead_tokens(head) + overhead_tokens(view) <= budget:
-        return messages, 0
+def tool_pairs(messages: list[dict]) -> list[list[int]]:
+    """Index groups of each pre-turn tool-call pair, oldest first, results included."""
     turn = _turn_start(messages)
-    over = overhead_tokens(head) + overhead_tokens(view) - low
-    dropped = 0
-    for block in _blocks(messages[start:turn]):
-        if over <= 0:
-            break
-        over -= sum(map(message_tokens, block))
-        dropped += len(block)
-    if not dropped:
-        return messages, 0  # nothing cuttable before the current turn: keep everything
-    return messages[:anchor] + messages[start + dropped :], dropped
+    groups: list[list[int]] = []
+    owner: dict[str, int] = {}
+    for i, message in enumerate(messages[:turn]):
+        ids = _call_ids(message)
+        if ids:
+            groups.append([i])
+            for call_id in ids:
+                owner[call_id] = len(groups) - 1
+        elif (call_id := _call_id(message)) is not None and call_id in owner:
+            groups[owner[call_id]].append(i)
+    return groups
 
 
-class Frontier:
-    """Per-conversation drop point that stays fixed until the payload outgrows the budget.
+def drop_oldest_tool_pairs(messages: list[dict], budget: int) -> tuple[list[dict], int]:
+    """N-1 policy: shed whole tool pairs, oldest first, until the payload fits the budget.
 
-    Clients resend the whole conversation every request, so a cut recomputed from scratch
-    walks forward as the tail grows: the prompt head changes on nearly every request and the
-    host has to re-bill the whole tail, which is what the cache-miss notices report. Pinning
-    the drop point keeps the head byte-identical between requests, so only the new turn is
-    fresh input; the frontier moves once per budget band instead of once per request.
+    Tool output is what balloons a transcript; prose is the evidence the next turn argues
+    from. So L1 drops a call turn together with every result it owns, never a plain
+    user/assistant message, and stops the moment the payload is under `budget` — no low
+    watermark, no pinned frontier. Pairs go oldest-first (N-1 of them before the newest):
+    the newest pair is dropped last, and only when the payload is still over budget without
+    it, so a single oversized dump cannot ride through untouched.
     """
-
-    def __init__(self, cap: int = FRONTIER_CAP) -> None:
-        self._pins: OrderedDict[str, tuple[int, str]] = OrderedDict()
-        self._cap = cap
-        self.resets = 0  # times a pin could not be relocated and history was re-cut
-
-    @property
-    def size(self) -> int:
-        """Conversations currently pinned."""
-        return len(self._pins)
-
-    @staticmethod
-    def key(messages: list[dict]) -> str:
-        """Conversation identity: the system prompt plus the first turn of the transcript."""
-        seed = next((m for m in messages if m.get("role") != "system"), {})
-        return hashlib.sha1((json.dumps(messages[0] if messages else {}, sort_keys=True) + "|" + content_sig(seed)).encode()).hexdigest()[:16]
-
-    def _remember(self, key: str, pin: tuple[int, str]) -> None:
-        """Store the pin, evicting the least recently used conversation."""
-        self._pins[key] = pin
-        self._pins.move_to_end(key)
-        while len(self._pins) > self._cap:
-            self._pins.popitem(last=False)
-
-    def _locate(self, messages: list[dict], anchor: int, start: int, kept_sig: str) -> int:
-        """Find the pinned head again: kept messages must survive, dropped ones may not.
-
-        The check deliberately hashes the first *kept* message instead of the last dropped
-        one. Clients rewrite old history in place (bounded tool results, truncation markers),
-        so the message before the frontier changes regularly while the kept head does not;
-        validating the dropped side reset the pin and re-cut the whole prefix every request.
-        """
-        if not kept_sig:
-            return anchor  # no pin yet: start from the protected task header
-        if start < len(messages) and message_sig(messages[start]) == kept_sig:
-            return start
-        candidates = [i for i in range(anchor, len(messages)) if message_sig(messages[i]) == kept_sig]
-        if candidates:  # nearest surviving copy keeps the frontier where it was
-            return min(candidates, key=lambda i: abs(i - start))
-        self.resets += 1
-        return anchor
-
-    def apply(self, messages: list[dict], budget: int, low: int) -> tuple[list[dict], int]:
-        """Return the pinned view of one conversation, cutting only when it outgrows `budget`."""
-        if not messages:
-            return messages, 0
-        key = self.key(messages)
-        anchor = _anchor(messages)
-        start = self._locate(messages, anchor, *self._pins.get(key, (anchor, "")))
-        kept_sig = message_sig(messages[start]) if start < len(messages) else ""
-        head = messages[:anchor]
-        view = messages[start:]
-        if overhead_tokens(head) + overhead_tokens(view) <= budget:
-            self._remember(key, (start, kept_sig))
-            return (head + repair_tool_pairs(view)) if start > anchor else messages, 0
-        kept, dropped = cut_prefix(messages, budget, low, anchor, start)
-        if not dropped:
-            # nothing cuttable is left before the current turn: forward the pinned view as-is
-            self._remember(key, (start, kept_sig))
-            return (head + repair_tool_pairs(view)) if start > anchor else messages, 0
-        boundary = start + dropped
-        self._remember(key, (boundary, message_sig(messages[boundary]) if boundary < len(messages) else ""))
-        return repair_tool_pairs(kept), count_tool_blocks(messages[start:boundary])
-
-
-FRONTIER = Frontier()
+    total = overhead_tokens(messages)
+    if total <= budget:
+        return messages, 0
+    drop: set[int] = set()
+    for group in tool_pairs(messages):
+        if total <= budget:
+            break
+        drop.update(group)
+        total -= sum(message_tokens(messages[i]) for i in group)
+    if not drop:
+        return messages, 0  # prose only: nothing is droppable
+    return [message for i, message in enumerate(messages) if i not in drop], len(drop)
 
 
 def drop_blocks_before_current_turn(messages: list[dict], budget: int = BUDGET) -> tuple[list, int]:
-    """L1: strip media, then cut whole tool blocks before the current turn.
+    """L1: strip media, then shed the oldest whole tool pairs (N-1 policy).
 
     Deliberately ignores the client's usage snapshot: it counts the history *before* this
     router trimmed it, so it stays above the budget for the rest of the session and would
     re-trim on every single request.
     """
     stripped, _ = strip_media(messages)
-    return FRONTIER.apply(stripped, budget, int(budget * CUT_FRACTION))
+    return drop_oldest_tool_pairs(stripped, budget)
 
 
 # --- Standard Mode | L2 -------------------------------------------------------------------

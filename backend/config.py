@@ -32,12 +32,10 @@ def _text(name: str, default: str) -> str:
 
 # --- minification ------------------------------------------------------------------------
 BUDGET = _int("PI_ROUTER_BUDGET", 60_000)  # usage that triggers minification
-CUT_FRACTION = _float("PI_ROUTER_CUT_FRACTION", 0.4)  # hysteresis: cut down to this share
 CONDENSE_TARGET_FRACTION = 0.2  # condenser target, share of entry tokens
 CHARS_PER_TOKEN = 3.6  # conservative estimate, cap decisions only
 WORDS_PER_TOKEN = 0.75  # English prose: ~1 token per 0.75 words (4 tokens ≈ 3 words)
 MAX_BODY_BYTES = _int("PI_ROUTER_MAX_BODY_BYTES", 128 << 20)  # bigger bodies pass untouched
-FRONTIER_CAP = 64  # remembered conversations (LRU)
 LEVEL = _text("PI_ROUTER_LEVEL", "L2")  # Fast Mode | L1 vs Standard Mode | L2
 
 # --- local condenser ---------------------------------------------------------------------

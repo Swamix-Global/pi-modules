@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from . import condenser, strategy
-from .config import (BUDGET, CODEX_HOST, CONDENSE_TARGET_FRACTION, CUT_FRACTION, HOST,
+from .config import (BUDGET, CODEX_HOST, CONDENSE_TARGET_FRACTION, HOST,
                      LEVEL, MAX_BODY_BYTES, PORT, ROUTES, UPSTREAM_TIMEOUT)
 from .transport import auth_map, maybe_gzip, parse_snapshot, upstream_headers
 
@@ -42,13 +42,11 @@ class Stats(BaseModel):
     strategy_passes: int = 0
     condenses: int = 0
     dropped_blocks: int = 0
-    trims: int = 0            # requests whose drop frontier moved (each rebuilds the cache)
-    rebuild_tokens: int = 0   # estimated tokens re-billed by those moves
+    trims: int = 0            # requests that shed tool pairs (each shed trims the cached prefix)
+    rebuild_tokens: int = 0   # estimated tokens re-billed by those sheds
     usage_tokens: int = 0
     status: dict[str, int] = Field(default_factory=dict)
     last_condense: CondenseInfo | None = None
-    frontier_pins: int = 0    # conversations whose drop point is currently pinned
-    frontier_resets: int = 0  # pins that could not be relocated (history was rewritten)
     active: bool = False
     model: str = ""
 
@@ -86,7 +84,7 @@ def _fold(messages: list[dict], entries: list[dict], sigs: list[str]) -> tuple[l
 
 
 def _l1(messages: list[dict]) -> tuple[list[dict], int]:
-    """Drop whole pre-turn tool blocks, counting the cache rebuild each move costs."""
+    """Shed the oldest whole tool pairs (N-1 policy), counting the rebuild each shed costs."""
     trimmed, dropped = strategy.drop_blocks_before_current_turn(messages, BUDGET)
     if dropped:
         STATS.trims += 1
@@ -128,7 +126,7 @@ def minify(raw: bytes) -> tuple[bytes, CondenseInfo, int, bool]:
     # estimate while a snapshot exists trims messages the host had already cached, so the
     # fallback trim is limited to snapshot-free clients that give us no usage at all.
     if snapshot is None and strategy.overhead_tokens(messages) > BUDGET:
-        messages = strategy.context_messages(messages, int(BUDGET * CUT_FRACTION))
+        messages = strategy.context_messages(messages, BUDGET)
     if messages is original:
         if snapshot is None:
             return raw, info, usage, streams  # nothing to do: forward verbatim
@@ -243,8 +241,6 @@ def health() -> Health:
 def stats() -> Stats:
     """Every counter the pipeline mutates, per request."""
     _ping()
-    STATS.frontier_pins = strategy.FRONTIER.size
-    STATS.frontier_resets = strategy.FRONTIER.resets
     return STATS
 
 

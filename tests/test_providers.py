@@ -12,7 +12,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from backend import condenser, strategy as u, transport as t  # noqa: E402
+from backend import condenser, transport as t  # noqa: E402
 import backend.app as router  # noqa: E402
 from backend.app import app  # noqa: E402
 from backend.app import Stats  # noqa: E402
@@ -37,7 +37,6 @@ def with_budget(monkeypatch, budget=400, level="L1"):
     monkeypatch.setattr(router, "_prev_sigs", [])
     monkeypatch.setattr(router, "LEVEL", level)  # L1: drop-only; L2: drop + condense
     monkeypatch.setattr(router, "STATS", Stats())  # isolate counters per test
-    u.FRONTIER._pins.clear()  # isolate the conversation frontier per test
 
 
 def capture_upstream(monkeypatch, payload=None, status=200, ctype="application/json"):
@@ -353,30 +352,28 @@ def test_phantom_usage_claim_never_trims_an_under_budget_payload(monkeypatch):
     assert router.STATS.trims == 0
 
 
-def test_drop_frontier_is_pinned_across_requests(monkeypatch):
-    """One trim per budget band, not one per request: the head must stay fixed."""
+def test_l1_sheds_oldest_pairs_and_keeps_the_newest(monkeypatch):
+    """N-1 policy: whole old tool pairs go, prose and the newest pair stay."""
     with_budget(monkeypatch, budget=1_000, level="L1")
-    u.FRONTIER._pins.clear()
     messages = openai_wire_thread(fill=3_000, blocks=4)
 
     captured = capture_upstream(monkeypatch)
     assert client().post("/r/deepseek/chat/completions",
                          content=ship({"messages": messages})).status_code == 200
     first = json.loads(captured["data"].decode().split("_pi_ctx::")[0])["messages"]
-    assert router.STATS.trims == 1, "the first over-budget request trims"
-    ids_first = [m.get("tool_call_id") for m in first if m.get("role") == "tool"]
+    assert router.STATS.trims == 1
+    ids = [m["tool_call_id"] for m in first if m.get("role") == "tool"]
+    assert ids == ["call_3"], "only the newest pair survives"
+    kept_calls = {c["id"] for m in first for c in m.get("tool_calls") or []}
+    assert set(ids) <= kept_calls, "no orphaned tool results"
+    assert first[0] == messages[0], "system prompt untouched"
+    assert {"role": "user", "content": "investigate"} in first, "prose survives"
+    assert first[-1]["content"] == "summarize the root cause"
 
-    grown = messages[:-1] + [
-        {"role": "assistant", "content": None, "tool_calls": [
-            {"id": "call_new", "type": "function",
-             "function": {"name": "bash", "arguments": "{}"}}]},
-        {"role": "tool", "tool_call_id": "call_new", "content": "y" * 400},
-        messages[-1]]
+    # The shed is stateless: the same transcript maps to the same prompt again, so a
+    # repeat request forwards identical bytes and the provider cache prefix still matches.
     assert client().post("/r/deepseek/chat/completions",
-                         content=ship({"messages": grown})).status_code == 200
+                         content=ship({"messages": messages})).status_code == 200
     second = json.loads(captured["data"].decode().split("_pi_ctx::")[0])["messages"]
-    ids_second = [m.get("tool_call_id") for m in second if m.get("role") == "tool"]
-    assert router.STATS.trims == 1, "growth inside the band must not move the frontier"
-    assert ids_second[:len(ids_first)] == ids_first, "cached head preserved across requests"
-    kept_calls = {c["id"] for m in second for c in m.get("tool_calls") or []}
-    assert set(ids_second) <= kept_calls, "no orphaned tool results"
+    assert second == first, "shedding is deterministic, not frontier-driven"
+    assert router.STATS.trims == 2
