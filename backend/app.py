@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field
 
 from . import condenser, strategy
 from .config import (BUDGET, CODEX_HOST, CONDENSE_TARGET_FRACTION, CUT_FRACTION, HOST,
-                     LEVEL, MAX_BODY_BYTES, PORT, ROUTES, SG_LANG_BASE, UPSTREAM_TIMEOUT)
+                     LEVEL, MAX_BODY_BYTES, PORT, ROUTES, UPSTREAM_TIMEOUT)
 from .transport import auth_map, maybe_gzip, parse_snapshot, upstream_headers
 
 
@@ -29,7 +29,7 @@ class CondenseInfo(BaseModel):
 
     dropped_blocks: int = 0
     condensed_entries: int = 0
-    summary_chars: int = 0
+    summary_words: int = 0
     duration_ms: float = 0.0
     trigger: str = "passthrough"  # passthrough | strategy | strategy+condenser
 
@@ -81,7 +81,7 @@ def _fold(messages: list[dict], entries: list[dict], sigs: list[str]) -> tuple[l
     _prev_sigs[:] = sigs  # identical entries never condense twice
     return ([*messages[:at], {"role": "user", "content": f"{NOTE_HEADER}\n\n{summary}"},
              *messages[at + len(entries):]],
-            {"condensed_entries": len(entries), "summary_chars": len(summary),
+            {"condensed_entries": len(entries), "summary_words": condenser.count_words(summary),
              "duration_ms": round(ms, 1), "trigger": "strategy+condenser"})
 
 

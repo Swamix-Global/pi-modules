@@ -4,6 +4,7 @@ Environment names are the only supported override; a unit restart is the only wa
 change routing behaviour. Values are plain module constants so the hot path pays no
 attribute lookups and tests can monkeypatch the owning module.
 """
+
 from __future__ import annotations
 
 import json
@@ -30,27 +31,27 @@ def _text(name: str, default: str) -> str:
 
 
 # --- minification ------------------------------------------------------------------------
-BUDGET = _int("PI_ROUTER_BUDGET", 60_000)             # usage that triggers minification
+BUDGET = _int("PI_ROUTER_BUDGET", 60_000)  # usage that triggers minification
 CUT_FRACTION = _float("PI_ROUTER_CUT_FRACTION", 0.4)  # hysteresis: cut down to this share
-CONDENSE_TARGET_FRACTION = 0.2                        # condenser target, share of entry tokens
-CHARS_PER_TOKEN = 3.6                                 # conservative estimate, cap decisions only
+CONDENSE_TARGET_FRACTION = 0.2  # condenser target, share of entry tokens
+CHARS_PER_TOKEN = 3.6  # conservative estimate, cap decisions only
+WORDS_PER_TOKEN = 0.75  # English prose: ~1 token per 0.75 words (4 tokens ≈ 3 words)
 MAX_BODY_BYTES = _int("PI_ROUTER_MAX_BODY_BYTES", 128 << 20)  # bigger bodies pass untouched
-FRONTIER_CAP = 64                                     # remembered conversations (LRU)
-LEVEL = _text("PI_ROUTER_LEVEL", "L2")                # Fast Mode | L1 vs Standard Mode | L2
+FRONTIER_CAP = 64  # remembered conversations (LRU)
+LEVEL = _text("PI_ROUTER_LEVEL", "L2")  # Fast Mode | L1 vs Standard Mode | L2
 
 # --- local condenser ---------------------------------------------------------------------
 SG_LANG_BASE = _text("SG_LANG_BASE", "http://127.0.0.1:30000/v1")
-SG_LANG_MODEL = _text("SG_LANG_MODEL", "")            # blank: use whatever the host serves
+SG_LANG_MODEL = _text("SG_LANG_MODEL", "")  # blank: use whatever the host serves
 CONDENSE_RETRIES = 2
 
 # --- inference hosts ---------------------------------------------------------------------
-UPSTREAM_TIMEOUT = (10, 300)                          # connect, read
+UPSTREAM_TIMEOUT = (10, 300)  # connect, read
 GZIP_MIN_BYTES = 32 << 10
 # Request gzip is opt-in: real cloud APIs reject Content-Encoding on POST /chat/completions
 # with 400 'Failed to parse JSON', and local uvicorn hosts cannot decode it at all.
 GZIP_PROVIDERS = frozenset(filter(None, _text("PI_ROUTER_GZIP_PROVIDERS", "").split(",")))
-CODEX_HOST = _text("PI_ROUTER_CODEX_UPSTREAM",
-                   "https://chatgpt.com/backend-api/codex/responses")
+CODEX_HOST = _text("PI_ROUTER_CODEX_UPSTREAM", "https://chatgpt.com/backend-api/codex/responses")
 DEFAULT_ROUTES = {
     "sglang": SG_LANG_BASE,
     "deepseek": "https://api.deepseek.com",
@@ -66,9 +67,7 @@ DEFAULT_ROUTES = {
     "zai": "https://api.z.ai/api/coding/paas/v4",
 }
 ROUTES: dict[str, str] = json.loads(_text("PI_ROUTER_ROUTES", json.dumps(DEFAULT_ROUTES)))
-HOP_HEADERS = frozenset({"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-                         "te", "trailer", "transfer-encoding", "upgrade", "host",
-                         "content-length"})
+HOP_HEADERS = frozenset({"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade", "host", "content-length"})
 MANAGED_AUTH = frozenset({"api-key", "authorization"})  # router injects its own bearer
 
 # --- service -----------------------------------------------------------------------------

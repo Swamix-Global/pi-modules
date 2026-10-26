@@ -10,6 +10,7 @@ the request before it. Cutting a scattered set of blocks out of the middle of hi
 shifts the prompt head, so the host can no longer serve the tail from cache and re-bills
 it as fresh input. Only contiguous front cuts and appended turns are allowed.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -32,11 +33,8 @@ def token_estimate(text: str) -> int:
 def message_tokens(message: dict) -> int:
     """Estimated tokens, ignoring encrypted thinking/reasoning blobs."""
     content = message.get("content")
-    body = token_estimate(content) if isinstance(content, str) else sum(
-        token_estimate(json.dumps(block, ensure_ascii=False)) for block in content or ()
-        if isinstance(block, dict) and block.get("type") not in THINKING_TYPES)
-    return body + sum(token_estimate(json.dumps(call, ensure_ascii=False))
-                      for call in message.get("tool_calls") or ())
+    body = token_estimate(content) if isinstance(content, str) else sum(token_estimate(json.dumps(block, ensure_ascii=False)) for block in content or () if isinstance(block, dict) and block.get("type") not in THINKING_TYPES)
+    return body + sum(token_estimate(json.dumps(call, ensure_ascii=False)) for call in message.get("tool_calls") or ())
 
 
 def overhead_tokens(messages: list[dict]) -> int:
@@ -52,16 +50,13 @@ def _call_id(message: dict) -> str | None:
 
 def _call_ids(message: dict) -> set[str]:
     """Every tool-call id a message announces, in either wire format."""
-    announced = {block.get("id") for block in message.get("content") or ()
-                 if isinstance(block, dict) and block.get("type") == "toolCall"}
+    announced = {block.get("id") for block in message.get("content") or () if isinstance(block, dict) and block.get("type") == "toolCall"}
     return (announced | {call.get("id") for call in message.get("tool_calls") or ()}) - {None}
 
 
 def _has_tool_calls(message: dict) -> bool:
     """True for Pi blocks (toolCall) and OpenAI wire format (tool_calls)."""
-    return bool(message.get("tool_calls")) or any(
-        isinstance(block, dict) and block.get("type") == "toolCall"
-        for block in message.get("content") or ())
+    return bool(message.get("tool_calls")) or any(isinstance(block, dict) and block.get("type") == "toolCall" for block in message.get("content") or ())
 
 
 def _is_media(block: object) -> bool:
@@ -75,15 +70,12 @@ def _is_tool_result(message: dict) -> bool:
 
 def content_sig(message: dict) -> str:
     """Content hash that identifies an already-condensed entry across requests."""
-    return hashlib.sha1(json.dumps(message.get("content"), sort_keys=True,
-                                   ensure_ascii=False).encode()).hexdigest()[:12]
+    return hashlib.sha1(json.dumps(message.get("content"), sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:12]
 
 
 def message_sig(message: dict) -> str:
     """Stable identity of one message, used to validate a pinned cut boundary."""
-    body = {"role": message.get("role"), "id": _call_id(message),
-            "content": message.get("content"),
-            "calls": [call.get("id") for call in message.get("tool_calls") or ()]}
+    body = {"role": message.get("role"), "id": _call_id(message), "content": message.get("content"), "calls": [call.get("id") for call in message.get("tool_calls") or ()]}
     return hashlib.sha1(json.dumps(body, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:12]
 
 
@@ -93,24 +85,16 @@ def _blocks(messages: list[dict]) -> list[list[dict]]:
     blocks: list[list[dict]] = []
     for i, message in enumerate(messages):
         owner = blocks[-1] if blocks else None
-        if (i and owner and owner[-1] is messages[i - 1] and _is_tool_result(message)
-                and _call_id(message) in _call_ids(owner[0])):
+        if i and owner and owner[-1] is messages[i - 1] and _is_tool_result(message) and _call_id(message) in _call_ids(owner[0]):
             owner.append(message)
         else:
             blocks.append([message])
     return blocks
 
 
-def _droppable(block: list[dict]) -> bool:
-    """Orphan results and assistant call turns are both safe to cut."""
-    head = block[0]
-    return _is_tool_result(head) or (head.get("role") == "assistant" and _has_tool_calls(head))
-
-
 def count_tool_blocks(messages: list[dict]) -> int:
     """Droppable blocks: assistant call turns plus tool results, either wire format."""
-    return sum(1 for m in messages if _is_tool_result(m)
-               or (m.get("role") == "assistant" and _has_tool_calls(m)))
+    return sum(1 for m in messages if _is_tool_result(m) or (m.get("role") == "assistant" and _has_tool_calls(m)))
 
 
 def _anchor(messages: list[dict]) -> int:
@@ -125,8 +109,7 @@ def _anchor(messages: list[dict]) -> int:
 
 def _turn_start(messages: list[dict]) -> int:
     """Index of the current turn: everything from here on stays."""
-    return max((i for i, m in enumerate(messages) if m.get("role") == "user"),
-               default=len(messages))
+    return max((i for i, m in enumerate(messages) if m.get("role") == "user"), default=len(messages))
 
 
 def strip_media(messages: list[dict]) -> tuple[list[dict], int]:
@@ -177,8 +160,7 @@ def repair_tool_pairs(messages: list[dict]) -> list[dict]:
 
 
 # --- Fast Mode | L1 -----------------------------------------------------------------------
-def cut_prefix(messages: list[dict], budget: int, low: int, anchor: int | None = None,
-               start: int | None = None) -> tuple[list[dict], int]:
+def cut_prefix(messages: list[dict], budget: int, low: int, anchor: int | None = None, start: int | None = None) -> tuple[list[dict], int]:
     """Drop a contiguous, block-aligned prefix of old turns until the payload fits `low`.
 
     `anchor` is the protected head (system messages plus the first user turn); `start` is the
@@ -203,7 +185,7 @@ def cut_prefix(messages: list[dict], budget: int, low: int, anchor: int | None =
         dropped += len(block)
     if not dropped:
         return messages, 0  # nothing cuttable before the current turn: keep everything
-    return messages[:anchor] + messages[start + dropped:], dropped
+    return messages[:anchor] + messages[start + dropped :], dropped
 
 
 class Frontier:
@@ -230,8 +212,7 @@ class Frontier:
     def key(messages: list[dict]) -> str:
         """Conversation identity: the system prompt plus the first turn of the transcript."""
         seed = next((m for m in messages if m.get("role") != "system"), {})
-        return hashlib.sha1((json.dumps(messages[0] if messages else {}, sort_keys=True)
-                             + "|" + content_sig(seed)).encode()).hexdigest()[:16]
+        return hashlib.sha1((json.dumps(messages[0] if messages else {}, sort_keys=True) + "|" + content_sig(seed)).encode()).hexdigest()[:16]
 
     def _remember(self, key: str, pin: tuple[int, str]) -> None:
         """Store the pin, evicting the least recently used conversation."""
@@ -252,8 +233,7 @@ class Frontier:
             return anchor  # no pin yet: start from the protected task header
         if start < len(messages) and message_sig(messages[start]) == kept_sig:
             return start
-        candidates = [i for i in range(anchor, len(messages))
-                      if message_sig(messages[i]) == kept_sig]
+        candidates = [i for i in range(anchor, len(messages)) if message_sig(messages[i]) == kept_sig]
         if candidates:  # nearest surviving copy keeps the frontier where it was
             return min(candidates, key=lambda i: abs(i - start))
         self.resets += 1
@@ -278,16 +258,14 @@ class Frontier:
             self._remember(key, (start, kept_sig))
             return (head + repair_tool_pairs(view)) if start > anchor else messages, 0
         boundary = start + dropped
-        self._remember(key, (boundary, message_sig(messages[boundary])
-                             if boundary < len(messages) else ""))
+        self._remember(key, (boundary, message_sig(messages[boundary]) if boundary < len(messages) else ""))
         return repair_tool_pairs(kept), count_tool_blocks(messages[start:boundary])
 
 
 FRONTIER = Frontier()
 
 
-def drop_blocks_before_current_turn(messages: list[dict],
-                                    budget: int = BUDGET) -> tuple[list, int]:
+def drop_blocks_before_current_turn(messages: list[dict], budget: int = BUDGET) -> tuple[list, int]:
     """L1: strip media, then cut whole tool blocks before the current turn.
 
     Deliberately ignores the client's usage snapshot: it counts the history *before* this
@@ -299,14 +277,11 @@ def drop_blocks_before_current_turn(messages: list[dict],
 
 
 # --- Standard Mode | L2 -------------------------------------------------------------------
-def condensed_prefix_build(messages: list[dict],
-                           prev_entry_sigs: list[str]) -> tuple[list, list]:
+def condensed_prefix_build(messages: list[dict], prev_entry_sigs: list[str]) -> tuple[list, list]:
     """Entries the condenser may fold: pre-turn, non-system, and never the same twice."""
     last_user = max((i for i, m in enumerate(messages) if m.get("role") == "user"), default=-1)
     entries = [m for m in messages[:last_user] if m.get("role") != "system"] if last_user > 0 else []
-    if not entries and len(messages) >= 2 and (
-            messages[-2].get("role") == "assistant" and _has_tool_calls(messages[-2])
-            and _is_tool_result(messages[-1])):
+    if not entries and len(messages) >= 2 and (messages[-2].get("role") == "assistant" and _has_tool_calls(messages[-2]) and _is_tool_result(messages[-1])):
         entries = messages[-2:]  # single-turn session: one giant tool dump still condenses
     sigs = [*map(content_sig, entries)]
     return ([], prev_entry_sigs) if entries and sigs == prev_entry_sigs else (entries, sigs)

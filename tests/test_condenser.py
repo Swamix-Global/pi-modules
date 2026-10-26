@@ -46,4 +46,12 @@ def test_condense_renders_every_wire_format(monkeypatch):
     notes, _ = condenser.condense(entries, 512)
     assert notes == "notes"
     assert "toolCall bash" in seen["text"] and "a.txt" in seen["text"]
-    assert "under ~" in seen["prompt"]
+    assert "under ~" in seen["prompt"] and "words" in seen["prompt"]
+    assert condenser.word_budget(512) == int(512 * 0.75)
+
+
+def test_condense_enforces_the_word_budget(monkeypatch):
+    monkeypatch.setattr(condenser, "local_ai",
+                        lambda *a, **k: "word " * 50_000)
+    notes, _ = condenser.condense([{"role": "user", "content": "hi"}], 512)
+    assert condenser.count_words(notes) == condenser.word_budget(512)  # ellipsis rides the last word

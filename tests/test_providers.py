@@ -9,7 +9,6 @@ import json
 import sys
 from pathlib import Path
 
-import pytest
 from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -274,7 +273,7 @@ def test_under_budget_passes_through(monkeypatch):
 def test_streaming_request_streams_through(monkeypatch):
     with_budget(monkeypatch, budget=10**9)
     sse = b'data: {"delta": 1}\n\ndata: [DONE]\n\n'
-    captured = capture_upstream(monkeypatch, payload=sse, ctype="text/event-stream")
+    capture_upstream(monkeypatch, payload=sse, ctype="text/event-stream")
     body = ship({"messages": [{"role": "user", "content": "hi"}], "stream": True})
     r = client().post("/r/deepseek/chat/completions", content=body)
     assert r.status_code == 200
@@ -288,7 +287,7 @@ def test_unknown_provider_404(monkeypatch):
 
 
 def test_upstream_error_passes_status(monkeypatch):
-    captured = capture_upstream(monkeypatch, payload=b'{"error": "quota"}', status=429)
+    capture_upstream(monkeypatch, payload=b'{"error": "quota"}', status=429)
     r = client().post("/r/deepseek/chat/completions",
                       content=ship({"messages": [{"role": "user", "content": "hi"}]}))
     assert r.status_code == 429

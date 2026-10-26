@@ -10,8 +10,6 @@ import json
 import re
 from typing import Any
 
-import requests
-
 from .config import (AUTH_PATH, GZIP_MIN_BYTES, GZIP_PROVIDERS, HOP_HEADERS,
                      MANAGED_AUTH)
 
@@ -32,8 +30,7 @@ def parse_snapshot(text: str) -> dict[str, Any]:
         raise ValueError(f"snapshot payload is not valid JSON: {exc}") from exc
     if not isinstance(usage := data.get("usage") or data.get("tokens"), int) or usage <= 0:
         raise ValueError("snapshot has no integer usage")
-    return {"usage": usage, "body": json.loads(text[:found.start()]),
-            "start": found.start(), "end": found.end()}
+    return {"usage": usage, "body": json.loads(text[:found.start()])}
 
 
 def auth_map() -> dict[str, str]:

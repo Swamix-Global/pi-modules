@@ -4,5 +4,7 @@ All router code lives in the `backend` package; this file only binds a process t
 """
 from backend.app import app, serve  # noqa: F401  (app re-exported for `uvicorn main:app`)
 
+__all__ = ["app", "serve"]
+
 if __name__ == "__main__":
     serve()
