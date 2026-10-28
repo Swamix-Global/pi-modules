@@ -21,8 +21,8 @@ def stats(url: str) -> dict:
     try:
         with urllib.request.urlopen(url.rstrip('/') + '/stats', timeout=3) as response:
             data = json.load(response)
-        return {k: data.get(k) for k in ('requests', 'trims', 'frontier_reuses', 'condenses',
-                                        'guard_failures', 'persistence_errors', 'last_request')}
+        return {k: data.get(k) for k in ('requests', 'unchanged', 'stripped', 'pairs_dropped',
+                                        'media_removed', 'usage_tokens', 'last_request')}
     except (OSError, ValueError):
         return {'unavailable': True}
 

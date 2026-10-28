@@ -1,43 +1,49 @@
-# Techstack:
-requests, uv, pydantic, fastapi, best dx friendly oss libraries known which can minimize the overall LOC with high elegance code.
+# ctx-engine spec
 
+Stateless proxy that rewrites chat-completion bodies so prompts stay small and
+byte-stable. Port 4141, `systemd --user` unit `pi-context-router.service`.
 
-## Features / Requirements:
-- ctx engine is a middleman server
-- accepts raw request, sends to inference host (LLM Provider), a minified context, to the LLM Provider
-- adds gzip headers for faster transmit
-- preserves, user,assistant,thinking at lower compression.
-- drops any images or media which balloon context, or are uncompatible
-- cache stays pristine, and high hit rate, this is core priority
-- core priority, long running agent turns, with minimal overhead and strips unnecessary context which is stale.
+## Decision: N-1 tool stripping, unconditional
+For every request, regardless of size or provider:
+1. strip media blocks (image / image_url / input_image / file / audio) from
+   message history;
+2. keep the newest complete tool pair before the current turn;
+3. drop all older complete pairs;
+4. never cut prose; never touch the current turn's messages;
+5. repair dangling tool_call / tool_result entries so providers accept the body.
 
+No token budget, no estimation, no thresholds, no per-request state. Requests
+with nothing to strip are forwarded byte-identical. Design intent: identical
+transcript → identical prompt bytes on every request, so provider prompt caches
+stay warm and cache misses happen only when history genuinely changes.
 
-## Definitions:
-- Turn : user message to last successful assistant response is a turn, next user message is start of new turn
+## Wire & auth
+- Routes: `/r/{provider}/{path}`, `/sglang/{path}`, `/codex/{path}`;
+  `/health`, `/stats`, `/` (self-description).
+- Hop-by-hop headers stripped; router injects bearer auth from
+  `~/.pi/agent/auth.json` for managed providers; private `x-pi-*` headers
+  never reach upstream.
+- Optional gzip for cloud providers (>= 32 KiB bodies).
+- Streaming responses chained untouched; provider usage recorded into
+  `usage_tokens` when the body carries a usage snapshot.
 
-- TOOL CALL PAIR: a tool call and its output is tool call pair.
+## Telemetry
+`/stats`: `requests`, `unchanged`, `stripped`, `pairs_dropped`, `media_removed`,
+`usage_tokens`, `last_request` (`trigger`, `pairs_dropped`, `media_removed`,
+`messages_before`/`after`, `model`), HTTP `status` counts, `active`, served
+model. The `x-pi-router` response header tags the trigger per request.
+Estimates are never reported as billed tokens; `cacheRead` truth comes from
+provider usage rows.
 
+## Config (environment, read at import; restart to change)
+`PI_ROUTER_HOST`/`PI_ROUTER_PORT` (127.0.0.1:4141), `PI_ROUTER_MAX_BODY_BYTES`
+(128 MiB), `SG_LANG_BASE`/`SG_LANG_MODEL`, `PI_ROUTER_AUTH`, gzip knobs,
+`PI_ROUTER_CODEX_UPSTREAM`. Nothing else is tunable; there is deliberately no
+budget knob.
 
-## Compression policy (CONTINUOUS)
+## Files
+`backend/{app,config,utils}.py` + `main.py`. Exactly these; no additions.
 
-
-- just drops tool call and tool results, until previous turn, current turn is preserved for better coherence. 
-
-EXAMPLE:
-```
-user: (N-1 Turn)
-asst: ...
-think : ...
-tool : ...
-user : (this is current turn)
-...
-```
-
-
-## Local AI (SGlang)
-- an sglang server with granite model is available, use it for summarizing the longer blocks 
-- make a condenser.local_ai(system_prompt,user_message) -> str
-- durable cache file system backed, so input  hash can fetched instantaneously
-
-
-the backend package stays at five modules: config, transport, strategy, condenser, app, and least possible simple implementation, without excessive error handling. 
+## Verification
+Manual telemetry only — `scripts/manual_rpc.py` against a real Pi RPC instance
+with real turns and real provider usage. No unit tests exist or may be added.
