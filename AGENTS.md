@@ -1,58 +1,37 @@
-# Project Agent Instructions: ctx-engine
+# ctx-engine development instructions
 
-Loopback context minifier: Python/FastAPI/requests in `backend/`, one thin `main.py` entry point.
-No database, no dashboard API, no Svelte service — the v2 SQLite/dashboard stack is retired and
-`frontend/` is dead weight kept only for history.
+Loopback context router on port 4141. Canonical source is this repository, not deployed Pi bundles.
 
-## Layout
+## Ownership and layout
 
-- `backend/config.py`: every tunable. Environment only, read once at import; a restart is the only
-  way to change behaviour. Keep new knobs here, never as scattered `os.getenv` calls.
-- `backend/transport.py`: `_pi_ctx` snapshot split, auth injection, hop-header hygiene, opt-in
-  request gzip. Moves bytes and credentials only; never inspects conversation content.
-- `backend/strategy.py`: turn anatomy (`_blocks`, `_anchor`, `_turn_start`), media stripping,
-  tool-pair repair, the pinned `Frontier`/`cut_prefix` L1 pass, whole-turn `context_messages`.
-- `backend/condenser.py`: L2 folding through local SGLang granite, `local_ai` with durable file
-  cache keyed by input hash, wire-format rendering.
-- `backend/app.py`: FastAPI surface, `minify` pipeline, counters and pydantic shapes.
-- `main.py`: `from backend.app import app, serve`; systemd runs `python main.py`.
+The backend contains **exactly three source files**. Do not split helpers into new modules or add compatibility shims or an `__init__.py`; Python namespace-package imports are sufficient.
+
+- `backend/app.py`: HTTP API, request orchestration, effective model budgets, nonblocking proxy streaming, numeric telemetry.
+- `backend/config.py`: all environment-only tunables, read once at startup.
+- `backend/utils.py`: wire metadata/auth/compression; message sizing and complete tool pairs; bounded local summaries; durable session/model frontiers and cache state. Organize these responsibilities into labelled sections within this file.
+- `scripts/manual_rpc.py`: manual live Pi RPC driver; not a test suite or mock.
 
 ## Invariants
 
-- **A request that needs no change is forwarded with its original bytes.** Re-serializing the JSON
-  rewrites the prompt prefix and invalidates the provider cache even when the text is identical.
-- **L1 cuts one contiguous prefix of whole tool blocks before the current turn**, down to
-  `budget × CUT_FRACTION`, and pins the resulting drop point per conversation. Never cut scattered
-  blocks out of the middle: that shifts the head on every request and re-bills the tail.
-- **The frontier moves only when the payload re-crosses the budget.** Hysteresis exists so the
-  frontier moves once per band, not once per request; `STATS.trims`/`rebuild_tokens` measure the
-  cost of every move, and `STATS.frontier_pins`/`frontier_resets` expose pin health.
-- **The client usage snapshot never drives trimming.** It counts history from before the router's
-  own cut, so it stays above the budget forever; it is telemetry and the trigger, not a measure of
-  what is being sent now.
-- **A pin is verified by its first kept message, never by the last dropped one.** Clients rewrite
-  old history in place (bounded tool results, truncation markers); validating the dropped side
-  reset the pin every request and re-cut the whole prefix, so the check follows the kept head.
-- **Tool calls and results travel together.** Any cut is block-aligned and `repair_tool_pairs`
-  runs after it, because providers reject an orphaned `tool` message.
-- **Media before the current turn is stripped**; media in the current turn is preserved untouched.
-- **The condenser is advisory.** Retries are bounded, notes are cached by input hash, and any
-  failure ships the turn untouched rather than failing the request.
-- **Managed providers get router-injected bearer auth** from `auth.json`; client `api-key` /
-  `authorization` values are dropped for those providers and kept for pass-through ones.
-- Request gzip stays opt-in (`PI_ROUTER_GZIP_PROVIDERS`): cloud chat APIs reject
-  `Content-Encoding` on POST, and local uvicorn hosts cannot decode it.
+1. An unchanged chat request is forwarded byte-for-byte (except the private snapshot trailer, if present). JSON whitespace itself is not provider prefix-cache content; actual message/tool tokens are.
+2. Never cut merely because input exceeds the low watermark. Trigger at the full effective message budget, then cut toward 60% to create headroom.
+3. Preserve user/system instructions. Remove complete call/result groups oldest-first; protect the newest current-turn group. No tool-free whole-turn deletion fallback.
+4. Apply prior removals BEFORE sizing. Removed groups must not resurrect when raw history is reconstructed. Reapply the exact saved summary on every subsequent request; do not substitute original history on a cache hit.
+5. Namespace state by explicit Pi session, provider, model, model limits, and initial user anchor. Summary source fingerprints must match; compaction/forks/edits must never inject stale notes. State is bounded and written atomically with mode 0600 only on frontier advances.
+6. Routed chat requests have ONE aggregate budget owner: the router. `util-compaction` supplies private session/window/reserve headers and still caps tool outputs. Unrouted/unsupported transports keep the client aggregate guard. Strip all private context headers before forwarding upstream.
+7. Account for tool schemas, framing and output reserve. Missing model metadata uses the operator ceiling, not a guessed model window. Do not ship a managed request known to exceed the safe budget.
+8. L1 is cheap tool-pair removal; L2 handles remaining prose pressure. L2 failures are advisory and rate-limited; try older completed current-turn groups before reporting an unfit request. Never silently delete user instructions.
+9. Blocking HTTP, condenser work, and upstream stream iteration must not block the ASGI event loop. `/health` reports router liveness without waiting on the condenser.
+10. Prompt estimates are NOT actual provider/cache/billed tokens. `trims` counts frontier advances, not reapplications. Do not label accumulated estimates as cache-miss measurements.
 
-## Checks and deploy
+## Verification policy — manual telemetry ONLY
 
-```sh
-.venv/bin/python -m pytest tests -q          # 40 tests
-systemctl --user restart pi-context-router.service
-curl -s 127.0.0.1:4141/health                # {"ok":true,...}
-curl -s 127.0.0.1:4141/stats                 # trims/rebuild_tokens should stay flat per band
-```
+For this subsystem and the util-compaction context guard, do not create, retain, or run unit tests, mock providers, pytest suites, or unit-test commit hooks. Retired unit tests have been removed at the operator's request.
 
-After any change to `strategy.py` or `app.py`, confirm on live `/stats` that `trims` does not grow
-per request — growing `trims` with flat request count is the cache-churn regression. A growing
-`frontier_resets` means the client is rewriting the kept head itself; that is a client problem, but
-it will show up as extra trims here.
+Launch an actual Pi instance in RPC mode with the deployed extension. Send the minimum essential turns, consume RPC continuously, and wait for `agent_settled` (not `agent_end`). Record only numeric usage (`input`, `cacheRead`, `output`), context limits, frontier advance/reuse counts, and command outcomes. Never log prompts, credentials, full tool output, or entire provider streams. A bounded real diagnostic file may be used to create context pressure.
+
+Verify: below-budget turns do not drop; one real overflow advances the frontier; subsequent small turns reuse the pinned representation and restore provider cache reads; tool calls remain valid; independent sessions/models are isolated; cached summaries are reapplied; reload/restart preserves a cut; oversize user-only input fails clearly without deletion. Label any unexercised path explicitly rather than claiming it passed. Static syntax/build checks are allowed, but are not a substitute for live telemetry.
+
+## Deploy
+
+Restart `systemctl --user restart pi-context-router.service`. Inspect `/health`, `/stats`, and live Pi usage. Build/deploy only the changed `util-compaction` package when other extensions have unrelated working changes. Use `/reload` in existing interactive Pi sessions; `/context-reload` is the equivalent extension command for an RPC session. A newly launched Pi loads deployed code immediately. Reloading a separate RPC instance does not reload another interactive instance.

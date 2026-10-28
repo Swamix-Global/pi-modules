@@ -1,7 +1,11 @@
 """Service entry point: `python main.py` (this is what systemd ExecStart runs).
 
-All router code lives in the `backend` package; this file only binds a process to it.
+The backend namespace contains exactly app.py, config.py and utils.py.
 """
+import sys
+
+sys.dont_write_bytecode = True
+
 from backend.app import app, serve  # noqa: F401  (app re-exported for `uvicorn main:app`)
 
 __all__ = ["app", "serve"]

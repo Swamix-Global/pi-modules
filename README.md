@@ -1,102 +1,60 @@
-# ctx-engine
+# Pi context engine
 
-Loopback context minifier for Pi at **http://127.0.0.1:4141**.
+Loopback context router at `127.0.0.1:4141`. It reduces old tool history while preserving user/system instructions and amortizing unavoidable provider prefix-cache breaks.
 
-It sits between Pi and every inference host, shrinks the body it forwards, and — the part that
-actually decides cost — keeps the surviving prefix **byte-identical** between requests so the
-host keeps serving the tail from its prompt cache. A cut that lands in the middle of history
-invalidates that cache and re-bills the whole prompt as fresh input; that failure mode is what
-this service is built to avoid.
+## Backend layout — exactly three files
 
-## Layout
+| File | Responsibility |
+|---|---|
+| `backend/app.py` | HTTP API, effective budgets, request orchestration, streaming and telemetry |
+| `backend/config.py` | Centralized configuration and environment tunables |
+| `backend/utils.py` | Wire/auth helpers, message fitting, local summaries and durable frontier state |
 
-```text
-backend/
-  config.py      every knob, read once from the environment
-  transport.py   _pi_ctx snapshot split, auth, hop headers, opt-in request gzip
-  strategy.py    turn anatomy, pinned L1 drop frontier, whole-turn trim
-  condenser.py   L2: local SGLang granite folding, durable file cache
-  app.py         FastAPI surface, pipeline, counters, shapes
-main.py          entry point (`python main.py`); systemd ExecStart runs this
-tests/           test_strategy.py, test_providers.py, test_transport.py, test_condenser.py
-frontend/        Svelte dashboard from the retired v2 build; not served by this service
-pi-context-router.service   unit template (installed copy lives in ~/.config/systemd/user)
-```
+No extra backend modules, compatibility wrappers, or `__init__.py`. `main.py` remains the thin service entry point and imports the namespace package. Keep new helpers in the appropriate existing file.
 
-## Setup and run
+## How fitting works
 
-Requires Python 3.13+; the virtual environment lives in `.venv/`.
+1. `util-compaction` bounds tool output once, at creation. For managed loopback `/r/` chat routes it sends private session/window/reserve headers; the router alone owns aggregate fitting. Unsupported/unrouted models retain the client guard.
+2. The router caps its 60,000-token operator ceiling by the selected model window, output reserve, tool schemas, and framing allowance. Sizes are conservative character-based **estimates**, not provider token counts.
+3. Reapply the session/provider/model frontier before sizing. Below the full budget, do not cut anything new. On overflow, remove complete oldest tool pairs toward 60% of the budget. Preserve user/system prose and the newest current-turn batch.
+4. If tool removal cannot relieve prose pressure, L2 asks the local SGLang model for bounded notes. Save the exact replacement and source fingerprints; reuse it on later requests rather than resurrecting original history. Condenser failures are advisory and rate-limited.
+5. An unfit request fails with a clear context error, not silent deletion of user instructions. Pi's transcript remains intact.
+
+Frontier metadata (IDs, source hashes, optional notes; no raw prompts) lives under `~/.pi/agent/ctx-cache/frontiers/`, written atomically with mode 0600. The cache is bounded to 128 conversations, with a 24-hour idle TTL. Source edits/compaction cannot reuse stale notes. Concurrent sessions/models are isolated. A router restart reloads saved cuts on demand.
+
+Cutting a tool group changes the provider token prefix from that point onward. Hysteresis limits how often this happens; it cannot eliminate that initial miss. JSON whitespace changes alone are not evidence of a provider cache miss.
+
+## API
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /health` | Router liveness plus last-known condenser identity; never waits for the condenser |
+| `GET /stats` | Frontier advances/reuse, guard failures, persistence errors, last request's estimated sizes |
+| `GET /` | Mode, ceiling, strategy, endpoints |
+| `POST /r/{provider}/{rest}` | Managed provider proxy; chat `messages` receive fitting |
+| `POST /v1/chat/completions` | Local SGLang passthrough (condenser traffic is not recursively fitted) |
+| `POST /codex/responses` | Codex Responses passthrough; client guard remains responsible |
+
+Pi sends `x-pi-ctx-session`, `x-pi-ctx-window`, and `x-pi-ctx-reserve` through the supported header hook. These headers are stripped before upstream forwarding. Other wire formats pass through without chat transforms. Authentication is injected from Pi's auth store; never put credentials into telemetry. Request gzip remains opt-in.
+
+`trims` counts **frontier advances**, not every request that reapplies a cut. `frontier_reuses` counts stable reapplication. `last_request` contains only hashed identity, model, numeric estimates, and decisions. The retired `rebuild_tokens` counter was an estimate of whole trimmed payloads, not actual re-billed input. Read actual `input`, `cacheRead`, and `output` from Pi RPC/provider usage. No access-log stream or request-body logging is needed.
+
+## Configuration and deployment
+
+Tunables are in `backend/config.py`, read once at startup. Main controls: `PI_ROUTER_BUDGET` (60000), `PI_ROUTER_LEVEL` (L2), `SG_LANG_BASE`, `SG_LANG_MODEL`, and `PI_ROUTER_CACHE`. The local condenser uses whichever model SGLang actually serves unless explicitly configured. Never assume the profile name is the served model.
 
 ```sh
-uv venv .venv --python python3
-uv pip install --python .venv/bin/python fastapi uvicorn requests pydantic
-.venv/bin/python main.py                                  # foreground
-systemctl --user restart pi-context-router.service        # deployed way
-curl -s 127.0.0.1:4141/health
+systemctl --user restart pi-context-router.service
+curl -s http://127.0.0.1:4141/health
+curl -s http://127.0.0.1:4141/stats
 ```
 
-## What happens to one request
+Build/deploy the changed util-compaction package, then `/reload` existing interactive Pi sessions. Its `/context-reload` extension command is callable through RPC. A separate RPC process cannot reload an already-open interactive session.
 
-1. **Snapshot split.** Pi appends `_pi_ctx::{"usage": …}` to the body. Usage comes from the
-   host, never from the estimate; the marker is stripped before forwarding.
-2. **L1 — pinned frontier.** Above `PI_ROUTER_BUDGET` usage, whole tool blocks before the
-   current turn are dropped as one contiguous prefix, down to `budget × PI_ROUTER_CUT_FRACTION`.
-   The drop point is remembered per conversation and only moves when the payload re-crosses the
-   budget, so the head stays cached for many turns. Hysteresis is the whole point: cutting
-   exactly to the budget re-crosses it within a turn or two and rebuilds the cache every request.
-3. **L2 — condense.** If L1 alone did not fit, pre-turn history is folded into one leading note
-   through the local granite model (durable cache keyed by input hash, fail-open: a dead
-   condenser ships the turn untouched).
-4. **Verbatim forward.** A request that needed nothing is forwarded with its original bytes —
-   re-serializing JSON changes bytes and breaks the cache even when the text is "the same".
+## Development verification: manual live telemetry only
 
-## Endpoints
+See `AGENTS.md`. Unit tests and their hook references for this subsystem are retired. Do not create mock-provider or unit-test substitutes.
 
-| path | purpose |
-|---|---|
-| `/r/{provider}/{rest}` | provider pass-through with minification |
-| `/v1/chat/completions` | local SGLang pass-through, never minified (it is the condenser) |
-| `/codex/responses` | Codex responses forwarded verbatim to the ChatGPT backend |
-| `/health` | condenser liveness + lifetime counters |
-| `/stats` | every counter the pipeline mutates |
-| `/` | mode, budget, strategy, endpoint list |
+`scripts/manual_rpc.py` starts an actual ephemeral Pi instance, consumes RPC continuously, passes supplied turns, and waits for `agent_settled`. Use the dedicated python tool to invoke it with `runpy.run_path`, setting `sys.argv` with `--provider`, `--model`, `--cwd`, and repeated `--turn` values (or a private JSON `--turns-file`). `--reload-after N` exercises the supported reload command; `--report` saves only minimal numeric telemetry at mode 0600. Calls incur real provider usage. No prompts, credentials, tool output, or full streams are logged.
 
-## Configuration
-
-All environment-driven, read once at import; restart to change. Defaults in parentheses.
-
-| variable | meaning |
-|---|---|
-| `PI_ROUTER_BUDGET` (60000) | usage that triggers minification |
-| `PI_ROUTER_CUT_FRACTION` (0.4) | hysteresis: L1 cuts down to this share of the budget |
-| `PI_ROUTER_LEVEL` (L2) | `L1` drop-only, `L2` drop + fold |
-| `PI_ROUTER_PORT` / `PI_ROUTER_HOST` (4141 / 127.0.0.1) | bind address |
-| `PI_ROUTER_MAX_BODY_BYTES` (128 MiB) | larger bodies pass through untouched |
-| `PI_ROUTER_AUTH` (`~/.pi/agent/auth.json`) | provider bearer keys the router injects |
-| `PI_ROUTER_CACHE` (`~/.pi/agent/ctx-cache`) | condenser note cache |
-| `PI_ROUTER_ROUTES` | provider → base URL JSON override |
-| `PI_ROUTER_GZIP_PROVIDERS` (empty) | comma list that accepts gzipped request bodies |
-| `PI_ROUTER_CODEX_UPSTREAM` | Codex backend URL |
-| `SG_LANG_BASE` / `SG_LANG_MODEL` | local condenser host and model override |
-
-`frontend/` is a leftover from the retired v2 dashboard (SQLite request log, settings API); this
-service serves no UI, and the old `PI_CONTEXT_ROUTER_*` variables and `.env` are gone. Config is
-process environment only.
-
-## Why the frontier is pinned (measured)
-
-Session telemetry from the pre-pinning router: `cacheRead` sat at the system prompt alone
-(median 11,520 tokens) on 254 of 448 cut requests, and 288 of 508 turns hit below 80 % cache —
-the head was being rewritten constantly while the tail was re-billed as fresh input. Simulation of
-the old "cut exactly to budget" pass moved the drop frontier on **74 %** of turns; a pinned
-frontier with hysteresis moves it on ~4 %.
-
-## Checks
-
-```sh
-.venv/bin/python -m pytest tests -q     # 40 tests: strategy, wire, condenser, full pipeline
-```
-
-`test_providers.py` drives the real ASGI app with fake upstreams: deepseek-style tool chains,
-OpenAI encrypted reasoning, antigravity signed thinking, streaming, snapshot-free clients, the
-condenser path, fail-open behavior, and frontier pinning across requests.
+Manually observe below-budget behavior, one actual pressure cut followed by cache recovery, independent session/model behavior, summary reuse where the condenser is available, and durable reapplication after restart. Record gaps honestly. Static builds/syntax checks are allowed, but do not prove live behavior.

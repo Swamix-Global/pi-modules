@@ -33,6 +33,11 @@ def _text(name: str, default: str) -> str:
 # --- minification ------------------------------------------------------------------------
 BUDGET = _int("PI_ROUTER_BUDGET", 60_000)  # usage that triggers minification
 CONDENSE_TARGET_FRACTION = 0.2  # condenser target, share of entry tokens
+CUT_FRACTION = 0.6  # destination only after full-budget overflow
+FRONTIER_LIMIT = 128  # bounded in-memory and durable conversation states
+FRONTIER_TTL = 24 * 3600  # idle states expire after a day
+CONDENSE_COOLDOWN = 60  # seconds before retrying a failed advisory condenser
+CONDENSE_INPUT_CHARS = 24_000  # bound each local-model input, including rolling notes
 CHARS_PER_TOKEN = 3.6  # conservative estimate, cap decisions only
 WORDS_PER_TOKEN = 0.75  # English prose: ~1 token per 0.75 words (4 tokens ≈ 3 words)
 MAX_BODY_BYTES = _int("PI_ROUTER_MAX_BODY_BYTES", 128 << 20)  # bigger bodies pass untouched
